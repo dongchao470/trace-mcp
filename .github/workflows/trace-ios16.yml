@@ -1,4 +1,4 @@
-name: Trace iOS 16 baseline
+name: Trace iOS 16 critical network fixes
 
 on:
   workflow_dispatch:
@@ -133,6 +133,23 @@ jobs:
           git diff --check
           git diff -- TraceSecurity/Certificate/CertificateManager.swift | tee ci-logs/certificate-error-ownership.patch
 
+      - name: Apply reviewed SSE and replay compatibility fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for patch in ci/ios16-stream-replay-1.patch ci/ios16-stream-replay-2.patch ci/ios16-stream-replay-3.patch ci/ios16-stream-replay-tests.patch; do
+            git apply --check "$patch"
+            git apply "$patch"
+          done
+          git diff --check
+          git diff --stat | tee ci-logs/critical-network-fixes.log
+
+      - name: Run exact-source critical network regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ci/run-critical-network-regressions.py 2>&1 | tee ci-logs/critical-network-regressions.log
+
       - name: Build full device app for iOS 16
         shell: bash
         run: |
@@ -142,7 +159,7 @@ jobs:
             -derivedDataPath DerivedData -clonedSourcePackagesDirPath SourcePackages \
             IPHONEOS_DEPLOYMENT_TARGET=16.0 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY='' DEVELOPMENT_TEAM='' ENABLE_USER_SCRIPT_SANDBOXING=NO \
-            CURRENT_PROJECT_VERSION=13 \
+            CURRENT_PROJECT_VERSION=14 \
             build 2>&1 | tee ci-logs/build.log
 
       - name: Verify iOS deployment targets and package an ad-hoc IPA
@@ -189,7 +206,7 @@ jobs:
                       (bundle / 'Info.plist').write_bytes(plistlib.dumps(info))
                       keychain_groups[bundle.name] = groups[0]
                       records[-1]['keychainAccessGroup'] = groups[0]
-                  assert info['CFBundleVersion'] == '13', (bundle.name, info['CFBundleVersion'])
+                  assert info['CFBundleVersion'] == '14', (bundle.name, info['CFBundleVersion'])
                   entitlements = pathlib.Path('ci-logs') / (bundle.name + '.entitlements.plist')
                   entitlements.write_text(text)
                   command += ['--entitlements', str(entitlements)]
@@ -200,14 +217,14 @@ jobs:
           PY
           mkdir -p Package/Payload
           ditto DerivedData/Build/Products/Release-iphoneos/Trace.app Package/Payload/Trace.app
-          (cd Package && zip -qr ../Trace-baseline-iOS16.ipa Payload)
-          shasum -a 256 Trace-baseline-iOS16.ipa | tee ci-logs/ipa.sha256
+          (cd Package && zip -qr ../Trace-build14-iOS16.ipa Payload)
+          shasum -a 256 Trace-build14-iOS16.ipa | tee ci-logs/ipa.sha256
 
       - name: Upload baseline IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Trace-baseline-iOS16
-          path: Trace-baseline-iOS16.ipa
+          name: Trace-build14-iOS16
+          path: Trace-build14-iOS16.ipa
           if-no-files-found: error
           retention-days: 7
 
