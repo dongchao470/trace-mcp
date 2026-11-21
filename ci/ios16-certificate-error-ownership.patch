@@ -1,0 +1,33 @@
+diff --git a/TraceSecurity/Certificate/CertificateManager.swift b/TraceSecurity/Certificate/CertificateManager.swift
+index e233944..e07edc0 100644
+--- a/TraceSecurity/Certificate/CertificateManager.swift
++++ b/TraceSecurity/Certificate/CertificateManager.swift
+@@ -309,9 +309,12 @@ public class CertificateManager {
+         SecurityLog.crypto.debug("event=crypto.rsa_keygen outcome=pending")
+         var error: Unmanaged<CFError>?
+         guard let privateKey = SecKeyCreateRandomKey(keyAttributes as CFDictionary, &error) else {
+-            let errorDesc = error?.takeRetainedValue().localizedDescription ?? "unknown"
++            // Consume the Security framework's +1 CFError exactly once and keep it
++            // alive through both logging and the thrown Swift error.
++            let keyGenerationError = error?.takeRetainedValue()
++            let errorDesc = keyGenerationError?.localizedDescription ?? "unknown"
+             SecurityLog.crypto.error("event=crypto.rsa_keygen outcome=failure error=\(errorDesc)")
+-            throw CertificateError.keyGenerationFailed(error?.takeRetainedValue())
++            throw CertificateError.keyGenerationFailed(keyGenerationError)
+         }
+         SecurityLog.crypto.debug("event=crypto.rsa_keygen outcome=success")
+ 
+@@ -435,9 +438,11 @@ public class CertificateManager {
+         SecurityLog.crypto.debug("event=crypto.rsa_keygen outcome=pending domain=\(domain, privacy: .private(mask: .hash))")
+         var error: Unmanaged<CFError>?
+         guard let privateKey = SecKeyCreateRandomKey(keyAttributes as CFDictionary, &error) else {
+-            let errorDesc = error?.takeRetainedValue().localizedDescription ?? "unknown"
++            // As for the Root CA, transfer the retained CFError to ARC only once.
++            let keyGenerationError = error?.takeRetainedValue()
++            let errorDesc = keyGenerationError?.localizedDescription ?? "unknown"
+             SecurityLog.crypto.error("event=crypto.rsa_keygen outcome=failure domain=\(domain, privacy: .private(mask: .hash)) error=\(errorDesc)")
+-            throw CertificateError.keyGenerationFailed(error?.takeRetainedValue())
++            throw CertificateError.keyGenerationFailed(keyGenerationError)
+         }
+         SecurityLog.crypto.debug("event=crypto.rsa_keygen outcome=success domain=\(domain, privacy: .private(mask: .hash))")
+ 
