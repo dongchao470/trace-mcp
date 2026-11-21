@@ -14,7 +14,7 @@ on:
       - .gitmodules
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: trace-ios16-${{ github.ref }}
@@ -39,6 +39,12 @@ jobs:
         with:
           xcode-version: latest-stable
 
+      - name: Rust toolchain for full QUIC support
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+          components: llvm-tools
+
       - name: Record toolchain and dependency versions
         id: versions
         shell: bash
@@ -46,19 +52,15 @@ jobs:
           mkdir -p ci-logs
           xcodebuild -version | tee ci-logs/toolchain.log
           xcodebuild -showsdks | tee -a ci-logs/toolchain.log
+          rustc -Vv | tee -a ci-logs/toolchain.log
           git rev-parse HEAD | tee ci-logs/revision.log
           git submodule status --recursive | tee ci-logs/submodules.log
           key=$(cat ci-logs/toolchain.log ci-logs/submodules.log | shasum -a 256 | cut -d' ' -f1)
           echo "key=$key" >> "$GITHUB_OUTPUT"
 
-      - name: Rust toolchain for full QUIC support
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
-
-      - name: Cache complete QUIC XCFramework
+      - name: Restore complete QUIC XCFramework
         id: quic-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             build/quiche/include
@@ -79,11 +81,41 @@ jobs:
           set -o pipefail
           ./Tools/QUIC/build_quiche_apple.sh 2>&1 | tee ci-logs/quiche.log
 
-      - name: Verify QUIC ABI
+      - name: Verify QUIC exports in each architecture
         shell: bash
         run: |
-          set -o pipefail
-          ./Tools/QUIC/verify_quiche_symbols.sh build/quiche/quiche.xcframework 2>&1 | tee ci-logs/quiche-symbols.log
+          python3 -u - <<'PY' 2>&1 | tee ci-logs/quiche-symbols.log
+          import pathlib, re, subprocess
+
+          xcframework = pathlib.Path('build/quiche/quiche.xcframework')
+          rust_lib = pathlib.Path(subprocess.check_output(['rustc', '--print', 'target-libdir'], text=True).strip())
+          nm = rust_lib.parent / 'bin' / 'llvm-nm'
+          subprocess.run([nm, '--version'], check=True)
+          verifier = pathlib.Path('Tools/QUIC/verify_quiche_symbols.sh').read_text()
+          required = set(re.findall(r'^  "(quiche_[a-z0-9_]+)"$', verifier, re.MULTILINE))
+          if not required:
+              raise SystemExit('No required QUIC exports found in the upstream verifier')
+          slices = [('ios-arm64', 'arm64'), ('ios-arm64_x86_64-simulator', 'arm64'), ('ios-arm64_x86_64-simulator', 'x86_64')]
+          for directory, arch in slices:
+              archive = xcframework / directory / 'libquiche.a'
+              print(f'Checking {archive} ({arch})')
+              symbols = subprocess.check_output([nm, f'--arch={arch}', '-gUj', archive], text=True)
+              exported = {line.removeprefix('_') for line in symbols.splitlines()}
+              missing = required - exported
+              if missing:
+                  raise SystemExit(f'{arch}: missing QUIC exports: {", ".join(sorted(missing))}')
+              print(f'Verified {len(required)} QUIC exports for {directory}/{arch}')
+          PY
+
+      - name: Save verified QUIC XCFramework
+        if: steps.quic-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/quiche/include
+            build/quiche/lib
+            build/quiche/quiche.xcframework
+          key: ${{ steps.quic-cache.outputs.cache-primary-key }}
 
       - name: Resolve pinned Swift packages
         shell: bash
@@ -103,35 +135,44 @@ jobs:
             CODE_SIGN_IDENTITY='' DEVELOPMENT_TEAM='' ENABLE_USER_SCRIPT_SANDBOXING=NO \
             build 2>&1 | tee ci-logs/build.log
 
-      - name: Verify bundle deployment targets and package for TrollStore
+      - name: Verify iOS deployment targets and package an ad-hoc IPA
         shell: bash
         run: |
           python3 - <<'PY'
-          import json, pathlib, plistlib, subprocess
+          import json, pathlib, plistlib, re, subprocess
+
+          def version(text):
+              return tuple(map(int, (text + '.0.0').split('.')[:3]))
+
           app = pathlib.Path('DerivedData/Build/Products/Release-iphoneos/Trace.app')
+          app_info = plistlib.loads((app / 'Info.plist').read_bytes())
+          app_group = app_info.get('AppGroupIdentifier') or 'group.' + app_info['CFBundleIdentifier']
+          sources = {'Trace.app': 'Trace/Trace.entitlements', 'TraceVPN.appex': 'TraceVPN/TraceVPN.entitlements', 'TraceWidgetExtension.appex': 'TraceWidget/TraceWidget.entitlements'}
           bundles = sorted(list(app.rglob('*.framework')) + list(app.rglob('*.appex')), key=lambda p: len(p.parts), reverse=True) + [app]
+          assert set(sources) <= {p.name for p in bundles}, 'Missing the app, packet tunnel, or widget'
           records = []
           for bundle in bundles:
-              info_path = bundle / 'Info.plist'
-              if not info_path.exists():
-                  continue
-              info = plistlib.loads(info_path.read_bytes())
-              minimum = info.get('MinimumOSVersion', '0')
-              assert tuple(map(int, minimum.split('.'))) <= (16, 4, 1), (str(bundle), minimum)
-              executable = bundle / info.get('CFBundleExecutable', '')
-              if executable.is_file():
-                  result = subprocess.run(['xcrun', 'vtool', '-show-build', str(executable)], capture_output=True, text=True, check=True)
-                  records.append({'bundle': bundle.name, 'id': info.get('CFBundleIdentifier'), 'minimumOS': minimum, 'macho': result.stdout})
+              info = plistlib.loads((bundle / 'Info.plist').read_bytes())
+              minimum = info.get('MinimumOSVersion')
+              if bundle.name in sources:
+                  assert minimum, f'{bundle.name}: missing MinimumOSVersion'
+              if minimum:
+                  assert version(minimum) <= (16, 0, 0), (str(bundle), minimum)
+              executable = bundle / info['CFBundleExecutable']
+              result = subprocess.run(['xcrun', 'vtool', '-show-build', str(executable)], capture_output=True, text=True, check=True)
+              min_versions = re.findall(r'^\s*minos\s+(\d+(?:\.\d+){0,2})\s*$', result.stdout, re.MULTILINE)
+              assert min_versions and all(version(v) <= (16, 0, 0) for v in min_versions), (str(bundle), result.stdout)
+              records.append({'bundle': bundle.name, 'id': info.get('CFBundleIdentifier'), 'minimumOS': minimum, 'macho': result.stdout})
               command = ['codesign', '--force', '--sign', '-']
-              source = {'Trace.app': 'Trace/Trace.entitlements', 'TraceVPN.appex': 'TraceVPN/TraceVPN.entitlements', 'TraceWidgetExtension.appex': 'TraceWidget/TraceWidget.entitlements'}.get(bundle.name)
+              source = sources.get(bundle.name)
               if source:
-                  text = pathlib.Path(source).read_text().replace('$(APP_GROUP_IDENTIFIER)', info['AppGroupIdentifier']).replace('$(AppIdentifierPrefix)', '')
+                  assert info.get('AppGroupIdentifier', app_group) == app_group, f'{bundle.name}: different application group'
+                  assert '$(' not in app_group and app_group.startswith('group.'), app_group
+                  text = pathlib.Path(source).read_text().replace('$(APP_GROUP_IDENTIFIER)', app_group).replace('$(AppIdentifierPrefix)', '')
                   entitlements = pathlib.Path('ci-logs') / (bundle.name + '.entitlements.plist')
                   entitlements.write_text(text)
                   command += ['--entitlements', str(entitlements)]
               subprocess.run(command + [str(bundle)], check=True)
-          assert any(p.name == 'TraceVPN.appex' for p in bundles), 'Missing packet tunnel'
-          assert any(p.name == 'TraceWidgetExtension.appex' for p in bundles), 'Missing widget'
           pathlib.Path('ci-logs/bundles.json').write_text(json.dumps(records, indent=2))
           print(json.dumps(records, indent=2))
           PY
@@ -155,38 +196,3 @@ jobs:
           name: trace-ios16-diagnostics
           path: ci-logs
           retention-days: 7
-
-      - name: Publish bounded build status on diagnostics branch
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BUILD_STATUS: ${{ job.status }}
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import base64, json, os, pathlib, re, urllib.error, urllib.request
-          base = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
-          def api(path, method='GET', body=None):
-              data = json.dumps(body).encode() if body is not None else None
-              request = urllib.request.Request(base + path, data=data, method=method, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
-              try:
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      return json.load(response)
-              except urllib.error.HTTPError as error:
-                  if error.code == 404 and method == 'GET': return None
-                  raise
-          diagnostic = {'run': os.environ['GITHUB_RUN_ID'], 'sha': os.environ['GITHUB_SHA'], 'status': os.environ['BUILD_STATUS'], 'logs': {}}
-          for path in pathlib.Path('ci-logs').glob('*.log'):
-              lines = path.read_text(errors='replace').splitlines()
-              errors = [line for line in lines if re.search(r'error:|fatal error|FAILED|failed|BUILD SUCCEEDED', line)]
-              diagnostic['logs'][path.name] = [line[:600] for line in (errors[-30:] + lines[-10:])[-40:]]
-          data = json.dumps(diagnostic, indent=2).encode()
-          branch = 'ci-diagnostics'
-          if api('/git/ref/heads/' + branch) is None:
-              api('/git/refs', 'POST', {'ref': 'refs/heads/' + branch, 'sha': os.environ['GITHUB_SHA']})
-          previous = api('/contents/ci-latest.json?ref=' + branch)
-          body = {'message': 'Record iOS 16 baseline result [skip ci]', 'branch': branch, 'content': base64.b64encode(data).decode()}
-          if previous: body['sha'] = previous['sha']
-          result = api('/contents/ci-latest.json', 'PUT', body)
-          print(json.dumps({'run': diagnostic['run'], 'status': diagnostic['status'], 'diagnosticsCommit': result['commit']['sha']}))
-          PY
