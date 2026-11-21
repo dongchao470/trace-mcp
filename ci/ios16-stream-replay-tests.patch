@@ -1,0 +1,219 @@
+diff --git a/TraceLogicTests/TraceCriticalNetworkingRegressionTests.swift b/TraceLogicTests/TraceCriticalNetworkingRegressionTests.swift
+new file mode 100644
+--- /dev/null
++++ b/TraceLogicTests/TraceCriticalNetworkingRegressionTests.swift
+@@ -0,0 +1,162 @@
++import AsyncHTTPClient
++import Foundation
++import NIOCore
++import NIOEmbedded
++import NIOHTTP1
++import NIOTransportServices
++import XCTest
++#if canImport(TraceCriticalFixes)
++@testable import TraceCriticalFixes
++#else
++@testable import TraceFeatures
++@testable import TraceProxy
++#endif
++
++final class TraceCriticalNetworkingRegressionTests: XCTestCase {
++    private final class Flag: @unchecked Sendable { var value = false }
++
++    func testSSEHeadersCancelFixedLifetimeBeforeFirstEvent() {
++        let loop = EmbeddedEventLoop()
++        let fired = Flag()
++        let deadline = NIOMITMStreamingResponseDeadline(eventLoop: loop, deadline: .uptimeNanoseconds(600_000_000_000)) {
++            fired.value = true
++        }
++        deadline.receivedHead(HTTPResponseHead(version: .http1_1, status: .ok,
++            headers: HTTPHeaders([("Content-Type", "Text/Event-Stream; charset=utf-8")])))
++        loop.advanceTime(by: .seconds(3600))
++        XCTAssertFalse(fired.value, "An open SSE stream must not expire at ten minutes")
++    }
++
++    func testOrdinaryResponseStillTimesOut() {
++        let loop = EmbeddedEventLoop()
++        let fired = Flag()
++        let deadline = NIOMITMStreamingResponseDeadline(eventLoop: loop, deadline: .uptimeNanoseconds(10)) {
++            fired.value = true
++        }
++        deadline.receivedHead(HTTPResponseHead(version: .http1_1, status: .ok,
++            headers: HTTPHeaders([("Content-Type", "application/json")])))
++        loop.advanceTime(by: .seconds(1))
++        XCTAssertTrue(fired.value)
++    }
++
++    func testSimilarContentTypeDoesNotDisableTimeout() {
++        let loop = EmbeddedEventLoop()
++        let fired = Flag()
++        let deadline = NIOMITMStreamingResponseDeadline(eventLoop: loop, deadline: .uptimeNanoseconds(10)) {
++            fired.value = true
++        }
++        deadline.receivedHead(HTTPResponseHead(version: .http1_1, status: .ok,
++            headers: HTTPHeaders([("Content-Type", "text/event-streaming")])))
++        loop.advanceTime(by: .seconds(1))
++        XCTAssertTrue(fired.value)
++    }
++
++    func testCompletedResponseCancelsTimer() {
++        let loop = EmbeddedEventLoop()
++        let fired = Flag()
++        let deadline = NIOMITMStreamingResponseDeadline(eventLoop: loop, deadline: .uptimeNanoseconds(10)) {
++            fired.value = true
++        }
++        deadline.cancel()
++        loop.advanceTime(by: .seconds(1))
++        XCTAssertFalse(fired.value)
++    }
++
++    func testLegacyBridgePreservesBodyAndDuplicateHeaders() async throws {
++        try await withServer { client, url in
++            let request = try HTTPClient.Request(url: url + "/echo", method: .POST,
++                body: .string("replay-body"))
++            let response = try await LegacyHTTPClientBridge.execute(client: client, request: request,
++                deadline: .now() + .seconds(5))
++            XCTAssertEqual(response.status, .ok)
++            XCTAssertEqual(response.version, .http1_1)
++            XCTAssertEqual(response.headers["set-cookie"].count, 2)
++            XCTAssertEqual(response.body.map { String(decoding: $0.readableBytesView, as: UTF8.self) }, "replay-body")
++        }
++    }
++
++    func testLegacyBridgeDoesNotHideRedirect() async throws {
++        try await withServer { client, url in
++            let request = try HTTPClient.Request(url: url + "/redirect")
++            let response = try await LegacyHTTPClientBridge.execute(client: client, request: request,
++                deadline: .now() + .seconds(5))
++            XCTAssertEqual(response.status, .found)
++            XCTAssertEqual(response.headers.first(name: "Location"), "/echo")
++        }
++    }
++
++    func testLegacyBridgeDeadlineFailsWithoutRuntimeAbort() async throws {
++        try await withServer { client, url in
++            let request = try HTTPClient.Request(url: url + "/hang")
++            do {
++                _ = try await LegacyHTTPClientBridge.execute(client: client, request: request,
++                    deadline: .now() + .milliseconds(150))
++                XCTFail("Expected a timeout")
++            } catch {
++                XCTAssertEqual(error as? HTTPClientError, .deadlineExceeded)
++            }
++        }
++    }
++
++    func testLegacyBridgeCancellationReachesNIO() async throws {
++        try await withServer { client, url in
++            let request = try HTTPClient.Request(url: url + "/hang")
++            let operation = Task {
++                try await LegacyHTTPClientBridge.execute(client: client, request: request,
++                    deadline: .now() + .seconds(10))
++            }
++            try await Task.sleep(nanoseconds: 100_000_000)
++            operation.cancel()
++            do { _ = try await operation.value; XCTFail("Expected cancellation") }
++            catch { XCTAssertTrue(error is CancellationError) }
++        }
++    }
++
++    private func withServer(_ run: (HTTPClient, String) async throws -> Void) async throws {
++        let group = NIOTSEventLoopGroup(loopCount: 1)
++        var configuration = HTTPClient.Configuration()
++        configuration.redirectConfiguration = .disallow
++        let client = HTTPClient(eventLoopGroupProvider: .shared(group), configuration: configuration)
++        let server = try await NIOTSListenerBootstrap(group: group)
++            .childChannelInitializer { channel in
++                channel.pipeline.configureHTTPServerPipeline().flatMap {
++                    channel.pipeline.addHandler(EchoHandler())
++                }
++            }.bind(host: "127.0.0.1", port: 0).get()
++        do {
++            try await run(client, "http://127.0.0.1:\(server.localAddress!.port!)")
++        } catch {
++            try? await server.close().get()
++            try? await client.shutdown()
++            try? await group.shutdownGracefully()
++            throw error
++        }
++        try await server.close().get()
++        try await client.shutdown()
++        try await group.shutdownGracefully()
++    }
++
++    private final class EchoHandler: ChannelInboundHandler {
++        typealias InboundIn = HTTPServerRequestPart
++        typealias OutboundOut = HTTPServerResponsePart
++        private var path = ""
++        private var body = ByteBuffer()
++
++        func channelRead(context: ChannelHandlerContext, data: NIOAny) {
++            switch unwrapInboundIn(data) {
++            case let .head(head): path = head.uri; body.clear()
++            case var .body(chunk): body.writeBuffer(&chunk)
++            case .end:
++                guard path != "/hang" else { return }
++                var headers = HTTPHeaders([("Content-Length", String(body.readableBytes)),
++                    ("Set-Cookie", "a=1"), ("Set-Cookie", "b=2")])
++                let status: HTTPResponseStatus = path == "/redirect" ? .found : .ok
++                if status == .found { headers.add(name: "Location", value: "/echo") }
++                context.write(wrapOutboundOut(.head(HTTPResponseHead(version: .http1_1,
++                    status: status, headers: headers))), promise: nil)
++                context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
++                context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
++            }
++        }
++    }
++}
+diff --git a/ci/run-critical-network-regressions.py b/ci/run-critical-network-regressions.py
+new file mode 100644
+--- /dev/null
++++ b/ci/run-critical-network-regressions.py
+@@ -0,0 +1,47 @@
++"""Run the exact critical-fix sources without building the iOS UI or changing app data."""
++from pathlib import Path
++import argparse
++import hashlib
++import shutil
++import subprocess
++
++parser = argparse.ArgumentParser()
++parser.add_argument('--prepare-only', action='store_true')
++parser.add_argument('--output', default='.critical-regressions')
++args = parser.parse_args()
++root = Path(__file__).resolve().parent.parent
++out = Path(args.output).resolve()
++sources = out / 'Sources/TraceCriticalFixes'
++tests = out / 'Tests/TraceCriticalFixesTests'
++sources.mkdir(parents=True, exist_ok=True)
++tests.mkdir(parents=True, exist_ok=True)
++files = [
++    ('TraceFeatures/Request/LegacyHTTPClientBridge.swift', sources),
++    ('TraceProxy/MITM/NIOMITMStreamingResponseDeadline.swift', sources),
++    ('TraceLogicTests/TraceCriticalNetworkingRegressionTests.swift', tests),
++]
++for name, directory in files:
++    source = root / name
++    shutil.copy2(source, directory)
++    print(hashlib.sha256(source.read_bytes()).hexdigest(), name, flush=True)
++shutil.copy2(root / 'Package.resolved', out / 'Package.resolved')
++(out / 'Package.swift').write_text('''// swift-tools-version: 6.0
++import PackageDescription
++let package = Package(name: "TraceCriticalFixes", platforms: [.macOS(.v13)], dependencies: [
++    .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.32.0"),
++    .package(url: "https://github.com/apple/swift-nio.git", from: "2.0.0"),
++    .package(url: "https://github.com/apple/swift-nio-transport-services.git", from: "1.0.0")
++], targets: [
++    .target(name: "TraceCriticalFixes", dependencies: [
++        .product(name: "AsyncHTTPClient", package: "async-http-client"),
++        .product(name: "NIOCore", package: "swift-nio"),
++        .product(name: "NIOHTTP1", package: "swift-nio")
++    ], swiftSettings: [.swiftLanguageMode(.v6)]),
++    .testTarget(name: "TraceCriticalFixesTests", dependencies: ["TraceCriticalFixes",
++        .product(name: "NIOEmbedded", package: "swift-nio"),
++        .product(name: "NIOTransportServices", package: "swift-nio-transport-services")
++    ], swiftSettings: [.swiftLanguageMode(.v5)])
++])
++''')
++if not args.prepare_only:
++    subprocess.run(['xcrun', 'swift', 'test', '-j', '4'], cwd=out, check=True)
