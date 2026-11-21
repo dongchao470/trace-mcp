@@ -124,6 +124,15 @@ jobs:
           xcodebuild -resolvePackageDependencies -project Trace.xcodeproj -scheme Trace \
             -clonedSourcePackagesDirPath SourcePackages 2>&1 | tee ci-logs/resolve.log
 
+      - name: Apply reviewed CFError ownership fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check ci/ios16-certificate-error-ownership.patch
+          git apply ci/ios16-certificate-error-ownership.patch
+          git diff --check
+          git diff -- TraceSecurity/Certificate/CertificateManager.swift | tee ci-logs/certificate-error-ownership.patch
+
       - name: Build full device app for iOS 16
         shell: bash
         run: |
@@ -133,6 +142,7 @@ jobs:
             -derivedDataPath DerivedData -clonedSourcePackagesDirPath SourcePackages \
             IPHONEOS_DEPLOYMENT_TARGET=16.0 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY='' DEVELOPMENT_TEAM='' ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            CURRENT_PROJECT_VERSION=13 \
             build 2>&1 | tee ci-logs/build.log
 
       - name: Verify iOS deployment targets and package an ad-hoc IPA
@@ -151,6 +161,7 @@ jobs:
           bundles = sorted(list(app.rglob('*.framework')) + list(app.rglob('*.appex')), key=lambda p: len(p.parts), reverse=True) + [app]
           assert set(sources) <= {p.name for p in bundles}, 'Missing the app, packet tunnel, or widget'
           records = []
+          keychain_groups = {}
           for bundle in bundles:
               info = plistlib.loads((bundle / 'Info.plist').read_bytes())
               minimum = info.get('MinimumOSVersion')
@@ -169,10 +180,21 @@ jobs:
                   assert info.get('AppGroupIdentifier', app_group) == app_group, f'{bundle.name}: different application group'
                   assert '$(' not in app_group and app_group.startswith('group.'), app_group
                   text = pathlib.Path(source).read_text().replace('$(APP_GROUP_IDENTIFIER)', app_group).replace('$(AppIdentifierPrefix)', '')
+                  groups = plistlib.loads(text.encode()).get('keychain-access-groups', [])
+                  if bundle.name in ('Trace.app', 'TraceVPN.appex'):
+                      assert len(groups) == 1 and groups[0] == 'com.justin.trace', (bundle.name, groups)
+                      # Ad-hoc/TrollStore builds have no Apple Team ID prefix.
+                      # Use the exact entitlement instead of inferring "com." as a Team ID.
+                      info['TraceKeychainAccessGroup'] = groups[0]
+                      (bundle / 'Info.plist').write_bytes(plistlib.dumps(info))
+                      keychain_groups[bundle.name] = groups[0]
+                      records[-1]['keychainAccessGroup'] = groups[0]
+                  assert info['CFBundleVersion'] == '13', (bundle.name, info['CFBundleVersion'])
                   entitlements = pathlib.Path('ci-logs') / (bundle.name + '.entitlements.plist')
                   entitlements.write_text(text)
                   command += ['--entitlements', str(entitlements)]
               subprocess.run(command + [str(bundle)], check=True)
+          assert keychain_groups == {'Trace.app': 'com.justin.trace', 'TraceVPN.appex': 'com.justin.trace'}
           pathlib.Path('ci-logs/bundles.json').write_text(json.dumps(records, indent=2))
           print(json.dumps(records, indent=2))
           PY
