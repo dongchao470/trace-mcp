@@ -1,0 +1,49 @@
+{
+  "run": "44908773251",
+  "sha": "016ca758b95109ca0a2ac5ad9941cf55070ddcd8",
+  "status": "failure",
+  "logs": {
+    "quiche.log": [
+      "\u001b[1m\u001b[33mwarning\u001b[0m: `quiche` (lib) generated 2 warnings",
+      "\u001b[1m\u001b[92m    Finished\u001b[0m `release` profile [optimized + debuginfo] target(s) in 29.75s",
+      "==> Fixing simulator platform markers",
+      "    Fixed 10 object file(s) with wrong platform marker in libquiche.a",
+      "xcframework successfully written out to: /Users/runner/work/trace-mcp/trace-mcp/build/quiche/quiche.xcframework",
+      "",
+      "quiche artifacts generated:",
+      "  - Device static lib: /Users/runner/work/trace-mcp/trace-mcp/build/quiche/lib/aarch64-apple-ios/libquiche.a",
+      "  - Simulator static lib: /Users/runner/work/trace-mcp/trace-mcp/build/quiche/lib/ios-simulator-universal/libquiche.a",
+      "  - XCFramework: /Users/runner/work/trace-mcp/trace-mcp/build/quiche/quiche.xcframework"
+    ],
+    "revision.log": [
+      "016ca758b95109ca0a2ac5ad9941cf55070ddcd8"
+    ],
+    "submodules.log": [
+      " 4d6c334dbfb68a79d1970c2744e62d09f71df12f ThirdParty/hev-socks5-tunnel (4d6c334)",
+      " 4be2e621813ba0315cfacd995bf501bde91d6996 ThirdParty/hev-socks5-tunnel/src/core (4be2e62)",
+      " 8d83bbbf79557138726c8ee5a5fae99cbb978d61 ThirdParty/hev-socks5-tunnel/third-part/hev-task-system (8d83bbb)",
+      " 07dbf162c718cc78ddedb9e67c6ebd17065eaf13 ThirdParty/hev-socks5-tunnel/third-part/lwip (07dbf16)",
+      " efa36117a8646d26d12b58e05bac472d7854a70d ThirdParty/hev-socks5-tunnel/third-part/yaml (efa3611)",
+      " 445292f46e05b72d56b9b957da77bfac3d24fc77 ThirdParty/quiche (445292f)",
+      " f1c75347daa2ea81a941e953f2263e0a4d970c8d ThirdParty/quiche/quiche/deps/boringssl (f1c7534)"
+    ],
+    "toolchain.log": [
+      "",
+      "visionOS Simulator SDKs:",
+      "\tSimulator - visionOS 26.2     \t-sdk xrsimulator26.2",
+      "",
+      "watchOS SDKs:",
+      "\twatchOS 26.2                  \t-sdk watchos26.2",
+      "",
+      "watchOS Simulator SDKs:",
+      "\tSimulator - watchOS 26.2      \t-sdk watchsimulator26.2",
+      ""
+    ],
+    "quiche-symbols.log": [
+      "quiche symbol verification failed.",
+      "Failed to inspect symbols for: build/quiche/quiche.xcframework/ios-arm64_x86_64-simulator/libquiche.a",
+      "Failed to inspect symbols for: build/quiche/quiche.xcframework/ios-arm64/libquiche.a",
+      "quiche symbol verification failed."
+    ]
+  }
+}
