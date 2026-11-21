@@ -1,0 +1,177 @@
+diff --git a/TraceProxy/MITM/NIOMITMHTTPConnectHandler+Forwarding.swift b/TraceProxy/MITM/NIOMITMHTTPConnectHandler+Forwarding.swift
+index 456d8cd..d3d5bad 100644
+--- a/TraceProxy/MITM/NIOMITMHTTPConnectHandler+Forwarding.swift
++++ b/TraceProxy/MITM/NIOMITMHTTPConnectHandler+Forwarding.swift
+@@ -22,7 +22,7 @@ extension NIOMITMHTTPConnectHandler {
+         requestHead: HTTPRequestHead,
+         context: ChannelHandlerContext
+     ) {
+-        guard let httpClient = NIORuntime.shared.currentResources()?.httpClient else {
++        guard let runtimeResources = NIORuntime.shared.currentResources() else {
+             finalizeActiveRequestAsHTTPFailure(
+                 status: .internalServerError,
+                 reason: "nio_runtime_unavailable"
+@@ -93,7 +93,7 @@ extension NIOMITMHTTPConnectHandler {
+                     context.eventLoop.execute {
+                         guard let self, self.state == .forwardingHTTPRequest else { return }
+ 
+-                        let responsePipeline: ResponsePipeline
++                        var responsePipeline: ResponsePipeline
+                         let blockQUIC: Bool
+                         switch planResult {
+                         case let .success(plan):
+@@ -107,6 +107,10 @@ extension NIOMITMHTTPConnectHandler {
+                             )
+                         }
+ 
++                        // HTTP/2 SSE reaches this path too. Whole-body buffering would wait forever.
++                        if Self.isSSERequest(headers: sanitizedHeaders) {
++                            responsePipeline = .streamAndCapture
++                        }
+                         self.logConnectStage(
+                             stage: "response_pipeline",
+                             outcome: "selected",
+@@ -122,7 +126,7 @@ extension NIOMITMHTTPConnectHandler {
+                         self.requestSentAt = Date()
+                         if responsePipeline == .streamAndCapture {
+                             self.forwardStreamingUpstreamResponse(
+-                                httpClient: httpClient,
++                                httpClient: runtimeResources.streamingHTTPClient,
+                                 request: outboundRequest,
+                                 outboundContext: outboundContext,
+                                 requestHead: requestHead,
+@@ -133,7 +137,7 @@ extension NIOMITMHTTPConnectHandler {
+                             )
+                             return
+                         }
+-                        httpClient.execute(request: outboundRequest, deadline: upstreamDeadline).whenComplete { [weak self] result in
++                        runtimeResources.httpClient.execute(request: outboundRequest, deadline: upstreamDeadline).whenComplete { [weak self] result in
+                             context.eventLoop.execute {
+                                 guard let self, self.state == .forwardingHTTPRequest else { return }
+                                 switch result {
+@@ -351,6 +355,16 @@ extension NIOMITMHTTPConnectHandler {
+ 
+         let targetPort = targetURL.port ?? ((targetURL.scheme?.lowercased() == "https" || targetURL.scheme?.lowercased() == "wss") ? 443 : 80)
+         var requestHeaders = sanitizedStreamingRequestHeaders(from: outboundHeaders)
++        let sseWireBody = normalizeWireBody(
++            outboundContext.body,
++            headers: &requestHeaders,
++            compressionInfo: outboundContext.requestSnapshot.requestBody.getCompressionInfo(),
++            direction: "request"
++        )
++        requestHeaders.remove(name: "Transfer-Encoding")
++        if !sseWireBody.isEmpty || requestHeaders.first(name: "Content-Length") != nil {
++            requestHeaders.replaceOrAdd(name: "Content-Length", value: String(sseWireBody.count))
++        }
+         requestHeaders.remove(name: "Accept-Encoding")
+         requestHeaders.replaceOrAdd(name: "Accept-Encoding", value: "identity")
+         guard let streamingRequestHead = makeStreamingUpstreamRequestHead(
+@@ -404,6 +418,7 @@ extension NIOMITMHTTPConnectHandler {
+                         self.upstreamChannel = upstream
+                         var closeAfterSend = false
+                         var responseHeadSeen = false
++                        var responseEndSeen = false
+                         let sseInterceptionRuntime = SSEInterceptionRuntime()
+                         var bodyRelayChain = context.eventLoop.makeSucceededVoidFuture()
+ 
+@@ -432,7 +447,8 @@ extension NIOMITMHTTPConnectHandler {
+                                     }
+                                     var forwardedHead = head
+                                     forwardedHead.headers.remove(name: "Proxy-Connection")
+-                                    context.write(self.wrapOutboundOut(.head(forwardedHead)), promise: nil)
++                                    // Send the handshake immediately even if the stream is initially idle.
++                                    context.writeAndFlush(self.wrapOutboundOut(.head(forwardedHead)), promise: nil)
+                                 case let .body(buffer):
+                                     let chunkData = self.byteBufferToData(buffer)
+                                     guard let streamRuntime else {
+@@ -492,6 +508,7 @@ extension NIOMITMHTTPConnectHandler {
+                                         )
+                                     }
+                                 case let .end(trailers):
++                                    responseEndSeen = true
+                                     bodyRelayChain.flatMap {
+                                         sseCapture.finish(
+                                             succeeded: true,
+@@ -551,12 +568,17 @@ extension NIOMITMHTTPConnectHandler {
+                                     reason: error.localizedDescription,
+                                     eventLoop: context.eventLoop
+                                 )
+-                                self.sendResponse(
+-                                    status: .badGateway,
+-                                    body: "Upstream SSE request failed",
+-                                    closeAfterSend: true,
+-                                    context: context
+-                                )
++                                if responseHeadSeen {
++                                    // Once streaming began, a second HTTP status line would corrupt the stream.
++                                    context.close(promise: nil)
++                                } else {
++                                    self.sendResponse(
++                                        status: .badGateway,
++                                        body: "Upstream SSE request failed",
++                                        closeAfterSend: true,
++                                        context: context
++                                    )
++                                }
+                                 self.state = .closed
+                                 self.upstreamChannel = nil
+                             }
+@@ -565,7 +587,8 @@ extension NIOMITMHTTPConnectHandler {
+                         let onInactive: @Sendable () -> Void = { [weak self] in
+                             let context = sendableContext.value
+                             context.eventLoop.execute {
+-                                guard let self, self.state == .forwardingHTTPRequest else { return }
++                                // The normal end path owns closing until queued interception writes finish.
++                                guard let self, self.state == .forwardingHTTPRequest, !responseEndSeen else { return }
+                                 sseCapture.finish(
+                                     succeeded: responseHeadSeen,
+                                     captureConfig: self.captureConfigProvider(),
+@@ -598,7 +621,7 @@ extension NIOMITMHTTPConnectHandler {
+                         .flatMap {
+                             self.writeAndFlushStreamingUpstreamRequest(
+                                 head: streamingRequestHead,
+-                                body: outboundContext.body,
++                                body: sseWireBody,
+                                 to: upstream
+                             )
+                         }
+@@ -1269,6 +1292,7 @@ extension NIOMITMHTTPConnectHandler {
+         var closeAfterSend = false
+         var responseHeadSent = false
+         var terminalStateReached = false
++        let responseDeadline = NIOMITMStreamingResponseDeadline(eventLoop: context.eventLoop)
+         let targetHost = URL(string: outboundContext.url)?.host ?? "unknown"
+         let sendableContext = NIOMITMUncheckedSendableBox(value: context)
+ 
+@@ -1284,6 +1308,7 @@ extension NIOMITMHTTPConnectHandler {
+                     return
+                 }
+ 
++                responseDeadline.receivedHead(head)
+                 responseHead = head
+                 responseHeadSent = true
+                 if self.responseHeadAt == nil { self.responseHeadAt = Date() }
+@@ -1604,10 +1629,20 @@ extension NIOMITMHTTPConnectHandler {
+             onFinish: onFinish,
+             onError: onError
+         )
+-        let task = httpClient.execute(request: request, delegate: delegate, deadline: upstreamDeadline)
+-        task.futureResult.whenFailure { error in
+-            onError(error)
++        // An AHC absolute deadline cannot be removed once a response turns out to be SSE.
++        // Keep the timeout here instead, and cancel it as soon as SSE response headers arrive.
++        let task = httpClient.execute(request: request, delegate: delegate)
++        responseDeadline.start(deadline: upstreamDeadline) {
++            onError(HTTPClientError.deadlineExceeded)
++            task.cancel()
++        }
++        task.futureResult.whenComplete { result in
++            context.eventLoop.execute {
++                responseDeadline.cancel()
++                if case let .failure(error) = result { onError(error) }
++            }
+         }
++        context.channel.closeFuture.whenComplete { _ in task.cancel() }
+     }
+ 
+     func sendHTTPResponse(
