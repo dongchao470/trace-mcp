@@ -1,0 +1,180 @@
+diff --git a/TraceProxy/MITM/Streams/SSEFlowHandler.swift b/TraceProxy/MITM/Streams/SSEFlowHandler.swift
+index 52bfef4..304ef66 100644
+--- a/TraceProxy/MITM/Streams/SSEFlowHandler.swift
++++ b/TraceProxy/MITM/Streams/SSEFlowHandler.swift
+@@ -31,48 +31,39 @@ final class SSEFlowHandler {
+         )
+         let session = runtime.snapshot()
+ 
+-        connectHandler.streamOpenInterceptionFuture(session: session, eventLoop: context.eventLoop).whenComplete { [weak self] result in
+-            context.eventLoop.execute {
+-                guard let self else { return }
++        let eventLoop = context.eventLoop
++        let contextBox = NIOMITMUncheckedSendableBox(value: context)
++        // This flow helper is temporary. Only the channel owns the handler needed by the callback.
++        connectHandler.streamOpenInterceptionFuture(session: session, eventLoop: eventLoop)
++            .hop(to: eventLoop).whenComplete { [weak handler = connectHandler] result in
++                let context = contextBox.value
++                guard let handler, context.channel.isActive, handler.state == .forwardingHTTPRequest else { return }
+                 let decision = (try? result.get()) ?? .forward
+ 
+                 switch decision {
+                 case .block, .drop:
+-                    self.connectHandler.sendResponse(
++                    handler.sendResponse(
+                         status: .forbidden,
+                         body: "SSE stream blocked by interceptor",
+                         closeAfterSend: true,
+                         context: context
+                     )
++                    return
+                 case let .modify(mutation):
+                     runtime.mergeMetadata(mutation.metadata)
+-                    self.persistSession(runtime.snapshot())
+-                    self.connectHandler.forwardSSEStreamLegacy(
+-                        outboundContext,
+-                        requestHead: requestHead,
+-                        outboundHeaders: outboundHeaders,
+-                        context: context,
+-                        streamRuntime: runtime,
+-                        openDecision: decision
+-                    )
+                 case .forward, .inject, .replay:
+-                    self.persistSession(runtime.snapshot())
+-                    self.connectHandler.forwardSSEStreamLegacy(
+-                        outboundContext,
+-                        requestHead: requestHead,
+-                        outboundHeaders: outboundHeaders,
+-                        context: context,
+-                        streamRuntime: runtime,
+-                        openDecision: decision
+-                    )
++                    break
+                 }
+-            }
+-        }
+-    }
+ 
+-    private func persistSession(_ session: StreamSession) {
+-        DispatchQueue.global(qos: .utility).async {
+-            try? AppGroupStorage.shared.upsertStreamSession(session)
+-        }
++                handler.persistStreamRuntimeSnapshot(runtime)
++                handler.forwardSSEStreamLegacy(
++                    outboundContext,
++                    requestHead: requestHead,
++                    outboundHeaders: outboundHeaders,
++                    context: context,
++                    streamRuntime: runtime,
++                    openDecision: decision
++                )
++            }
+     }
+ }
+diff --git a/TraceFeatures/Request/LegacyHTTPClientBridge.swift b/TraceFeatures/Request/LegacyHTTPClientBridge.swift
+new file mode 100644
+--- /dev/null
++++ b/TraceFeatures/Request/LegacyHTTPClientBridge.swift
+@@ -0,0 +1,57 @@
++import AsyncHTTPClient
++import Foundation
++import NIOCore
++
++/// Use AHC's EventLoopFuture transport rather than its async/TaskLocal tracing path.
++/// The latter aborts in swift_task_dealloc on the affected iOS 16 runtime.
++enum LegacyHTTPClientBridge {
++    static let maximumResponseBytes = 32 * 1024 * 1024
++
++    static func execute(
++        client: HTTPClient,
++        request: HTTPClient.Request,
++        deadline: NIODeadline
++    ) async throws -> HTTPClient.Response {
++        let cancellation = RequestCancellation()
++        do {
++            return try await withTaskCancellationHandler(operation: {
++                try Task.checkCancellation()
++                return try await withCheckedThrowingContinuation { continuation in
++                    let accumulator = ResponseAccumulator(request: request, maxBodySize: maximumResponseBytes)
++                    let task = client.execute(request: request, delegate: accumulator, deadline: deadline)
++                    cancellation.install(task)
++                    task.futureResult.whenComplete { result in
++                        continuation.resume(with: result)
++                    }
++                }
++            }, onCancel: {
++                cancellation.cancel()
++            })
++        } catch {
++            if Task.isCancelled { throw CancellationError() }
++            throw error
++        }
++    }
++
++    private final class RequestCancellation: @unchecked Sendable {
++        private let lock = NSLock()
++        private var task: HTTPClient.Task<HTTPClient.Response>?
++        private var isCancelled = false
++
++        func install(_ task: HTTPClient.Task<HTTPClient.Response>) {
++            lock.lock()
++            self.task = task
++            let cancelImmediately = isCancelled
++            lock.unlock()
++            if cancelImmediately { task.cancel() }
++        }
++
++        func cancel() {
++            lock.lock()
++            isCancelled = true
++            let task = task
++            lock.unlock()
++            task?.cancel()
++        }
++    }
++}
+diff --git a/TraceProxy/MITM/NIOMITMStreamingResponseDeadline.swift b/TraceProxy/MITM/NIOMITMStreamingResponseDeadline.swift
+new file mode 100644
+--- /dev/null
++++ b/TraceProxy/MITM/NIOMITMStreamingResponseDeadline.swift
+@@ -0,0 +1,40 @@
++import Foundation
++import NIOCore
++import NIOHTTP1
++
++/// All methods are called on the downstream event loop.
++/// Ordinary responses keep their bounded deadline; an SSE response has no fixed lifetime.
++final class NIOMITMStreamingResponseDeadline: @unchecked Sendable {
++    private let eventLoop: EventLoop
++    private var timeout: Scheduled<Void>?
++    private var cancelled = false
++
++    init(eventLoop: EventLoop) {
++        self.eventLoop = eventLoop
++    }
++
++    convenience init(eventLoop: EventLoop, deadline: NIODeadline, onTimeout: @escaping @Sendable () -> Void) {
++        self.init(eventLoop: eventLoop)
++        start(deadline: deadline, onTimeout: onTimeout)
++    }
++
++    func start(deadline: NIODeadline, onTimeout: @escaping @Sendable () -> Void) {
++        guard !cancelled else { return }
++        timeout = eventLoop.scheduleTask(deadline: deadline, onTimeout)
++    }
++
++    func receivedHead(_ head: HTTPResponseHead) {
++        let isEventStream = head.headers["content-type"].contains {
++            $0.split(separator: ";", maxSplits: 1).first?
++                .trimmingCharacters(in: .whitespacesAndNewlines)
++                .lowercased() == "text/event-stream"
++        }
++        if isEventStream { cancel() }
++    }
++
++    func cancel() {
++        cancelled = true
++        timeout?.cancel()
++        timeout = nil
++    }
++}
