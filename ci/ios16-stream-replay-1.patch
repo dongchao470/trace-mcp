@@ -1,0 +1,132 @@
+diff --git a/TraceCore/Networking/NIORuntime.swift b/TraceCore/Networking/NIORuntime.swift
+index 040dc9c..3600103 100644
+--- a/TraceCore/Networking/NIORuntime.swift
++++ b/TraceCore/Networking/NIORuntime.swift
+@@ -26,6 +26,8 @@ public enum NIORuntimeShutdownReason: String {
+ public struct NIORuntimeResources {
+     public let eventLoopGroup: EventLoopGroup
+     public let httpClient: HTTPClient
++    /// Proxy response streaming must not inherit the ordinary client's idle-read timeout.
++    public let streamingHTTPClient: HTTPClient
+ }
+ 
+ public final class NIORuntime: @unchecked Sendable {
+@@ -62,13 +64,22 @@ public final class NIORuntime: @unchecked Sendable {
+                 read: .seconds(60)
+             )
+             configuration.ignoreUncleanSSLShutdown = true
++            // A proxy must return redirects unchanged; RequestExecutor follows them explicitly.
++            configuration.redirectConfiguration = .disallow
+             let httpClient = HTTPClient(
+                 eventLoopGroupProvider: .shared(eventLoopGroup),
+                 configuration: configuration
+             )
++            var streamingConfiguration = configuration
++            streamingConfiguration.timeout = .init(connect: .seconds(30), read: nil)
++            let streamingHTTPClient = HTTPClient(
++                eventLoopGroupProvider: .shared(eventLoopGroup),
++                configuration: streamingConfiguration
++            )
+             state.resources = NIORuntimeResources(
+                 eventLoopGroup: eventLoopGroup,
+-                httpClient: httpClient
++                httpClient: httpClient,
++                streamingHTTPClient: streamingHTTPClient
+             )
+         }
+ 
+@@ -158,7 +169,11 @@ private extension NIORuntime {
+     }
+ 
+     func shutdown(_ resources: NIORuntimeResources) throws {
+-        try resources.httpClient.syncShutdown()
+-        try resources.eventLoopGroup.syncShutdownGracefully()
++        // Attempt every shutdown even if one client reports an error.
++        var firstError: Error?
++        do { try resources.streamingHTTPClient.syncShutdown() } catch { firstError = error }
++        do { try resources.httpClient.syncShutdown() } catch { if firstError == nil { firstError = error } }
++        do { try resources.eventLoopGroup.syncShutdownGracefully() } catch { if firstError == nil { firstError = error } }
++        if let firstError { throw firstError }
+     }
+ }
+diff --git a/TraceFeatures/Request/RequestExecutor.swift b/TraceFeatures/Request/RequestExecutor.swift
+index 264a1c0..e1b58d0 100644
+--- a/TraceFeatures/Request/RequestExecutor.swift
++++ b/TraceFeatures/Request/RequestExecutor.swift
+@@ -166,7 +166,7 @@ public final class AsyncHTTPClientRequestTransport: @unchecked Sendable, Request
+             }
+ 
+             guard request.followRedirects, let redirectTarget else {
+-                let body = try await collectBody(from: response.body)
++                let body = response.body.map { Data($0.readableBytesView) } ?? Data()
+                 return RequestExecutorTransportResponse(
+                     finalURL: currentURL,
+                     statusCode: Int(response.status.code),
+@@ -187,8 +187,7 @@ public final class AsyncHTTPClientRequestTransport: @unchecked Sendable, Request
+                 throw RequestExecutorTransportError.redirectCycleDetected(redirectTarget.absoluteString)
+             }
+ 
+-            try await drainBody(response.body)
+-
++            // The compatibility delegate has already consumed this redirect response body.
+             let transformed = transformForRedirect(
+                 originalURL: currentURL,
+                 redirectURL: redirectTarget,
+@@ -215,22 +214,29 @@ private extension AsyncHTTPClientRequestTransport {
+         headers: [String: String],
+         body: Data?,
+         timeout: TimeInterval
+-    ) async throws -> HTTPClientResponse {
+-        var request = HTTPClientRequest(url: url.absoluteString)
+-        request.method = nioMethod(from: methodRaw)
+-
++    ) async throws -> HTTPClient.Response {
+         var nioHeaders = HTTPHeaders()
+         for (key, value) in headers {
+             nioHeaders.replaceOrAdd(name: key, value: value)
+         }
+-        request.headers = nioHeaders
+-
++        var requestBody: HTTPClient.Body?
+         if let body, !body.isEmpty {
+-            request.body = .bytes(body)
+-        }
+-
++            var buffer = ByteBufferAllocator().buffer(capacity: body.count)
++            buffer.writeBytes(body)
++            requestBody = .byteBuffer(buffer)
++        }
++        let request = try HTTPClient.Request(
++            url: url.absoluteString,
++            method: nioMethod(from: methodRaw),
++            headers: nioHeaders,
++            body: requestBody
++        )
+         let timeoutSeconds = max(Int64(timeout.rounded(.up)), 1)
+-        return try await client.execute(request, timeout: .seconds(timeoutSeconds))
++        return try await LegacyHTTPClientBridge.execute(
++            client: client,
++            request: request,
++            deadline: .now() + .seconds(timeoutSeconds)
++        )
+     }
+ 
+     func nioMethod(from raw: String) -> NIOHTTP1.HTTPMethod {
+@@ -257,17 +263,6 @@ private extension AsyncHTTPClientRequestTransport {
+         headers.map { TraceHTTPHeader(key: $0.name, value: $0.value) }
+     }
+ 
+-    func collectBody(from body: HTTPClientResponse.Body) async throws -> Data {
+-        let buffer = try await body.collect(upTo: Int.max)
+-        return Data(buffer.readableBytesView)
+-    }
+-
+-    func drainBody(_ body: HTTPClientResponse.Body) async throws {
+-        for try await _ in body {
+-            continue
+-        }
+-    }
+-
+     func extractRedirectTarget(
+         status: HTTPResponseStatus,
+         location: String?,
