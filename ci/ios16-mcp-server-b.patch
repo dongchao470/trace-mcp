@@ -1,6 +1,6 @@
 --- a/TraceCore/MCP/TraceMCPServer.swift
 +++ b/TraceCore/MCP/TraceMCPServer.swift
-@@ -85,48 +166,101 @@
+@@ -85,48 +157,101 @@
              return
          }
  
@@ -49,7 +49,7 @@
 +            case .ready:
 +                let current = self.status
 +                mcpLog.info(
-+                    "mcp.listener ready port=\(current.port, privacy: .public) host=\(current.host, privacy: .public) loopbackIf=\(loopbackInterface)"
++                    "mcp.listener ready port=\(Int(current.port), privacy: .public) host=\(current.host, privacy: .public) loopbackIf=\(loopbackInterface)"
 +                )
 +                TraceMCPStatusStore.publish(self.snapshot())
 +                self.scheduleSelfCheck()
@@ -93,7 +93,7 @@
 +        state.loopbackInterface = loopbackInterface
 +        lock.unlock()
 +        listener.start(queue: queue)
-+        mcpLog.info("mcp.start port=\(port.rawValue, privacy: .public) host=\(host, privacy: .public) loopbackIf=\(loopbackInterface)")
++        mcpLog.info("mcp.start port=\(Int(port.rawValue), privacy: .public) host=\(host, privacy: .public) loopbackIf=\(loopbackInterface)")
      }
  
 +    private func accept(_ connection: NWConnection) {
