@@ -1,0 +1,105 @@
+//
+//  TraceMCPTools.swift
+//  TraceCore
+//
+//  Tool surface exposed by the Trace MCP server.
+//
+
+import AsyncHTTPClient
+import Foundation
+import NIOCore
+
+public struct TraceMCPToolDefinition: Sendable {
+    public let name: String
+    public let description: String
+    public let inputSchema: JSONValue
+
+    public init(name: String, description: String, inputSchema: JSONValue) {
+        self.name = name
+        self.description = description
+        self.inputSchema = inputSchema
+    }
+}
+
+/// Serializes every tool call; storage handles are not re-entrant.
+public actor TraceMCPDispatcher {
+    public static let shared = TraceMCPDispatcher()
+
+    private let storage = AppGroupStorage.shared
+    private let isoFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    public init() {}
+
+    // MARK: - Definitions
+
+    public nonisolated var tools: [TraceMCPToolDefinition] {
+        [
+            TraceMCPToolDefinition(
+                name: "trace_status",
+                description: "Trace 抓包状态：进程宿主、版本、端口、运行时长、抓包与会话数量、重写规则数量。",
+                inputSchema: JSONValue(["type": .string("object"), "properties": .object([:])])
+            ),
+            TraceMCPToolDefinition(
+                name: "list_sessions",
+                description: "列出抓包会话（最近的在前）。返回 id、名称、开始时间、请求数、是否进行中。",
+                inputSchema: JSONValue([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "limit": .object(["type": .string("integer"), "default": .number(20), "maximum": .number(200)]),
+                    ]),
+                ])
+            ),
+            TraceMCPToolDefinition(
+                name: "list_requests",
+                description: "按条件列出抓到的请求，返回精简条目（id/method/url/status/duration 等），用于浏览与筛选。",
+                inputSchema: JSONValue([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "session_id": .object(["type": .string("string"), "description": "只看某个会话"]),
+                        "host": .object(["type": .string("string"), "description": "域名包含匹配，例如 api.example.com"]),
+                        "url_contains": .object(["type": .string("string"), "description": "URL 包含匹配"]),
+                        "method": .object(["type": .string("string"), "description": "GET/POST 等"]),
+                        "status": .object(["type": .string("integer"), "description": "状态码精确匹配"]),
+                        "status_min": .object(["type": .string("integer")]),
+                        "status_max": .object(["type": .string("integer")]),
+                        "only_errors": .object(["type": .string("boolean"), "description": "只要 4xx/5xx 或无状态码"]),
+                        "limit": .object(["type": .string("integer"), "default": .number(50), "maximum": .number(500)]),
+                        "offset": .object(["type": .string("integer"), "default": .number(0)]),
+                        "sort": .object(["type": .string("string"), "enum": .array([.string("newest"), .string("oldest"), .string("slowest")])]),
+                    ]),
+                ])
+            ),
+            TraceMCPToolDefinition(
+                name: "get_request",
+                description: "读取单个请求的完整详情：请求/响应头、正文（文本优先，二进制给大小）、时序、TLS、命中的规则。",
+                inputSchema: JSONValue([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "id": .object(["type": .string("string"), "description": "请求 UUID"]),
+                        "max_body_bytes": .object(["type": .string("integer"), "default": .number(65536), "maximum": .number(1048576)]),
+                    ]),
+                    "required": .array([.string("id")]),
+                ])
+            ),
+            TraceMCPToolDefinition(
+                name: "search_requests",
+                description: "在 URL、请求头/响应头或正文中搜索关键字，返回匹配的请求条目。",
+                inputSchema: JSONValue([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "query": .object(["type": .string("string")]),
+                        "scope": .object(["type": .string("string"), "enum": .array([.string("all"), .string("url"), .string("headers"), .string("body")]), "default": .string("all")]),
+                        "session_id": .object(["type": .string("string")]),
+                        "limit": .object(["type": .string("integer"), "default": .number(50), "maximum": .number(500)]),
+                    ]),
+                    "required": .array([.string("query")]),
+                ])
+            ),
+            TraceMCPToolDefinition(
+                name: "replay_request",
+                description: "重放一条已抓到的请求，可选覆盖请求头/请求体，返回新记录 id、状态码、耗时与响应预览。",
+           
