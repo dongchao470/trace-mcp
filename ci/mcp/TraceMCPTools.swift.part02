@@ -1,39 +1,62 @@
-     inputSchema: JSONValue([
-                    "type": .string("object"),
-                    "properties": .object([
-                        "id": .object(["type": .string("string"), "description": "被重放的请求 UUID"]),
-                        "headers": .object(["type": .string("object"), "description": "要覆盖或新增的请求头（字符串值）"]),
-                        "body": .object(["type": .string("string"), "description": "用这段文本替换请求体"]),
-                        "timeout_seconds": .object(["type": .string("integer"), "default": .number(30), "maximum": .number(120)]),
-                        "store": .object(["type": .string("boolean"), "default": .bool(true), "description": "是否把重放结果写回抓包列表"]),
-                    ]),
-                    "required": .array([.string("id")]),
-                ])
-            ),
-            TraceMCPToolDefinition(
-                name: "list_rewrite_rules",
-                description: "列出重写规则（只读）：名称、是否启用、规则类型、匹配描述、动作类型、命中次数。",
-                inputSchema: JSONValue([
-                    "type": .string("object"),
-                    "properties": .object([
-                        "limit": .object(["type": .string("integer"), "default": .number(100), "maximum": .number(500)]),
-                        "enabled_only": .object(["type": .string("boolean"), "default": .bool(false)]),
-                    ]),
-                ])
-            ),
-            TraceMCPToolDefinition(
-                name: "clear_requests",
-                description: "清空抓包记录（危险操作，需 confirm=true）。可选只清某个会话。",
-                inputSchema: JSONValue([
-                    "type": .string("object"),
-                    "properties": .object([
-                        "confirm": .object(["type": .string("boolean"), "description": "必须为 true 才会执行"]),
-                        "session_id": .object(["type": .string("string"), "description": "只清这个会话"]),
-                    ]),
-                    "required": .array([.string("confirm")]),
-                ])
-            ),
+会话"),
+        ], required: ["confirm"])
+    )
+
+    // MARK: - Schema helpers
+
+    private static func schema(_ properties: [String: JSONValue], required: [String] = []) -> JSONValue {
+        var object: [String: JSONValue] = [
+            "type": .string("object"),
+            "properties": .object(properties),
         ]
+        if !required.isEmpty {
+            object["required"] = .array(required.map { JSONValue.string($0) })
+        }
+        return .object(object)
+    }
+
+    private static func stringField(_ description: String? = nil) -> JSONValue {
+        var object: [String: JSONValue] = ["type": .string("string")]
+        if let description {
+            object["description"] = .string(description)
+        }
+        return .object(object)
+    }
+
+    private static func enumField(_ values: [String]) -> JSONValue {
+        .object([
+            "type": .string("string"),
+            "enum": .array(values.map { JSONValue.string($0) }),
+        ])
+    }
+
+    private static func intField(_ description: String? = nil, defaultValue: Int? = nil, maximum: Int? = nil) -> JSONValue {
+        var object: [String: JSONValue] = ["type": .string("integer")]
+        if let description {
+            object["description"] = .string(description)
+        }
+        if let defaultValue {
+            object["default"] = .number(Double(defaultValue))
+        }
+        if let maximum {
+            object["maximum"] = .number(Double(maximum))
+        }
+        return .object(object)
+    }
+
+    private static func boolField(_ description: String? = nil, defaultValue: Bool? = nil) -> JSONValue {
+        var object: [String: JSONValue] = ["type": .string("boolean")]
+        if let description {
+            object["description"] = .string(description)
+        }
+        if let defaultValue {
+            object["default"] = .bool(defaultValue)
+        }
+        return .object(object)
+    }
+
+    private static func objectField(_ description: String) -> JSONValue {
+        .object(["type": .string("object"), "description": .string(description)])
     }
 
     // MARK: - Dispatch
@@ -111,4 +134,6 @@
             .sorted { $0.startTime > $1.startTime }
             .prefix(limit)
         return .object([
-            "count": .number(D
+            "count": .number(Double(sessions.count)),
+            "sessions": .array(sessions.map { session in
+          
