@@ -1,5 +1,4 @@
-value)
-            }
+
             if let body, !body.isEmpty {
                 clientRequest.body = .bytes(ByteBuffer(bytes: body))
             }
@@ -113,6 +112,4 @@ value)
             requests = requests.filter { $0.url.localizedCaseInsensitiveContains(needle) }
         }
         if let method = args["method"]?.string, !method.isEmpty {
-            requests = requests.filter { ($0.requestMethodRaw ?? $0.method.rawValue).caseInsensitiveCompare(method) == .orderedSame }
-        }
-    
+            requests = requests.filter { ($0.requestMethodRaw ?? $0.method.rawValue).caseInsensit
