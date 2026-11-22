@@ -1,0 +1,136 @@
+--- a/TraceCore/MCP/TraceMCPServer.swift
++++ b/TraceCore/MCP/TraceMCPServer.swift
+@@ -85,48 +166,99 @@
+             return
+         }
+ 
++        // Some iOS builds never deliver inbound traffic for a listener that only sets
++        // `requiredLocalEndpoint`, so bind the loopback interface explicitly and fall
++        // back to a wildcard bind guarded by the peer check in `accept(_:)`.
++        do {
++            try launchListener(port: nwPort, loopbackInterface: true, host: host)
++        } catch {
++            mcpLog.error("mcp.bind loopback failed \(error.localizedDescription, privacy: .public)")
++            do {
++                try launchListener(port: nwPort, loopbackInterface: false, host: host)
++            } catch {
++                record(error: "listener init failed: \(error.localizedDescription)")
++            }
++        }
++    }
++
++    private func launchListener(port: NWEndpoint.Port, loopbackInterface: Bool, host: String) throws {
+         let parameters = NWParameters.tcp
+         parameters.allowLocalEndpointReuse = true
+-        parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: nwPort)
++        if loopbackInterface {
++            parameters.requiredInterfaceType = .loopback
++        }
+ 
+-        do {
+-            let listener = try NWListener(using: parameters)
+-            listener.stateUpdateHandler = { [weak self] newState in
+-                guard let self else { return }
+-                switch newState {
+-                case .ready:
+-                    mcpLog.info("mcp.listener ready port=\(port, privacy: .public) host=\(host, privacy: .public)")
+-                case let .failed(error):
+-                    self.record(error: "listener failed: \(error.localizedDescription)")
+-                    self.stopListener()
+-                case .cancelled:
+-                    break
+-                default:
+-                    break
+-                }
++        let listener = try NWListener(using: parameters, on: port)
++        listener.stateUpdateHandler = { [weak self] newState in
++            guard let self else { return }
++            switch newState {
++            case .ready:
++                let current = self.status
++                mcpLog.info(
++                    "mcp.listener ready port=\(current.port, privacy: .public) host=\(current.host, privacy: .public) loopbackIf=\(loopbackInterface)"
++                )
++                TraceMCPStatusStore.publish(self.snapshot())
++                self.scheduleSelfCheck()
++            case let .failed(error):
++                self.record(error: "listener failed: \(error.localizedDescription)")
++                self.stopListener()
++            case .cancelled:
++                break
++            default:
++                break
+             }
+-            listener.newConnectionHandler = { [weak self] connection in
+-                guard let self else {
+-                    connection.cancel()
+-                    return
+-                }
+-                guard Self.isLoopback(connection.endpoint) else {
+-                    connection.cancel()
+-                    return
+-                }
+-                MCPHTTPConnection(connection: connection, queue: queue).start()
++        }
++        listener.newConnectionHandler = { [weak self] connection in
++            guard let self else {
++                connection.cancel()
++                return
+             }
+-            lock.lock()
+-            state.listener = listener
+-            state.startedAt = Date()
+-            lock.unlock()
+-            listener.start(queue: queue)
+-            mcpLog.info("mcp.start port=\(port, privacy: .public) host=\(host, privacy: .public)")
+-        } catch {
+-            record(error: "listener init failed: \(error.localizedDescription)")
++            self.accept(connection)
+         }
++        lock.lock()
++        state.listener = listener
++        state.startedAt = Date()
++        state.loopbackInterface = loopbackInterface
++        lock.unlock()
++        listener.start(queue: queue)
++        mcpLog.info("mcp.start port=\(port.rawValue, privacy: .public) host=\(host, privacy: .public) loopbackIf=\(loopbackInterface)")
+     }
+ 
++    private func accept(_ connection: NWConnection) {
++        let peer = Self.describe(connection.endpoint)
++        lock.lock()
++        let boundToLoopback = state.loopbackInterface
++        state.connectionCount += 1
++        state.lastPeer = peer
++        lock.unlock()
++
++        // A listener bound to the loopback interface cannot receive external traffic,
++        // so the peer check only guards the wildcard fallback.
++        guard boundToLoopback || Self.isLoopback(connection.endpoint) else {
++            mcpLog.error("mcp.reject peer=\(peer, privacy: .public)")
++            TraceMCPStatusStore.publish(snapshot())
++            connection.cancel()
++            return
++        }
++        TraceMCPStatusStore.publish(snapshot())
++        MCPHTTPConnection(connection: connection, queue: queue).start()
++    }
++
++    private static func describe(_ endpoint: NWEndpoint) -> String {
++        switch endpoint {
++        case let .hostPort(host, port):
++            return "\(host):\(port)"
++        case let .service(name, type, domain, _):
++            return "\(name).\(type).\(domain)"
++        case let .unix(path):
++            return path
++        case let .url(url):
++            return url.absoluteString
++        @unknown default:
++            return "unknown"
++        }
++    }
++
+     public func stop() {
+         stopListener()
+     }
