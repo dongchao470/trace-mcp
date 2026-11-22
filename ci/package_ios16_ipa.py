@@ -38,7 +38,7 @@ for bundle in bundles:
             (bundle / 'Info.plist').write_bytes(plistlib.dumps(info))
             keychain_groups[bundle.name] = groups[0]
             records[-1]['keychainAccessGroup'] = groups[0]
-        assert info['CFBundleVersion'] == '16', (bundle.name, info['CFBundleVersion'])
+        assert info['CFBundleVersion'] == '17', (bundle.name, info['CFBundleVersion'])
         entitlements = pathlib.Path('ci-logs') / (bundle.name + '.entitlements.plist')
         entitlements.write_text(text)
         command += ['--entitlements', str(entitlements)]
