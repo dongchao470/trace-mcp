@@ -1,0 +1,12 @@
+diff --git a/TraceCore/Models/BodyStorage.swift b/TraceCore/Models/BodyStorage.swift
+--- a/TraceCore/Models/BodyStorage.swift
++++ b/TraceCore/Models/BodyStorage.swift
+@@ -15,7 +15,7 @@
+ #endif
+ 
+ /// Compression information for body data
+-public struct CompressionInfo: Codable, Equatable {
++public struct CompressionInfo: Codable, Equatable, Sendable {
+     public let algorithm: String // "gzip", "br", "deflate", "none", or comma-separated for multiple
+     public let compressedSize: Int
+     public let decompressedSize: Int
