@@ -1,0 +1,170 @@
+diff --git a/TraceProxy/MITM/NIOMITMSSECaptureState.swift b/TraceProxy/MITM/NIOMITMSSECaptureState.swift
+--- a/TraceProxy/MITM/NIOMITMSSECaptureState.swift
++++ b/TraceProxy/MITM/NIOMITMSSECaptureState.swift
+@@ -233,6 +233,7 @@
+ 
+     func finish(
+         succeeded: Bool,
++        reason: String? = nil,
+         captureConfig: CaptureConfiguration,
+         onRequestCaptured: ((NetworkRequest) -> Void)?
+     ) {
+@@ -287,7 +288,9 @@
+             }
+             contentDecoder = nil
+         }
+-        snapshot.status = succeeded ? .closed : .failed
++        let outcome = SSECompletionPolicy.outcome(responseComplete: succeeded, statusCode: responseStatusCode)
++        snapshot.status = outcome.succeeded ? .closed : .failed
++        snapshot.closeReason = reason ?? outcome.reason
+         snapshot.endTime = Date()
+         connection = snapshot
+         persist(snapshot)
+@@ -298,10 +301,10 @@
+                 url: snapshot.url,
+                 startTime: snapshot.startTime,
+                 endTime: snapshot.endTime,
+-                status: succeeded ? .closed : .failed,
++                status: outcome.succeeded ? .closed : .failed,
+                 requestHeaders: snapshot.requestHeaders,
+                 responseHeaders: snapshot.responseHeaders,
+-                metadata: [:],
++                metadata: ["close_reason": snapshot.closeReason ?? outcome.reason],
+                 eventCount: Int(streamSequence),
+                 bytesIn: snapshot.totalBytesReceived,
+                 bytesOut: 0
+diff --git a/TraceProxy/MITM/NIOMITMRequestBodyPolicy.swift b/TraceProxy/MITM/NIOMITMRequestBodyPolicy.swift
+new file mode 100644
+--- /dev/null
++++ b/TraceProxy/MITM/NIOMITMRequestBodyPolicy.swift
+@@ -0,0 +1,17 @@
++import Foundation
++
++/// Capture storage is a bounded preview, never a source for an unchanged wire request.
++enum NIOMITMRequestBodyPolicy {
++    static func select(
++        originalBody: Data,
++        bodyWasModified: Bool,
++        bodyIsEmpty: Bool,
++        readModifiedBody: () -> Data?
++    ) -> Data? {
++        guard bodyWasModified else { return originalBody }
++        // An explicitly cleared body must not fall back to the original upload.
++        guard !bodyIsEmpty else { return Data() }
++        // A missing modified-body file is an error, not permission to replay a preview.
++        return readModifiedBody()
++    }
++}
+diff --git a/TraceProxy/MITM/RequestInterceptor.swift b/TraceProxy/MITM/RequestInterceptor.swift
+--- a/TraceProxy/MITM/RequestInterceptor.swift
++++ b/TraceProxy/MITM/RequestInterceptor.swift
+@@ -375,7 +375,7 @@
+         let scriptStart = DispatchTime.now()
+         let bodyBeforeScripts = modifiedRequest.requestBody
+         modifiedRequest = await executeRequestScripts(on: modifiedRequest)
+-        var requestBodyModified = modifiedRequest.requestBody != bodyBeforeScripts
++        var requestBodyModified = modifiedRequest.requestBodyModified || modifiedRequest.requestBody != bodyBeforeScripts
+         metrics.scriptExecutionTimeNs += DispatchTime.now().uptimeNanoseconds - scriptStart.uptimeNanoseconds
+ 
+         // Phase 6: Rewrite (Request)
+diff --git a/TraceUI/Body/BodyViewerPolicy.swift b/TraceUI/Body/BodyViewerPolicy.swift
+--- a/TraceUI/Body/BodyViewerPolicy.swift
++++ b/TraceUI/Body/BodyViewerPolicy.swift
+@@ -17,8 +17,9 @@
+     public static let expandedPlainTextLoadBytes = 768 * 1024
+     public static let expandedBinaryLoadBytes = 512 * 1024
+ 
+-    public static let automaticStructuredRenderBytes = 256 * 1024
+-    public static let jsonStructuredParsingBytes = 256 * 1024
++    public static let automaticStructuredRenderBytes = 32 * 1024
++    public static let jsonStructuredParsingBytes = 32 * 1024
++    public static let jsonSyntaxHighlightBytes = 8 * 1024
+     public static let networkBodySearchBytes = 32 * 1024
+     public static let imageThumbnailMaxPixelSize = 2400
+ 
+diff --git a/TraceUI/Body/BodyInspectorView.swift b/TraceUI/Body/BodyInspectorView.swift
+--- a/TraceUI/Body/BodyInspectorView.swift
++++ b/TraceUI/Body/BodyInspectorView.swift
+@@ -312,15 +312,11 @@
+     }
+ 
+     private var textView: some View {
+-        Text(content)
+-            .font(.system(.caption, design: .monospaced))
+-            .textSelection(.enabled)
++        PagedBodyTextView(content: content)
+     }
+ 
+     private var hexView: some View {
+-        Text(hexRepresentation)
+-            .font(.system(.caption, design: .monospaced))
+-            .textSelection(.enabled)
++        PagedBodyTextView(content: hexRepresentation)
+     }
+ 
+     private var fullViewerSheet: some View {
+@@ -486,6 +482,8 @@
+     }
+ 
+     private func detectFromContent() -> DetectedContentType? {
++        // Content sniffing runs during view construction; never parse a large JSON here.
++        guard viewerByteCount <= BodyViewerPolicy.automaticStructuredRenderBytes else { return .plainText }
+         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+ 
+         if (trimmed.hasPrefix("{") && trimmed.hasSuffix("}")) ||
+@@ -532,7 +530,7 @@
+     }
+ 
+     private var viewerByteCount: Int {
+-        rawData?.count ?? content.utf8.count
++        max(rawData?.count ?? 0, content.utf8.count)
+     }
+ 
+     private var hexRepresentation: String {
+diff --git a/TraceUI/Body/JSONViewerView.swift b/TraceUI/Body/JSONViewerView.swift
+--- a/TraceUI/Body/JSONViewerView.swift
++++ b/TraceUI/Body/JSONViewerView.swift
+@@ -107,12 +107,10 @@
+                 ProgressView("Parsing…")
+                     .frame(maxWidth: .infinity, alignment: .leading)
+             } else if shouldBypassStructuredParsing {
+-                Text(jsonString)
+-                    .font(DesignSystem.Typography.monospacedFont)
+-                    .frame(maxWidth: .infinity, alignment: .leading)
+-                    .textSelection(.enabled)
++                PagedBodyTextView(content: jsonString)
+             } else {
+-                Text(formattedJSON ?? attributedJSONString())
++                // Never run parsing or regex highlighting synchronously while building a view.
++                Text(formattedJSON ?? AttributedString(jsonString))
+                     .font(DesignSystem.Typography.monospacedFont)
+                     .frame(maxWidth: .infinity, alignment: .leading)
+                     .textSelection(.enabled)
+@@ -313,10 +311,7 @@
+     // MARK: - Raw View
+ 
+     private var rawView: some View {
+-        Text(jsonString)
+-            .font(DesignSystem.Typography.monospacedFont)
+-            .frame(maxWidth: .infinity, alignment: .leading)
+-            .textSelection(.enabled)
++        PagedBodyTextView(content: jsonString)
+     }
+ 
+     // MARK: - Error View
+@@ -372,6 +367,7 @@
+             }
+         }.value
+ 
++        guard !Task.isCancelled else { return }
+         parsedJSON = json
+         parseError = error
+         formattedJSON = formatted
+@@ -432,6 +428,7 @@
+         }
+ 
+         var result = AttributedString(formattedString)
++        guard formattedString.utf8.count <= BodyViewerPolicy.jsonSyntaxHighlightBytes else { return result }
+ 
+         Self.highlightPattern(&result, pattern: "\"[^\"]+\"\\s*:", color: DesignSystem.Colors.accent)
+         Self.highlightPattern(&result, pattern: ":\\s*\"[^\"]*\"", color: DesignSystem.Colors.success)
