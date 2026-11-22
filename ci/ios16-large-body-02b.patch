@@ -1,0 +1,108 @@
+diff --git a/TraceProxy/MITM/NIOMITMHTTPConnectHandler+Interception.swift b/TraceProxy/MITM/NIOMITMHTTPConnectHandler+Interception.swift
+--- a/TraceProxy/MITM/NIOMITMHTTPConnectHandler+Interception.swift
++++ b/TraceProxy/MITM/NIOMITMHTTPConnectHandler+Interception.swift
+@@ -32,6 +32,7 @@
+         eventLoop: EventLoop
+     ) {
+         guard let runtime else { return }
++        if let reason { runtime.mergeMetadata(["close_reason": reason]) }
+         runtime.setStatus(status, endTime: status == .closed || status == .failed ? Date() : nil)
+         let session = runtime.snapshot()
+         persistStreamRuntimeSnapshot(runtime)
+@@ -46,22 +47,27 @@
+         }
+     }
+ 
++    struct RequestInterceptionOutcome: Sendable {
++        let result: InterceptionResult
++        let captureOnly: Bool
++    }
++
+     func requestInterceptionFuture(
+         _ requestContext: RequestInterceptionContext,
+         fallbackRequest: NetworkRequest,
+         eventLoop: EventLoop
+-    ) -> EventLoopFuture<InterceptionResult> {
+-        guard let interceptor else {
+-            return eventLoop.makeSucceededFuture(.modified(fallbackRequest))
+-        }
+-
+-        let promise = eventLoop.makePromise(of: InterceptionResult.self)
++    ) -> EventLoopFuture<RequestInterceptionOutcome> {
++        guard let interceptor else {
++            return eventLoop.makeSucceededFuture(
++                RequestInterceptionOutcome(result: .modified(fallbackRequest), captureOnly: true)
++            )
++        }
++
++        let promise = eventLoop.makePromise(of: RequestInterceptionOutcome.self)
+         promise.completeWithTask { [fallbackRequest] in
+-            // Fast-path: Skip expensive interception when all features are disabled.
+-            // This reduces latency by 1-3ms per request in capture-only mode.
+             let anyFeaturesEnabled = await interceptor.areAnyFeaturesEnabled()
+             if !anyFeaturesEnabled {
+-                return .modified(fallbackRequest)
++                return RequestInterceptionOutcome(result: .modified(fallbackRequest), captureOnly: true)
+             }
+ 
+             let result = await interceptor.interceptRequest(
+@@ -78,15 +84,15 @@
+                 if patched.protocolVersion == nil || patched.protocolVersion == .http11 {
+                     patched.protocolVersion = fallbackRequest.protocolVersion
+                 }
+-                return .modified(patched)
++                return RequestInterceptionOutcome(result: .modified(patched), captureOnly: false)
+             case let .mocked(request):
+                 var patched = request
+                 if patched.protocolVersion == nil || patched.protocolVersion == .http11 {
+                     patched.protocolVersion = fallbackRequest.protocolVersion
+                 }
+-                return .mocked(patched)
++                return RequestInterceptionOutcome(result: .mocked(patched), captureOnly: false)
+             case .blocked, .failed:
+-                return result
++                return RequestInterceptionOutcome(result: result, captureOnly: false)
+             }
+         }
+         return promise.futureResult
+diff --git a/TraceProxy/MITM/NIOMITMHTTPConnectHandler+ResponseCapture.swift b/TraceProxy/MITM/NIOMITMHTTPConnectHandler+ResponseCapture.swift
+--- a/TraceProxy/MITM/NIOMITMHTTPConnectHandler+ResponseCapture.swift
++++ b/TraceProxy/MITM/NIOMITMHTTPConnectHandler+ResponseCapture.swift
+@@ -85,13 +85,21 @@
+         publishCapturedRequest(request)
+     }
+ 
+-    func makeOutboundRequestContext(from request: NetworkRequest, fallbackBody: Data) -> OutboundRequestContext? {
++    func makeOutboundRequestContext(
++        from request: NetworkRequest,
++        fallbackBody: Data,
++        originalHeaders: [String: String]? = nil
++    ) -> OutboundRequestContext? {
+         let methodToken = request.requestMethodRaw ?? request.method.rawValue
+-        let requestHeaders = dictionary(from: request.requestHeaders)
+-        let requestBodyData = request.requestBody.getData()
+-            ?? request.requestBody.getString()?.data(using: .utf8)
+-            ?? fallbackBody
+-        guard URL(string: request.url) != nil else {
++        let requestHeaders = originalHeaders ?? dictionary(from: request.requestHeaders)
++        guard !request.requestBodyModified || !request.requestBody.isTruncated,
++              let requestBodyData = NIOMITMRequestBodyPolicy.select(
++                  originalBody: fallbackBody,
++                  bodyWasModified: request.requestBodyModified,
++                  bodyIsEmpty: request.requestBody.isEmpty,
++                  readModifiedBody: { request.requestBody.getData() }
++              ),
++              URL(string: request.url) != nil else {
+             return nil
+         }
+ 
+@@ -100,7 +108,8 @@
+             methodToken: methodToken,
+             url: request.url,
+             headers: requestHeaders,
+-            body: requestBodyData
++            body: requestBodyData,
++            bodyCompressionInfo: request.requestBodyModified ? request.requestBody.getCompressionInfo() : nil
+         )
+     }
+ 
