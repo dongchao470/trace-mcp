@@ -1,0 +1,74 @@
+ngCharacters(in: .whitespaces)
+            if name == "content-length" {
+                contentLength = Int(value) ?? 0
+            }
+        }
+
+        let bodyStart = separator.upperBound
+        guard buffer.distance(from: bodyStart, to: buffer.endIndex) >= contentLength else {
+            return nil
+        }
+        let bodyEnd = buffer.index(bodyStart, offsetBy: contentLength)
+        let body = Data(buffer[bodyStart..<bodyEnd])
+        buffer = Data(buffer[bodyEnd...])
+        return ParsedRequest(method: method, path: path, body: body)
+    }
+
+    private func handle(_ request: ParsedRequest) {
+        guard !completed else { return }
+        completed = true
+        let path = request.path.split(separator: "?").first.map(String.init) ?? request.path
+
+        if request.method == "GET", path == "/health" {
+            let status = TraceMCPServer.shared.status
+            let payload = JSONValue.object([
+                "ok": .bool(status.isRunning),
+                "server": .string("trace-mcp"),
+                "host": .string(status.host),
+                "port": .number(Double(status.port)),
+                "uptime_seconds": .number(status.uptime),
+                "error": TraceMCPServer.shared.lastError.map { .string($0) } ?? .null,
+            ])
+            send(status: 200, body: payload.data())
+            return
+        }
+
+        guard path == "/mcp" || path == "/" else {
+            send(status: 404, body: JSONValue.object(["error": .string("not found")]).data())
+            return
+        }
+        guard request.method == "POST" else {
+            send(status: 405, body: JSONValue.object(["error": .string("use POST /mcp")]).data())
+            return
+        }
+
+        Task {
+            let response = await TraceMCPServer.shared.handleRPC(request.body)
+            if let response {
+                self.send(status: 200, body: response)
+            } else {
+                self.send(status: 202, body: nil)
+            }
+        }
+    }
+
+    private func send(status: Int, body: Data?) {
+        let reason = status == 200 ? "OK" : (status == 202 ? "Accepted" : (status == 404 ? "Not Found" : (status == 405 ? "Method Not Allowed" : "Error")))
+        var header = "HTTP/1.1 \(status) \(reason)\r\n"
+        header += "Content-Type: application/json; charset=utf-8\r\n"
+        header += "Content-Length: \(body?.count ?? 0)\r\n"
+        header += "Cache-Control: no-store\r\n"
+        header += "Connection: close\r\n\r\n"
+        var payload = Data(header.utf8)
+        if let body {
+            payload.append(body)
+        }
+        connection.send(content: payload, completion: .contentProcessed { [weak self] _ in
+            self?.finish()
+        })
+    }
+
+    private func finish() {
+        connection.cancel()
+    }
+}
