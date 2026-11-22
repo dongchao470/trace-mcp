@@ -1,0 +1,74 @@
+diff --git a/TraceProxy/MITM/NIOMITMHTTPConnectHandler+Forwarding.swift b/TraceProxy/MITM/NIOMITMHTTPConnectHandler+Forwarding.swift
+--- a/TraceProxy/MITM/NIOMITMHTTPConnectHandler+Forwarding.swift
++++ b/TraceProxy/MITM/NIOMITMHTTPConnectHandler+Forwarding.swift
+@@ -35,7 +35,7 @@
+         let outboundBodyData = normalizeWireBody(
+             outboundContext.body,
+             headers: &outboundHeaders,
+-            compressionInfo: outboundContext.requestSnapshot.requestBody.getCompressionInfo(),
++            compressionInfo: outboundContext.bodyCompressionInfo,
+             direction: "request"
+         )
+         switch streamingRequestKind(requestHead: requestHead, headers: outboundHeaders) {
+@@ -358,7 +358,7 @@
+         let sseWireBody = normalizeWireBody(
+             outboundContext.body,
+             headers: &requestHeaders,
+-            compressionInfo: outboundContext.requestSnapshot.requestBody.getCompressionInfo(),
++            compressionInfo: outboundContext.bodyCompressionInfo,
+             direction: "request"
+         )
+         requestHeaders.remove(name: "Transfer-Encoding")
+@@ -418,6 +418,7 @@
+                         self.upstreamChannel = upstream
+                         var closeAfterSend = false
+                         var responseHeadSeen = false
++                        var responseStatusCode: Int?
+                         var responseEndSeen = false
+                         let sseInterceptionRuntime = SSEInterceptionRuntime()
+                         var bodyRelayChain = context.eventLoop.makeSucceededVoidFuture()
+@@ -430,6 +431,7 @@
+                                 switch part {
+                                 case let .head(head):
+                                     responseHeadSeen = true
++                                    responseStatusCode = Int(head.status.code)
+                                     closeAfterSend = self.shouldCloseConnection(requestHead: requestHead, responseHeaders: head.headers)
+                                     sseCapture.beginResponse(
+                                         head: head,
+@@ -510,6 +512,7 @@
+                                 case let .end(trailers):
+                                     responseEndSeen = true
+                                     bodyRelayChain.flatMap {
++                                        let outcome = SSECompletionPolicy.outcome(responseComplete: true, statusCode: responseStatusCode)
+                                         sseCapture.finish(
+                                             succeeded: true,
+                                             captureConfig: self.captureConfigProvider(),
+@@ -517,8 +520,8 @@
+                                         )
+                                         self.completeStreamRuntime(
+                                             streamRuntime,
+-                                            status: .closed,
+-                                            reason: nil,
++                                            status: outcome.succeeded ? .closed : .failed,
++                                            reason: outcome.reason,
+                                             eventLoop: context.eventLoop
+                                         )
+                                         let promise = context.eventLoop.makePromise(of: Void.self)
+@@ -590,14 +593,14 @@
+                                 // The normal end path owns closing until queued interception writes finish.
+                                 guard let self, self.state == .forwardingHTTPRequest, !responseEndSeen else { return }
+                                 sseCapture.finish(
+-                                    succeeded: responseHeadSeen,
++                                    succeeded: false,
+                                     captureConfig: self.captureConfigProvider(),
+                                     onRequestCaptured: self.onRequestCaptured
+                                 )
+                                 self.completeStreamRuntime(
+                                     streamRuntime,
+-                                    status: responseHeadSeen ? .closed : .failed,
+-                                    reason: responseHeadSeen ? nil : "upstream_inactive",
++                                    status: .failed,
++                                    reason: "upstream_closed_before_response_end",
+                                     eventLoop: context.eventLoop
+                                 )
+                                 self.state = .closed
