@@ -1,0 +1,37 @@
+diff --git a/Trace/TraceApp.swift b/Trace/TraceApp.swift
+index 10a7127..fd2e5cc 100644
+--- a/Trace/TraceApp.swift
++++ b/Trace/TraceApp.swift
+@@ -197,6 +197,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
+         if let shortcutItem = launchOptions?[.shortcutItem] as? UIApplicationShortcutItem {
+             application.shortcutItem = shortcutItem
+         }
++        // Loopback MCP endpoint for local agents; the tunnel extension hosts the same
++        // endpoint while the VPN runs so the tools keep answering after the app suspends.
++        TraceMCPBootstrap.startIfEnabled(host: "app")
+         return true
+     }
+ 
+diff --git a/TraceVPN/Providers/PacketTunnelProvider.swift b/TraceVPN/Providers/PacketTunnelProvider.swift
+index 6b29253..0eb8a2b 100644
+--- a/TraceVPN/Providers/PacketTunnelProvider.swift
++++ b/TraceVPN/Providers/PacketTunnelProvider.swift
+@@ -304,6 +304,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
+         }
+ 
+         loadInitialThrottlingState()
++
++        // Host the loopback MCP endpoint here as well: the tunnel keeps running while the
++        // host app is suspended, so a local agent keeps its tools across app backgrounding.
++        TraceMCPBootstrap.startIfEnabled(host: "extension")
+     }
+ 
+     private func logProtocolRoutingConfiguration() async {
+@@ -370,6 +374,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
+         with reason: NEProviderStopReason,
+         completionHandler: @escaping () -> Void
+     ) {
++        TraceMCPServer.shared.stop()
+         let reasonName = String(describing: reason)
+         let stopEvent = LogEvent.vpnTunnel("stop_begin")
+             .with("reason_code", value: reason.rawValue)
