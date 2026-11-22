@@ -7,3 +7,4 @@
 - The listener binds the loopback interface and falls back to a wildcard bind guarded by a peer check
 - Runtime state (listening, last error, last peer, self check) is mirrored to `mcp-status.json` in the app group container
 - Tools: trace_status, list_sessions, list_requests, get_request, search_requests, replay_request, list_rewrite_rules, clear_requests
+- Build 3: settings screen imports Combine and Foundation for the refresh timer.
