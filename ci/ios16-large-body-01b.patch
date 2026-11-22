@@ -1,0 +1,90 @@
+diff --git a/TraceCore/Utilities/JSONCoding.swift b/TraceCore/Utilities/JSONCoding.swift
+--- a/TraceCore/Utilities/JSONCoding.swift
++++ b/TraceCore/Utilities/JSONCoding.swift
+@@ -19,21 +19,39 @@
+         return encoder
+     }
+ 
++    // Shared across decoders: SSE records may each create their own JSONDecoder.
++    // The lock also protects concurrent storage reader threads using the formatters.
++    private final class DateParser: @unchecked Sendable {
++        static let shared = DateParser()
++        let lock = NSLock()
++        let fractional = ISO8601DateFormatter()
++        let whole = ISO8601DateFormatter()
++
++        init() {
++            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
++            whole.formatOptions = [.withInternetDateTime]
++        }
++
++        func parse(_ string: String) -> Date? {
++            lock.lock()
++            defer { lock.unlock() }
++            if string.contains(".") {
++                return fractional.date(from: string) ?? whole.date(from: string)
++            }
++            return whole.date(from: string) ?? fractional.date(from: string)
++        }
++    }
++
+     public static func makeDecoder() -> JSONDecoder {
++        let dateParser = DateParser.shared
+         let decoder = JSONDecoder()
+         decoder.dateDecodingStrategy = .custom { decoder in
+             let container = try decoder.singleValueContainer()
+ 
+-            // Preferred: ISO-8601 strings (Trace policy).
+-            if let string = try? container.decode(String.self) {
+-                // Accept both fractional and non-fractional seconds.
+-                let isoWithFractional = ISO8601DateFormatter()
+-                isoWithFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+-                if let date = isoWithFractional.date(from: string) { return date }
+-
+-                let iso = ISO8601DateFormatter()
+-                iso.formatOptions = [.withInternetDateTime]
+-                if let date = iso.date(from: string) { return date }
++            // Preferred: ISO-8601 strings, including fractional timestamps.
++            if let string = try? container.decode(String.self),
++               let date = dateParser.parse(string) {
++                return date
+             }
+ 
+             // Backward compatibility: Foundation default `Date` coding encodes as a number of seconds
+diff --git a/TraceProxy/MITM/NIOMITMHTTPConnectHandler.swift b/TraceProxy/MITM/NIOMITMHTTPConnectHandler.swift
+--- a/TraceProxy/MITM/NIOMITMHTTPConnectHandler.swift
++++ b/TraceProxy/MITM/NIOMITMHTTPConnectHandler.swift
+@@ -66,6 +66,7 @@
+         let url: String
+         let headers: [String: String]
+         let body: Data
++        let bodyCompressionInfo: CompressionInfo?
+     }
+ 
+     enum StreamingRequestKind {
+@@ -455,13 +456,13 @@
+     }
+ 
+     func handleInterceptionResult(
+-        _ result: InterceptionResult,
++        _ outcome: RequestInterceptionOutcome,
+         requestHead: HTTPRequestHead,
+         requestBodyData: Data,
+         fallbackRequest: NetworkRequest,
+         context: ChannelHandlerContext
+     ) {
+-        switch result {
++        switch outcome.result {
+         case .blocked:
+             var blocked = fallbackRequest
+             blocked.statusCode = 403
+@@ -512,7 +513,8 @@
+         case let .modified(modifiedRequest):
+             guard let outboundContext = makeOutboundRequestContext(
+                 from: modifiedRequest,
+-                fallbackBody: requestBodyData
++                fallbackBody: requestBodyData,
++                originalHeaders: outcome.captureOnly ? dictionary(from: requestHead.headers) : nil
+             ) else {
+                 finalizeActiveRequestAsHTTPFailure(
+                     status: .badRequest,
