@@ -5,6 +5,7 @@
 //  Local MCP endpoint: status, port, self test and tool catalogue.
 //
 
+import Combine
 import SwiftUI
 import TraceCore
 import UIKit
