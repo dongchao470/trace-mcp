@@ -1,0 +1,121 @@
+    if let status = args["status"]?.int {
+            requests = requests.filter { $0.statusCode == status }
+        }
+        if let minStatus = args["status_min"]?.int {
+            requests = requests.filter { ($0.statusCode ?? 0) >= minStatus }
+        }
+        if let maxStatus = args["status_max"]?.int {
+            requests = requests.filter { ($0.statusCode ?? 0) <= maxStatus }
+        }
+        if args["only_errors"]?.bool == true {
+            requests = requests.filter { request in
+                guard let code = request.statusCode else { return true }
+                return code >= 400
+            }
+        }
+        return requests
+    }
+
+    private func sortRequests(_ requests: [NetworkRequest], mode: String) -> [NetworkRequest] {
+        switch mode {
+        case "oldest":
+            return requests.sorted { $0.timestamp < $1.timestamp }
+        case "slowest":
+            return requests.sorted { $0.duration > $1.duration }
+        default:
+            return requests.sorted { $0.timestamp > $1.timestamp }
+        }
+    }
+
+    private func summary(_ request: NetworkRequest) -> JSONValue {
+        .object([
+            "id": .string(request.id.uuidString),
+            "method": .string(request.requestMethodRaw ?? request.method.rawValue),
+            "url": .string(request.url),
+            "status": request.statusCode.map { .number(Double($0)) } ?? .null,
+            "duration_ms": .number((request.duration * 1000).rounded()),
+            "timestamp": .string(iso(request.timestamp)),
+            "session_id": request.sessionId.map { .string($0.uuidString) } ?? .null,
+            "request_bytes": .number(Double(request.requestBody.totalSize)),
+            "response_bytes": .number(Double(request.responseBody.totalSize)),
+            "rewritten": .bool(request.wasRewritten),
+            "blocked": .bool(request.wasBlocked),
+        ])
+    }
+
+    private func detail(_ request: NetworkRequest, maxBodyBytes: Int) -> JSONValue {
+        .object([
+            "id": .string(request.id.uuidString),
+            "url": .string(request.url),
+            "method": .string(request.requestMethodRaw ?? request.method.rawValue),
+            "status": request.statusCode.map { .number(Double($0)) } ?? .null,
+            "status_message": request.statusMessage.map { .string($0) } ?? .null,
+            "timestamp": .string(iso(request.timestamp)),
+            "duration_ms": .number((request.duration * 1000).rounded()),
+            "protocol": request.protocolVersion.map { .string($0.rawValue) } ?? .null,
+            "remote_address": request.remoteAddress.map { .string($0) } ?? .null,
+            "rewritten": .bool(request.wasRewritten),
+            "blocked": .bool(request.wasBlocked),
+            "request_headers": .array(request.requestHeaders.map { .object(["name": .string($0.key), "value": .string($0.value)]) }),
+            "response_headers": .array(request.responseHeaders.map { .object(["name": .string($0.key), "value": .string($0.value)]) }),
+            "request_body": bodyDescription(request.requestBody, maxBytes: maxBodyBytes),
+            "response_body": bodyDescription(request.responseBody, maxBytes: maxBodyBytes),
+        ])
+    }
+
+    private func bodyDescription(_ body: BodyStorage, maxBytes: Int) -> JSONValue {
+        let total = body.totalSize
+        guard total > 0 else {
+            return .object(["bytes": .number(0), "kind": .string("empty")])
+        }
+        if let text = body.getString(maxBytes: maxBytes) {
+            return .object([
+                "bytes": .number(Double(total)),
+                "kind": .string("text"),
+                "text": .string(text),
+                "truncated": .bool(total > maxBytes),
+            ])
+        }
+        return .object([
+            "bytes": .number(Double(total)),
+            "kind": .string("binary"),
+            "note": .string("非 UTF-8 正文，未返回内容"),
+        ])
+    }
+
+    private func previewText(from data: Data, maxBytes: Int) -> String {
+        let slice = data.prefix(maxBytes)
+        if let text = String(data: slice, encoding: .utf8) {
+            return text
+        }
+        return "<二进制 \(data.count) 字节>"
+    }
+
+    private func matchesHeaders(_ request: NetworkRequest, _ query: String) -> Bool {
+        request.requestHeaders.contains { $0.key.localizedCaseInsensitiveContains(query) || $0.value.localizedCaseInsensitiveContains(query) }
+            || request.responseHeaders.contains { $0.key.localizedCaseInsensitiveContains(query) || $0.value.localizedCaseInsensitiveContains(query) }
+    }
+
+    private func matchesBody(_ request: NetworkRequest, _ query: String) -> Bool {
+        for body in [request.requestBody, request.responseBody] {
+            if let text = body.getString(maxBytes: 512 * 1024), text.localizedCaseInsensitiveContains(query) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func iso(_ date: Date) -> String {
+        isoFormatter.string(from: date)
+    }
+
+    private func serverContext() -> NIORuntimeContext {
+        TraceMCPServer.shared.status.host == "extension" ? .networkExtension : .app
+    }
+}
+
+private extension Data {
+    var utf8String: String? {
+        String(data: self, encoding: .utf8)
+    }
+}
