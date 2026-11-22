@@ -1,0 +1,93 @@
+--- a/TraceCore/MCP/TraceMCPServer.swift
++++ b/TraceCore/MCP/TraceMCPServer.swift
+@@ -138,8 +270,12 @@
+         state.startedAt = nil
+         state.host = "idle"
+         state.port = 0
++        state.loopbackInterface = false
++        state.selfCheck = nil
++        state.selfCheckStatus = nil
+         lock.unlock()
+         listener?.cancel()
++        TraceMCPStatusStore.publish(snapshot())
+     }
+ 
+     private func record(error: String) {
+@@ -147,6 +283,7 @@
+         state.lastError = error
+         lock.unlock()
+         mcpLog.error("mcp.error \(error, privacy: .public)")
++        TraceMCPStatusStore.publish(snapshot())
+     }
+ 
+     private static func isLoopback(_ endpoint: NWEndpoint) -> Bool {
+@@ -389,5 +526,69 @@
+ 
+     private func finish() {
+         connection.cancel()
++    }
++}
++
++// MARK: - Runtime diagnostics
++
++/// Snapshot of the MCP endpoint, mirrored to `mcp-status.json` in the shared container.
++public struct TraceMCPRuntimeSnapshot: Codable, Sendable {
++    public let host: String
++    public let port: UInt16
++    public let listening: Bool
++    public let loopbackInterface: Bool
++    public let lastError: String?
++    public let lastPeer: String?
++    public let connections: Int
++    public let selfCheck: String?
++    public let selfCheckStatus: Int?
++    public let updatedAt: String
++    public let pid: Int32
++
++    public init(
++        host: String,
++        port: UInt16,
++        listening: Bool,
++        loopbackInterface: Bool,
++        lastError: String?,
++        lastPeer: String?,
++        connections: Int,
++        selfCheck: String?,
++        selfCheckStatus: Int?,
++        updatedAt: String,
++        pid: Int32
++    ) {
++        self.host = host
++        self.port = port
++        self.listening = listening
++        self.loopbackInterface = loopbackInterface
++        self.lastError = lastError
++        self.lastPeer = lastPeer
++        self.connections = connections
++        self.selfCheck = selfCheck
++        self.selfCheckStatus = selfCheckStatus
++        self.updatedAt = updatedAt
++        self.pid = pid
++    }
++}
++
++public enum TraceMCPStatusStore {
++    public static let fileName = "mcp-status.json"
++
++    public static var fileURL: URL? {
++        AppGroupStorage.shared.containerURL?.appendingPathComponent(fileName)
++    }
++
++    public static func publish(_ snapshot: TraceMCPRuntimeSnapshot) {
++        guard let url = fileURL else { return }
++        let encoder = JSONEncoder()
++        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
++        guard let data = try? encoder.encode(snapshot) else { return }
++        try? data.write(to: url, options: .atomic)
++    }
++
++    public static func loadLastSnapshot() -> TraceMCPRuntimeSnapshot? {
++        guard let url = fileURL, let data = try? Data(contentsOf: url) else { return nil }
++        return try? JSONDecoder().decode(TraceMCPRuntimeSnapshot.self, from: data)
+     }
+ }
