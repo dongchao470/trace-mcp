@@ -134,6 +134,21 @@ jobs:
           git diff --check
           git diff --stat | tee ci-logs/large-body-fixes.log
 
+      - name: Apply reviewed MCP hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check ci/ios16-mcp-hooks.patch
+          git apply ci/ios16-mcp-hooks.patch
+          git diff --check
+          git diff --stat | tee ci-logs/mcp-hooks.log
+
+      - name: Assemble MCP server sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh ci/assemble_mcp_sources.sh | tee ci-logs/mcp-sources.log
+
       - name: Assemble Simplified Chinese localization
         shell: bash
         run: |
@@ -156,7 +171,7 @@ jobs:
             -derivedDataPath DerivedData -clonedSourcePackagesDirPath SourcePackages \
             IPHONEOS_DEPLOYMENT_TARGET=16.0 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY='' DEVELOPMENT_TEAM='' ENABLE_USER_SCRIPT_SANDBOXING=NO \
-            CURRENT_PROJECT_VERSION=16 \
+            CURRENT_PROJECT_VERSION=17 \
             build 2>&1 | tee ci-logs/build.log
 
       - name: Verify iOS deployment targets and package an ad-hoc IPA
@@ -167,14 +182,14 @@ jobs:
           python3 ci/package_ios16_ipa.py
           mkdir -p Package/Payload
           ditto DerivedData/Build/Products/Release-iphoneos/Trace.app Package/Payload/Trace.app
-          (cd Package && zip -qr ../Trace-build16-iOS16.ipa Payload)
-          shasum -a 256 Trace-build16-iOS16.ipa | tee ci-logs/ipa.sha256
+          (cd Package && zip -qr ../Trace-build17-iOS16.ipa Payload)
+          shasum -a 256 Trace-build17-iOS16.ipa | tee ci-logs/ipa.sha256
 
       - name: Upload baseline IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Trace-build16-iOS16
-          path: Trace-build16-iOS16.ipa
+          name: Trace-build17-iOS16
+          path: Trace-build17-iOS16.ipa
           if-no-files-found: error
           retention-days: 7
 
