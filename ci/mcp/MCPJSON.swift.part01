@@ -1,0 +1,186 @@
+//
+//  MCPJSON.swift
+//  TraceCore
+//
+//  Minimal JSON value model used by the in-app MCP server.
+//
+
+import CoreFoundation
+import Foundation
+
+/// A JSON value that can cross isolation boundaries.
+public enum JSONValue: Sendable, Equatable {
+    case null
+    case bool(Bool)
+    case number(Double)
+    case string(String)
+    case array([JSONValue])
+    case object([String: JSONValue])
+
+    public init(any value: Any) {
+        switch value {
+        case is NSNull:
+            self = .null
+        case let value as Bool:
+            self = .bool(value)
+        case let value as NSString:
+            self = .string(value as String)
+        case let value as String:
+            self = .string(value)
+        case let value as NSNumber:
+            if CFGetTypeID(value) == CFBooleanGetTypeID() {
+                self = .bool(value.boolValue)
+            } else {
+                self = .number(value.doubleValue)
+            }
+        case let value as [Any]:
+            self = .array(value.map(JSONValue.init(any:)))
+        case let value as [String: Any]:
+            self = .object(value.mapValues(JSONValue.init(any:)))
+        default:
+            self = .null
+        }
+    }
+
+    public init(parsing data: Data) throws {
+        let object = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        self.init(any: object)
+    }
+
+    /// Foundation representation for serialization.
+    public func toFoundation() -> Any {
+        switch self {
+        case .null:
+            NSNull()
+        case let .bool(value):
+            value
+        case let .number(value):
+            value
+        case let .string(value):
+            value
+        case let .array(values):
+            values.map { $0.toFoundation() }
+        case let .object(values):
+            values.mapValues { $0.toFoundation() }
+        }
+    }
+
+    public func data(pretty: Bool = false) -> Data {
+        var options: JSONSerialization.WritingOptions = [.withoutEscapingSlashes]
+        if pretty {
+            options.insert(.prettyPrinted)
+        }
+        guard JSONSerialization.isValidJSONObject(toFoundation()),
+              let data = try? JSONSerialization.data(withJSONObject: toFoundation(), options: options)
+        else {
+            return Data("null".utf8)
+        }
+        return data
+    }
+
+    public var string: String? {
+        if case let .string(value) = self {
+            return value
+        }
+        return nil
+    }
+
+    public var double: Double? {
+        switch self {
+        case let .number(value): value
+        case let .string(value): Double(value)
+        default: nil
+        }
+    }
+
+    public var int: Int? {
+        double.map { Int($0) }
+    }
+
+    public var bool: Bool? {
+        switch self {
+        case let .bool(value): value
+        case let .number(value): value != 0
+        default: nil
+        }
+    }
+
+    public var object: [String: JSONValue]? {
+        if case let .object(value) = self {
+            return value
+        }
+        return nil
+    }
+
+    public var array: [JSONValue]? {
+        if case let .array(value) = self {
+            return value
+        }
+        return nil
+    }
+
+    public subscript(key: String) -> JSONValue? {
+        object?[key]
+    }
+}
+
+public extension JSONValue {
+    static func text(_ value: String) -> JSONValue {
+        .string(value)
+    }
+
+    /// Object literal helper: keys with `nil` values are dropped.
+    init(_ pairs: KeyValuePairs<String, JSONValue?>) {
+        var result: [String: JSONValue] = [:]
+        for pair in pairs {
+            if let value = pair.value {
+                result[pair.key] = value
+            }
+        }
+        self = .object(result)
+    }
+}
+
+// MARK: - JSON-RPC
+
+public struct MCPRPCRequest: Sendable {
+    public let id: JSONValue?
+    public let method: String
+    public let params: JSONValue?
+
+    public init(id: JSONValue?, method: String, params: JSONValue?) {
+        self.id = id
+        self.method = method
+        self.params = params
+    }
+
+    public static func decode(_ body: Data) throws -> MCPRPCRequest? {
+        let value = try JSONValue(parsing: body)
+        guard let object = value.object, let method = object["method"]?.string else {
+            return nil
+        }
+        return MCPRPCRequest(id: object["id"], method: method, params: object["params"])
+    }
+}
+
+public enum MCPRPCErrorCode: Int, Sendable {
+    case parseError = -32700
+    case invalidRequest = -32600
+    case methodNotFound = -32601
+    case invalidParams = -32602
+    case internalError = -32603
+}
+
+public enum MCPError: Error, Sendable {
+    case invalidParams(String)
+    case toolFailure(String)
+    case internalFailure(String)
+
+    public var message: String {
+        switch self {
+        case let .invalidParams(text): text
+        case let .toolFailure(text): text
+        case let .internalFailure(text): text
+        }
+    }
+}
