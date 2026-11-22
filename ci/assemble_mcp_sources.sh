@@ -7,7 +7,7 @@ cat ci/mcp/TraceMCPServer.swift.part* > TraceCore/MCP/TraceMCPServer.swift
 cat ci/mcp/TraceMCPTools.swift.part* > TraceCore/MCP/TraceMCPTools.swift
 cat ci/mcp/TraceMCPPreferences.swift.part* > TraceCore/MCP/TraceMCPPreferences.swift
 # Reviewed follow-up: loopback interface bind, peer diagnostics and runtime self test.
-for patch in ci/ios16-mcp-server-a.patch ci/ios16-mcp-server-b.patch ci/ios16-mcp-server-c.patch ci/ios16-mcp-retain.patch ci/ios16-mcp-jsonrpc.patch; do
+for patch in ci/ios16-mcp-server-a.patch ci/ios16-mcp-server-b.patch ci/ios16-mcp-server-c.patch ci/ios16-mcp-retain.patch ci/ios16-mcp-jsonrpc.patch ci/ios16-mcp-host.patch; do
   git apply --check "$patch"
   git apply "$patch"
 done
