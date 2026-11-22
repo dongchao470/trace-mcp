@@ -1,0 +1,119 @@
+ouble(sessions.count)),
+            "sessions": .array(sessions.map { session in
+                .object([
+                    "id": .string(session.id.uuidString),
+                    "name": session.name.map { .string($0) } ?? .null,
+                    "started_at": .string(iso(session.startTime)),
+                    "ended_at": session.endTime.map { .string(iso($0)) } ?? .null,
+                    "request_count": .number(Double(session.requestCount)),
+                    "active": .bool(session.isActive),
+                ])
+            }),
+        ])
+    }
+
+    private func listRequests(_ args: JSONValue) async throws -> JSONValue {
+        let limit = max(1, min(args["limit"]?.int ?? 50, 500))
+        let offset = max(0, args["offset"]?.int ?? 0)
+        let filtered = try await matchingRequests(args)
+        let sorted = sortRequests(filtered, mode: args["sort"]?.string ?? "newest")
+        let page = Array(sorted.dropFirst(offset).prefix(limit))
+        return .object([
+            "total_matched": .number(Double(sorted.count)),
+            "returned": .number(Double(page.count)),
+            "offset": .number(Double(offset)),
+            "requests": .array(page.map(summary)),
+        ])
+    }
+
+    private func getRequest(_ args: JSONValue) async throws -> JSONValue {
+        guard let rawID = args["id"]?.string, let id = UUID(uuidString: rawID) else {
+            throw MCPError.invalidParams("需要合法的 id（UUID）")
+        }
+        let maxBytes = max(0, min(args["max_body_bytes"]?.int ?? 65536, 1048576))
+        guard let request = try storage.loadRequest(id) else {
+            throw MCPError.toolFailure("没有找到请求 \(rawID)")
+        }
+        return detail(request, maxBodyBytes: maxBytes)
+    }
+
+    private func searchRequests(_ args: JSONValue) async throws -> JSONValue {
+        guard let query = args["query"]?.string, !query.isEmpty else {
+            throw MCPError.invalidParams("需要非空的 query")
+        }
+        let scope = args["scope"]?.string ?? "all"
+        let limit = max(1, min(args["limit"]?.int ?? 50, 500))
+        var requests = try await storage.loadRequests()
+        if let sessionID = args["session_id"]?.string, let uuid = UUID(uuidString: sessionID) {
+            requests = requests.filter { $0.sessionId == uuid }
+        }
+        let matches = requests.filter { request in
+            switch scope {
+            case "url":
+                return request.url.localizedCaseInsensitiveContains(query)
+            case "headers":
+                return matchesHeaders(request, query)
+            case "body":
+                return matchesBody(request, query)
+            default:
+                return request.url.localizedCaseInsensitiveContains(query)
+                    || matchesHeaders(request, query)
+                    || matchesBody(request, query)
+            }
+        }
+        let sorted = sortRequests(matches, mode: "newest")
+        return .object([
+            "query": .string(query),
+            "scope": .string(scope),
+            "total_matched": .number(Double(matches.count)),
+            "requests": .array(sorted.prefix(limit).map(summary)),
+        ])
+    }
+
+    private func replayRequest(_ args: JSONValue) async throws -> JSONValue {
+        guard let rawID = args["id"]?.string, let id = UUID(uuidString: rawID) else {
+            throw MCPError.invalidParams("需要合法的 id（UUID）")
+        }
+        guard let source = try storage.loadRequest(id) else {
+            throw MCPError.toolFailure("没有找到请求 \(rawID)")
+        }
+        guard let url = URL(string: source.url), let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme) else {
+            throw MCPError.toolFailure("URL 不可重放：\(source.url)")
+        }
+
+        var headers: [(String, String)] = source.requestHeaders.map { ($0.key, $0.value) }
+        // Hop-by-hop headers must not be replayed verbatim.
+        headers.removeAll { name, _ in
+            ["content-length", "connection", "transfer-encoding", "keep-alive", "proxy-connection", "host"].contains(name.lowercased())
+        }
+        if let overrides = args["headers"]?.object {
+            for (name, value) in overrides {
+                headers.removeAll { $0.0.caseInsensitiveCompare(name) == .orderedSame }
+                if let text = value.string {
+                    headers.append((name, text))
+                }
+            }
+        }
+        headers.append(("Host", url.host ?? ""))
+
+        let methodRaw = source.requestMethodRaw ?? source.method.rawValue
+        var body: Data? = source.requestBody.getData()
+        if let overrideBody = args["body"]?.string {
+            body = Data(overrideBody.utf8)
+        }
+        let timeout = max(1, min(args["timeout_seconds"]?.int ?? 30, 120))
+
+        let started = Date()
+        let clock = DispatchTime.now().uptimeNanoseconds
+        var statusCode: Int?
+        var statusMessage: String?
+        var responseHeaders: [TraceHTTPHeader] = []
+        var responseBody = Data()
+        var failureMessage: String?
+
+        do {
+            let resources = NIORuntime.shared.acquire(for: serverContext())
+            var clientRequest = HTTPClientRequest(url: source.url)
+            clientRequest.method = .RAW(value: methodRaw)
+            for (name, value) in headers {
+                clientRequest.headers.add(name: name, value: 
