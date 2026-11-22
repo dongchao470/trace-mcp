@@ -1,0 +1,75 @@
+//
+//  TraceMCPPreferences.swift
+//  TraceCore
+//
+//  Persisted MCP settings plus process bootstrap helpers.
+//
+
+import Foundation
+
+public struct TraceMCPPreferences: Codable, Sendable, Equatable {
+    public var enabled: Bool
+    public var port: UInt16
+
+    public static let settingKey = "mcp"
+    public static let defaultPort: UInt16 = TraceMCPServer.defaultPort
+
+    public init(enabled: Bool = true, port: UInt16 = TraceMCPPreferences.defaultPort) {
+        self.enabled = enabled
+        self.port = port
+    }
+
+    public static func load() -> TraceMCPPreferences {
+        guard let stored = AppGroupStorage.shared.loadHardeningSetting(TraceMCPPreferences.self, forKey: settingKey) else {
+            return TraceMCPPreferences()
+        }
+        return stored
+    }
+
+    public func save() {
+        try? AppGroupStorage.shared.saveHardeningSetting(self, forKey: Self.settingKey)
+    }
+}
+
+public enum TraceMCPBootstrap {
+    /// Starts the loopback MCP endpoint for the current process when the setting allows it.
+    public static func startIfEnabled(host: String) {
+        let preferences = TraceMCPPreferences.load()
+        guard preferences.enabled else {
+            TraceMCPServer.shared.stop()
+            return
+        }
+        TraceMCPServer.shared.start(port: preferences.port, host: host)
+    }
+
+    @discardableResult
+    public static func setEnabled(_ enabled: Bool, host: String) -> TraceMCPPreferences {
+        var preferences = TraceMCPPreferences.load()
+        preferences.enabled = enabled
+        preferences.save()
+        if enabled {
+            TraceMCPServer.shared.start(port: preferences.port, host: host)
+        } else {
+            TraceMCPServer.shared.stop()
+        }
+        return preferences
+    }
+
+    /// Restarts the listener on a new port; falls back to the previous port on failure.
+    @discardableResult
+    public static func setPort(_ port: UInt16, host: String) -> TraceMCPPreferences {
+        var preferences = TraceMCPPreferences.load()
+        let previous = preferences.port
+        preferences.port = port == 0 ? TraceMCPPreferences.defaultPort : port
+        preferences.save()
+        guard preferences.enabled else { return preferences }
+        TraceMCPServer.shared.stop()
+        TraceMCPServer.shared.start(port: preferences.port, host: host)
+        if TraceMCPServer.shared.lastError != nil {
+            preferences.port = previous
+            preferences.save()
+            TraceMCPServer.shared.start(port: previous, host: host)
+        }
+        return preferences
+    }
+}
