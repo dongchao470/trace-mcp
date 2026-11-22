@@ -1,0 +1,118 @@
+value)
+            }
+            if let body, !body.isEmpty {
+                clientRequest.body = .bytes(ByteBuffer(bytes: body))
+            }
+            let response = try await resources.httpClient.execute(clientRequest, timeout: .seconds(Int64(timeout)))
+            statusCode = Int(response.status.code)
+            statusMessage = response.status.reasonPhrase
+            for (name, value) in response.headers {
+                responseHeaders.append(TraceHTTPHeader(key: name, value: value))
+            }
+            let buffer = try await response.body.collect(upTo: 16 * 1024 * 1024)
+            responseBody = Data(buffer: buffer)
+        } catch {
+            failureMessage = error.localizedDescription
+        }
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - clock) / 1_000_000_000
+
+        var newID: UUID?
+        if args["store"]?.bool ?? true, failureMessage == nil {
+            let record = NetworkRequest(
+                url: source.url,
+                method: source.method,
+                requestMethodRaw: methodRaw,
+                statusCode: statusCode,
+                statusMessage: statusMessage,
+                timestamp: started,
+                duration: elapsed,
+                requestHeaders: headers.map { TraceHTTPHeader(key: $0.0, value: $0.1) },
+                responseHeaders: responseHeaders,
+                requestBody: body.map { .inline($0) } ?? .empty,
+                responseBody: .inline(responseBody),
+                initiatorDisplayName: "MCP replay"
+            )
+            do {
+                try storage.saveRequest(record)
+                newID = record.id
+            } catch {
+                failureMessage = "重放成功但写入抓包失败：\(error.localizedDescription)"
+            }
+        }
+
+        return .object([
+            "source_request_id": .string(rawID),
+            "new_request_id": newID.map { .string($0.uuidString) } ?? .null,
+            "url": .string(source.url),
+            "method": .string(methodRaw),
+            "status": statusCode.map { .number(Double($0)) } ?? .null,
+            "duration_ms": .number((elapsed * 1000).rounded()),
+            "response_bytes": .number(Double(responseBody.count)),
+            "response_preview": .string(previewText(from: responseBody, maxBytes: 4096)),
+            "error": failureMessage.map { .string($0) } ?? .null,
+        ])
+    }
+
+    private func listRewriteRules(_ args: JSONValue) async throws -> JSONValue {
+        let limit = max(1, min(args["limit"]?.int ?? 100, 500))
+        let enabledOnly = args["enabled_only"]?.bool ?? false
+        var rules = try await storage.loadRewriteRules()
+        if enabledOnly {
+            rules = rules.filter(\.enabled)
+        }
+        rules.sort { ($0.priority, $0.name) < ($1.priority, $1.name) }
+        return .object([
+            "total": .number(Double(rules.count)),
+            "rules": .array(rules.prefix(limit).map { rule in
+                .object([
+                    "id": .string(rule.id.uuidString),
+                    "name": .string(rule.name),
+                    "enabled": .bool(rule.enabled),
+                    "type": .string(rule.ruleType.rawValue),
+                    "match": .string(rule.matchPattern),
+                    "priority": .number(Double(rule.priority)),
+                    "actions": .array(rule.actions.map { .string($0.actionType.rawValue) }),
+                    "hit_count": .number(Double(rule.hitCount)),
+                    "modified_at": .string(iso(rule.modifiedAt)),
+                ])
+            }),
+        ])
+    }
+
+    private func clearRequests(_ args: JSONValue) async throws -> JSONValue {
+        guard args["confirm"]?.bool == true else {
+            throw MCPError.invalidParams("这是破坏性操作，必须传 confirm=true")
+        }
+        let all = try await storage.loadRequests()
+        if let sessionID = args["session_id"]?.string, let uuid = UUID(uuidString: sessionID) {
+            let remaining = all.filter { $0.sessionId != uuid }
+            try await storage.saveRequests(remaining)
+            return .object([
+                "deleted": .number(Double(all.count - remaining.count)),
+                "session_id": .string(sessionID),
+            ])
+        }
+        try await storage.saveRequests([])
+        return .object(["deleted": .number(Double(all.count))])
+    }
+
+    // MARK: - Helpers
+
+    private func matchingRequests(_ args: JSONValue) async throws -> [NetworkRequest] {
+        var requests = try await storage.loadRequests()
+        if let sessionID = args["session_id"]?.string, let uuid = UUID(uuidString: sessionID) {
+            requests = requests.filter { $0.sessionId == uuid }
+        }
+        if let host = args["host"]?.string, !host.isEmpty {
+            requests = requests.filter { request in
+                guard let url = URL(string: request.url) else { return false }
+                return (url.host ?? "").localizedCaseInsensitiveContains(host)
+            }
+        }
+        if let needle = args["url_contains"]?.string, !needle.isEmpty {
+            requests = requests.filter { $0.url.localizedCaseInsensitiveContains(needle) }
+        }
+        if let method = args["method"]?.string, !method.isEmpty {
+            requests = requests.filter { ($0.requestMethodRaw ?? $0.method.rawValue).caseInsensitiveCompare(method) == .orderedSame }
+        }
+    
