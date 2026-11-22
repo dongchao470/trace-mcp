@@ -1,0 +1,121 @@
+--- a/TraceCore/MCP/TraceMCPServer.swift
++++ b/TraceCore/MCP/TraceMCPServer.swift
+@@ -54,6 +54,8 @@
+     private let lock = NSLock()
+     private var state = State()
+     private let queue = DispatchQueue(label: "com.justin.trace.mcp.server", qos: .utility)
++    /// Serial queue used to retry binding after the other process releases the loopback port.
++    private let retryQueue = DispatchQueue(label: "com.justin.trace.mcp.retry", qos: .utility)
+ 
+     private init() {}
+ 
+@@ -177,6 +179,30 @@
+             } catch {
+                 record(error: "listener init failed: \(error.localizedDescription)")
+             }
++        }
++    }
++
++    /// True while this process owns a bound listener.
++    public var isListening: Bool {
++        lock.lock()
++        defer { lock.unlock() }
++        return state.listener != nil
++    }
++
++    /// Binds, retrying while another process still owns the loopback port: the host app
++    /// releases it when it backgrounds and the tunnel extension keeps serving afterwards.
++    public func startRetrying(
++        port: UInt16,
++        host: String,
++        interval: TimeInterval = 10,
++        remaining: Int = 90
++    ) {
++        start(port: port, host: host)
++        guard remaining > 0 else { return }
++        retryQueue.asyncAfter(deadline: .now() + interval) { [weak self] in
++            guard let self else { return }
++            if self.isListening { return }
++            self.startRetrying(port: port, host: host, interval: interval, remaining: remaining - 1)
+         }
+     }
+ 
+--- a/TraceCore/MCP/TraceMCPPreferences.swift
++++ b/TraceCore/MCP/TraceMCPPreferences.swift
+@@ -42,6 +42,16 @@
+         TraceMCPServer.shared.start(port: preferences.port, host: host)
+     }
+ 
++    /// Same as above but waits for the other process to release the loopback port.
++    public static func startRetryingIfEnabled(host: String) {
++        let preferences = TraceMCPPreferences.load()
++        guard preferences.enabled else {
++            TraceMCPServer.shared.stop()
++            return
++        }
++        TraceMCPServer.shared.startRetrying(port: preferences.port, host: host)
++    }
++
+     @discardableResult
+     public static func setEnabled(_ enabled: Bool, host: String) -> TraceMCPPreferences {
+         var preferences = TraceMCPPreferences.load()
+--- a/Trace/TraceApp.swift
++++ b/Trace/TraceApp.swift
+@@ -6,6 +6,7 @@
+ //
+ 
+ import SwiftUI
++import Combine
+ import TraceCore
+ import TraceFeatures
+ import TraceSecurity
+@@ -189,6 +190,7 @@
+ 
+ final class AppDelegate: NSObject, UIApplicationDelegate {
+     var viewModel: CaptureViewModel?
++    private var vpnStatusCancellable: AnyCancellable?
+ 
+     func application(
+         _ application: UIApplication,
+@@ -200,7 +202,30 @@
+         // Loopback MCP endpoint for local agents; the tunnel extension hosts the same
+         // endpoint while the VPN runs so the tools keep answering after the app suspends.
+         TraceMCPBootstrap.startIfEnabled(host: "app")
++        // The loopback port can only belong to one process. While the tunnel runs the
++        // extension keeps serving, so the app parks its own listener the moment VPN
++        // connects and takes the port back once the tunnel stops.
++        vpnStatusCancellable = VPNManager.shared.isConnectedPublisher
++            .receive(on: DispatchQueue.main)
++            .sink { connected in
++                if connected {
++                    TraceMCPServer.shared.stop()
++                } else {
++                    TraceMCPBootstrap.startIfEnabled(host: "app")
++                }
++            }
+         return true
++    }
++
++    func applicationDidEnterBackground(_ application: UIApplication) {
++        // Release the port so the tunnel extension can own it while we are suspended.
++        TraceMCPServer.shared.stop()
++    }
++
++    func applicationWillEnterForeground(_ application: UIApplication) {
++        if !VPNManager.shared.isConnected {
++            TraceMCPBootstrap.startIfEnabled(host: "app")
++        }
+     }
+ 
+     func application(
+--- a/TraceVPN/Providers/PacketTunnelProvider.swift
++++ b/TraceVPN/Providers/PacketTunnelProvider.swift
+@@ -307,7 +307,7 @@
+ 
+         // Host the loopback MCP endpoint here as well: the tunnel keeps running while the
+         // host app is suspended, so a local agent keeps its tools across app backgrounding.
+-        TraceMCPBootstrap.startIfEnabled(host: "extension")
++        TraceMCPBootstrap.startRetryingIfEnabled(host: "extension")
+     }
+ 
+     private func logProtocolRoutingConfiguration() async {
