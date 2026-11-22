@@ -12,7 +12,7 @@
      }
  
      private let lock = NSLock()
-@@ -63,6 +68,82 @@
+@@ -63,6 +68,76 @@
          return state.lastError
      }
  
@@ -34,16 +34,10 @@
 +            connections: state.connectionCount,
 +            selfCheck: state.selfCheck,
 +            selfCheckStatus: state.selfCheckStatus,
-+            updatedAt: Self.isoFormatter.string(from: Date()),
++            updatedAt: ISO8601DateFormatter().string(from: Date()),
 +            pid: ProcessInfo.processInfo.processIdentifier
 +        )
 +    }
-+
-+    private static let isoFormatter: ISO8601DateFormatter = {
-+        let formatter = ISO8601DateFormatter()
-+        formatter.formatOptions = [.withInternetDateTime]
-+        return formatter
-+    }()
 +
 +    /// Runs a loopback request against `/health` and records the outcome.
 +    public func runSelfCheck(completion: ((String, Int?) -> Void)? = nil) {
