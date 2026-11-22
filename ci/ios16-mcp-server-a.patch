@@ -1,0 +1,97 @@
+--- a/TraceCore/MCP/TraceMCPServer.swift
++++ b/TraceCore/MCP/TraceMCPServer.swift
+@@ -36,6 +36,11 @@
+         var port: UInt16 = 0
+         var startedAt: Date?
+         var lastError: String?
++        var loopbackInterface: Bool = false
++        var lastPeer: String?
++        var connectionCount: Int = 0
++        var selfCheck: String?
++        var selfCheckStatus: Int?
+     }
+ 
+     private let lock = NSLock()
+@@ -63,6 +68,82 @@
+         return state.lastError
+     }
+ 
++    /// Full runtime state, including diagnostics published to the shared container.
++    public var runtimeSnapshot: TraceMCPRuntimeSnapshot {
++        snapshot()
++    }
++
++    private func snapshot() -> TraceMCPRuntimeSnapshot {
++        lock.lock()
++        defer { lock.unlock() }
++        return TraceMCPRuntimeSnapshot(
++            host: state.host,
++            port: state.port,
++            listening: state.listener != nil,
++            loopbackInterface: state.loopbackInterface,
++            lastError: state.lastError,
++            lastPeer: state.lastPeer,
++            connections: state.connectionCount,
++            selfCheck: state.selfCheck,
++            selfCheckStatus: state.selfCheckStatus,
++            updatedAt: Self.isoFormatter.string(from: Date()),
++            pid: ProcessInfo.processInfo.processIdentifier
++        )
++    }
++
++    private static let isoFormatter: ISO8601DateFormatter = {
++        let formatter = ISO8601DateFormatter()
++        formatter.formatOptions = [.withInternetDateTime]
++        return formatter
++    }()
++
++    /// Runs a loopback request against `/health` and records the outcome.
++    public func runSelfCheck(completion: ((String, Int?) -> Void)? = nil) {
++        let current = status
++        let port = current.port == 0 ? TraceMCPPreferences.defaultPort : current.port
++        guard current.isRunning, let url = URL(string: "http://127.0.0.1:\(port)/health") else {
++            update(selfCheck: current.isRunning ? "无效端口" : "监听未启动", statusCode: nil, completion: completion)
++            return
++        }
++
++        let configuration = URLSessionConfiguration.ephemeral
++        configuration.timeoutIntervalForRequest = 5
++        configuration.timeoutIntervalForResource = 8
++        configuration.waitsForConnectivity = false
++        let session = URLSession(configuration: configuration)
++        let task = session.dataTask(with: url) { [weak self] data, response, error in
++            defer { session.finishTasksAndInvalidate() }
++            guard let self else { return }
++            if let error {
++                self.update(selfCheck: "请求失败: \(error.localizedDescription)", statusCode: nil, completion: completion)
++                return
++            }
++            let code = (response as? HTTPURLResponse)?.statusCode
++            let text = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
++            let trimmed = text.count > 160 ? String(text.prefix(160)) + "…" : text
++            self.update(selfCheck: "HTTP \(code.map(String.init) ?? "-") \(trimmed)", statusCode: code, completion: completion)
++        }
++        task.resume()
++    }
++
++    private func update(selfCheck: String, statusCode: Int?, completion: ((String, Int?) -> Void)?) {
++        lock.lock()
++        state.selfCheck = selfCheck
++        state.selfCheckStatus = statusCode
++        lock.unlock()
++        mcpLog.info("mcp.selfcheck \(selfCheck, privacy: .public)")
++        TraceMCPStatusStore.publish(snapshot())
++        if let completion {
++            DispatchQueue.main.async { completion(selfCheck, statusCode) }
++        }
++    }
++
++    private func scheduleSelfCheck() {
++        queue.asyncAfter(deadline: .now() + 2) { [weak self] in
++            self?.runSelfCheck()
++        }
++    }
++
+     /// Starts the loopback listener once; repeated calls with the same port are no-ops.
+     public func start(port: UInt16 = TraceMCPServer.defaultPort, host: String) {
+         lock.lock()
