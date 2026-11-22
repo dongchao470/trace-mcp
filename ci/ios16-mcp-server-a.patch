@@ -12,7 +12,7 @@
      }
  
      private let lock = NSLock()
-@@ -63,6 +68,76 @@
+@@ -63,6 +68,73 @@
          return state.lastError
      }
  
@@ -40,11 +40,11 @@
 +    }
 +
 +    /// Runs a loopback request against `/health` and records the outcome.
-+    public func runSelfCheck(completion: ((String, Int?) -> Void)? = nil) {
++    public func runSelfCheck() {
 +        let current = status
 +        let port = current.port == 0 ? TraceMCPPreferences.defaultPort : current.port
 +        guard current.isRunning, let url = URL(string: "http://127.0.0.1:\(port)/health") else {
-+            update(selfCheck: current.isRunning ? "无效端口" : "监听未启动", statusCode: nil, completion: completion)
++            update(selfCheck: current.isRunning ? "无效端口" : "监听未启动", statusCode: nil)
 +            return
 +        }
 +
@@ -57,27 +57,24 @@
 +            defer { session.finishTasksAndInvalidate() }
 +            guard let self else { return }
 +            if let error {
-+                self.update(selfCheck: "请求失败: \(error.localizedDescription)", statusCode: nil, completion: completion)
++                self.update(selfCheck: "请求失败: \(error.localizedDescription)", statusCode: nil)
 +                return
 +            }
 +            let code = (response as? HTTPURLResponse)?.statusCode
 +            let text = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
 +            let trimmed = text.count > 160 ? String(text.prefix(160)) + "…" : text
-+            self.update(selfCheck: "HTTP \(code.map(String.init) ?? "-") \(trimmed)", statusCode: code, completion: completion)
++            self.update(selfCheck: "HTTP \(code.map(String.init) ?? "-") \(trimmed)", statusCode: code)
 +        }
 +        task.resume()
 +    }
 +
-+    private func update(selfCheck: String, statusCode: Int?, completion: ((String, Int?) -> Void)?) {
++    private func update(selfCheck: String, statusCode: Int?) {
 +        lock.lock()
 +        state.selfCheck = selfCheck
 +        state.selfCheckStatus = statusCode
 +        lock.unlock()
 +        mcpLog.info("mcp.selfcheck \(selfCheck, privacy: .public)")
 +        TraceMCPStatusStore.publish(snapshot())
-+        if let completion {
-+            DispatchQueue.main.async { completion(selfCheck, statusCode) }
-+        }
 +    }
 +
 +    private func scheduleSelfCheck() {
