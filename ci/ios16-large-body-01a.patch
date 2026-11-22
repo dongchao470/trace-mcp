@@ -1,0 +1,159 @@
+diff --git a/Trace/ViewModels/SSEViewModel.swift b/Trace/ViewModels/SSEViewModel.swift
+--- a/Trace/ViewModels/SSEViewModel.swift
++++ b/Trace/ViewModels/SSEViewModel.swift
+@@ -49,9 +49,20 @@
+     }
+ 
+     private func scheduleLoad() {
+-        loadTask?.cancel()
++        // Coalesce stream notifications instead of launching overlapping history scans.
++        guard loadTask == nil else {
++            hasPendingRefresh = true
++            return
++        }
++        hasPendingRefresh = false
+         loadTask = Task { [weak self] in
+-            await self?.loadConnections()
++            try? await Task.sleep(nanoseconds: 250_000_000)
++            guard let self else { return }
++            if !Task.isCancelled, self.isSceneActive { await self.loadConnections() }
++            self.loadTask = nil
++            if self.isSceneActive, self.hasPendingRefresh {
++                self.scheduleLoad()
++            }
+         }
+     }
+ 
+@@ -60,6 +71,7 @@
+         isSceneActive = isActive
+ 
+         guard isActive else {
++            hasPendingRefresh = true
+             loadTask?.cancel()
+             return
+         }
+@@ -81,8 +93,11 @@
+     func loadConnections() async {
+         NetworkLog.sse.info("event=sse_viewmodel.load_connections outcome=start")
+         do {
+-            var loaded = try storage.loadAllSSEConnections()
+-            loaded.sort { $0.startTime > $1.startTime }
++            let loaded = try await Task.detached(priority: .utility) {
++                try AppGroupStorage.shared.loadAllSSEConnections()
++                    .sorted { $0.startTime > $1.startTime }
++            }.value
++            guard !Task.isCancelled, isSceneActive else { return }
+             connections = loaded
+             NetworkLog.sse.info("event=sse_viewmodel.load_connections outcome=success count=\(loaded.count, privacy: .public)")
+         } catch {
+diff --git a/Trace/Views/SSE/SSEDetailView.swift b/Trace/Views/SSE/SSEDetailView.swift
+--- a/Trace/Views/SSE/SSEDetailView.swift
++++ b/Trace/Views/SSE/SSEDetailView.swift
+@@ -35,6 +35,8 @@
+ 
+                 if let endTime = connection.endTime {
+                     LabeledContent("Ended", value: endTime, format: .dateTime)
++                    LabeledContent("结束原因", value: SSECompletionPolicy.description(for: connection.closeReason))
++                        .foregroundStyle(connection.status == .failed ? DesignSystem.Colors.danger : .secondary)
+                 }
+ 
+                 if let duration = connection.duration {
+diff --git a/TraceCore/Models/SSEConnection.swift b/TraceCore/Models/SSEConnection.swift
+--- a/TraceCore/Models/SSEConnection.swift
++++ b/TraceCore/Models/SSEConnection.swift
+@@ -16,10 +16,10 @@
+ 
+     public var displayName: String {
+         switch self {
+-        case .connecting: "Connecting"
+-        case .streaming: "Streaming"
+-        case .closed: "Closed"
+-        case .failed: "Failed"
++        case .connecting: "连接中"
++        case .streaming: "接收中"
++        case .closed: "已结束"
++        case .failed: "异常中断"
+         }
+     }
+ 
+@@ -45,6 +45,8 @@
+     public var responseHeaders: [TraceHTTPHeader]
+     public var totalBytesReceived: Int
+     public var isTruncated: Bool
++    /// Nil for legacy records; do not assume a closed legacy connection was successful.
++    public var closeReason: String? = nil
+ 
+     public init(
+         id: UUID = UUID(),
+@@ -56,7 +58,8 @@
+         requestHeaders: [TraceHTTPHeader] = [],
+         responseHeaders: [TraceHTTPHeader] = [],
+         totalBytesReceived: Int = 0,
+-        isTruncated: Bool = false
++        isTruncated: Bool = false,
++        closeReason: String? = nil
+     ) {
+         self.id = id
+         self.url = url
+@@ -68,6 +71,7 @@
+         self.responseHeaders = responseHeaders
+         self.totalBytesReceived = totalBytesReceived
+         self.isTruncated = isTruncated
++        self.closeReason = closeReason
+     }
+ 
+     public var host: String {
+diff --git a/TraceCore/Models/SSECompletionPolicy.swift b/TraceCore/Models/SSECompletionPolicy.swift
+new file mode 100644
+--- /dev/null
++++ b/TraceCore/Models/SSECompletionPolicy.swift
+@@ -0,0 +1,36 @@
++import Foundation
++
++/// HTTP completion, not merely receiving headers, decides whether a stream ended normally.
++public enum SSECompletionPolicy {
++    public struct Outcome: Sendable {
++        public let succeeded: Bool
++        public let reason: String
++    }
++
++    public static func outcome(responseComplete: Bool, statusCode: Int?) -> Outcome {
++        guard responseComplete else {
++            return Outcome(succeeded: false, reason: "upstream_closed_before_response_end")
++        }
++        guard let statusCode else {
++            return Outcome(succeeded: false, reason: "missing_response_status")
++        }
++        guard (200 ..< 300).contains(statusCode) else {
++            return Outcome(succeeded: false, reason: "http_\(statusCode)")
++        }
++        return Outcome(succeeded: true, reason: "response_completed")
++    }
++
++    public static func description(for reason: String?) -> String {
++        switch reason {
++        case "response_completed": return "响应正常结束"
++        case "upstream_closed_before_response_end": return "上游提前断开，未收到完整响应结束"
++        case "missing_response_status": return "未收到有效的 HTTP 响应"
++        case "client_disconnected": return "客户端关闭了连接"
++        case "stream_interrupted": return "流传输被中断"
++        case nil, "": return "旧记录未保存结束原因，无法仅凭 Closed 判断是否异常"
++        case let value?:
++            if value.hasPrefix("http_") { return "HTTP 错误：\(value.dropFirst(5))" }
++            return value
++        }
++    }
++}
+diff --git a/TraceCore/Storage/AppGroupStorage.swift b/TraceCore/Storage/AppGroupStorage.swift
+--- a/TraceCore/Storage/AppGroupStorage.swift
++++ b/TraceCore/Storage/AppGroupStorage.swift
+@@ -2462,7 +2462,8 @@
+                     requestHeaders: session.requestHeaders,
+                     responseHeaders: session.responseHeaders,
+                     totalBytesReceived: session.bytesIn,
+-                    isTruncated: session.metadata["is_truncated"] == "true"
++                    isTruncated: session.metadata["is_truncated"] == "true",
++                    closeReason: session.metadata["close_reason"]
+                 )
+             )
+         }
