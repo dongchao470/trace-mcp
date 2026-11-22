@@ -134,6 +134,14 @@ jobs:
           git diff --check
           git diff --stat | tee ci-logs/large-body-fixes.log
 
+      - name: Assemble Simplified Chinese localization
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p Trace/zh-Hans.lproj
+          cat ci/l10n-zh-hans-*.strings > Trace/zh-Hans.lproj/Localizable.strings
+          wc -c Trace/zh-Hans.lproj/Localizable.strings
+
       - name: Run exact-source critical network regression tests
         shell: bash
         run: |
