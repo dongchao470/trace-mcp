@@ -13,7 +13,6 @@ struct MCPView: View {
     @State private var preferences: TraceMCPPreferences
     @State private var portText: String
     @State private var snapshot: TraceMCPRuntimeSnapshot
-    @State private var selfCheckRunning = false
     @State private var copied = false
 
     private let host = "app"
@@ -101,17 +100,11 @@ struct MCPView: View {
     private var selfTestSection: some View {
         Section {
             Button {
-                runSelfCheck()
+                TraceMCPServer.shared.runSelfCheck()
+                refresh()
             } label: {
-                HStack {
-                    Label("Test Loopback Connection", systemImage: "bolt.horizontal")
-                    Spacer()
-                    if selfCheckRunning {
-                        ProgressView()
-                    }
-                }
+                Label("Test Loopback Connection", systemImage: "bolt.horizontal")
             }
-            .disabled(selfCheckRunning)
 
             if let result = snapshot.selfCheck {
                 Text(result)
@@ -179,14 +172,6 @@ struct MCPView: View {
         preferences = TraceMCPBootstrap.setPort(port, host: host)
         portText = String(preferences.port)
         refresh()
-    }
-
-    private func runSelfCheck() {
-        selfCheckRunning = true
-        TraceMCPServer.shared.runSelfCheck { _, _ in
-            selfCheckRunning = false
-            refresh()
-        }
     }
 
     private func copyEndpoint() {
