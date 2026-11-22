@@ -1,6 +1,4 @@
-ouble(sessions.count)),
-            "sessions": .array(sessions.map { session in
-                .object([
+      .object([
                     "id": .string(session.id.uuidString),
                     "name": session.name.map { .string($0) } ?? .null,
                     "started_at": .string(iso(session.startTime)),
@@ -116,4 +114,5 @@ ouble(sessions.count)),
             var clientRequest = HTTPClientRequest(url: source.url)
             clientRequest.method = .RAW(value: methodRaw)
             for (name, value) in headers {
-                clientRequest.headers.add(name: name, value: 
+                clientRequest.headers.add(name: name, value: value)
+            }
