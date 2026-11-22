@@ -1,0 +1,157 @@
+diff --git a/TraceLogicTests/TraceCriticalNetworkingRegressionTests.swift b/TraceLogicTests/TraceCriticalNetworkingRegressionTests.swift
+--- a/TraceLogicTests/TraceCriticalNetworkingRegressionTests.swift
++++ b/TraceLogicTests/TraceCriticalNetworkingRegressionTests.swift
+@@ -112,6 +112,21 @@
+         }
+     }
+ 
++    func testLargeCapturePreviewCannotTruncateForwardedPOST() async throws {
++        let original = Data(("{\"payload\":\"" + String(repeating: "x", count: 542_852) + "\"}").utf8)
++        XCTAssertEqual(original.count, 542_866)
++        let selected = try XCTUnwrap(NIOMITMRequestBodyPolicy.select(originalBody: original,
++            bodyWasModified: false, bodyIsEmpty: false,
++            readModifiedBody: { Data(original.prefix(256 * 1024)) }))
++        try await withServer { client, url in
++            let request = try HTTPClient.Request(url: url + "/echo", method: .POST, body: .data(selected))
++            let response = try await LegacyHTTPClientBridge.execute(client: client, request: request,
++                deadline: .now() + .seconds(10))
++            XCTAssertEqual(response.status, .ok)
++            XCTAssertEqual(response.body.map { Data($0.readableBytesView) }, original)
++        }
++    }
++
+     private func withServer(_ run: (HTTPClient, String) async throws -> Void) async throws {
+         let group = NIOTSEventLoopGroup(loopCount: 1)
+         var configuration = HTTPClient.Configuration()
+diff --git a/TraceLogicTests/TraceLargeBodyRegressionTests.swift b/TraceLogicTests/TraceLargeBodyRegressionTests.swift
+new file mode 100644
+--- /dev/null
++++ b/TraceLogicTests/TraceLargeBodyRegressionTests.swift
+@@ -0,0 +1,110 @@
++import Foundation
++import XCTest
++#if canImport(TraceCriticalFixes)
++@testable import TraceCriticalFixes
++#else
++@testable import TraceCore
++@testable import TraceProxy
++@testable import TraceUI
++#endif
++
++final class TraceLargeBodyRegressionTests: XCTestCase {
++    func testUnchangedBodyNeverReadsCapturePreview() {
++        let original = Data(repeating: 0x61, count: 542_866)
++        var previewReads = 0
++        let selected = NIOMITMRequestBodyPolicy.select(originalBody: original,
++            bodyWasModified: false, bodyIsEmpty: false) {
++                previewReads += 1
++                return Data(original.prefix(256 * 1024))
++            }
++        XCTAssertEqual(selected, original)
++        XCTAssertEqual(previewReads, 0)
++    }
++
++    func testCaptureBodyDisabledStillForwardsOriginalBody() {
++        let original = Data(repeating: 0x7B, count: 600_000)
++        let selected = NIOMITMRequestBodyPolicy.select(originalBody: original,
++            bodyWasModified: false, bodyIsEmpty: true, readModifiedBody: { nil })
++        XCTAssertEqual(selected, original)
++    }
++
++    func testExplicitBodyReplacementAndClearing() {
++        let original = Data("original".utf8)
++        let replacement = Data("replacement".utf8)
++        XCTAssertEqual(NIOMITMRequestBodyPolicy.select(originalBody: original,
++            bodyWasModified: true, bodyIsEmpty: false, readModifiedBody: { replacement }), replacement)
++        XCTAssertEqual(NIOMITMRequestBodyPolicy.select(originalBody: original,
++            bodyWasModified: true, bodyIsEmpty: true, readModifiedBody: { XCTFail("must not read"); return nil }), Data())
++    }
++
++    func testMissingModifiedBodyDoesNotSilentlyUseOriginalOrPreview() {
++        XCTAssertNil(NIOMITMRequestBodyPolicy.select(originalBody: Data("original".utf8),
++            bodyWasModified: true, bodyIsEmpty: false, readModifiedBody: { nil }))
++    }
++
++    func testCompressedWireBodyIsNotReplacedWithDecodedPreview() {
++        let original = Data([0x1F, 0x8B, 0x08, 0x00, 0x99, 0xFF])
++        XCTAssertEqual(NIOMITMRequestBodyPolicy.select(originalBody: original,
++            bodyWasModified: false, bodyIsEmpty: false, readModifiedBody: { Data("decoded".utf8) }), original)
++    }
++
++    func testUnicodePaginationPreservesAllBytesAndBoundsEachPage() {
++        let original = String(repeating: "汉字🧑🏽‍💻e\u{301}\n", count: 30_000)
++        let pages = BodyTextPagination.pages(original)
++        XCTAssertGreaterThan(pages.count, 1)
++        XCTAssertEqual(Data(pages.joined().utf8), Data(original.utf8))
++        XCTAssertTrue(pages.allSatisfy { $0.utf8.count <= BodyTextPagination.defaultPageBytes + 3 })
++        XCTAssertTrue(pages.allSatisfy { !$0.contains("\u{FFFD}") })
++    }
++
++    func testPaginationHandlesEmptyAndTinyBudget() {
++        XCTAssertEqual(BodyTextPagination.pages(""), [""])
++        let input = "😀汉😀字😀"
++        let pages = BodyTextPagination.pages(input, pageBytes: 1)
++        XCTAssertEqual(pages.joined(), input)
++        XCTAssertTrue(pages.allSatisfy { $0.utf8.count <= 7 })
++    }
++
++    func testSSERequiresResponseEndAndSuccessfulHTTPStatus() {
++        let normal = SSECompletionPolicy.outcome(responseComplete: true, statusCode: 200)
++        XCTAssertTrue(normal.succeeded)
++        XCTAssertEqual(normal.reason, "response_completed")
++        let interrupted = SSECompletionPolicy.outcome(responseComplete: false, statusCode: 200)
++        XCTAssertFalse(interrupted.succeeded)
++        XCTAssertEqual(interrupted.reason, "upstream_closed_before_response_end")
++        let rejected = SSECompletionPolicy.outcome(responseComplete: true, statusCode: 400)
++        XCTAssertFalse(rejected.succeeded)
++        XCTAssertEqual(rejected.reason, "http_400")
++        XCTAssertFalse(SSECompletionPolicy.outcome(responseComplete: true, statusCode: nil).succeeded)
++    }
++
++    func testLegacyClosedRecordIsNotPresentedAsProvenSuccess() {
++        XCTAssertTrue(SSECompletionPolicy.description(for: nil).contains("无法"))
++        XCTAssertTrue(SSECompletionPolicy.description(for: "http_400").contains("400"))
++    }
++
++    private struct Dates: Decodable { let whole: Date; let fractional: Date; let legacy: Date }
++
++    func testDateDecoderKeepsWholeFractionalAndLegacyCompatibility() throws {
++        let data = Data(#"{"whole":"2026-11-22T00:00:00Z","fractional":"2026-11-22T00:00:00.125Z","legacy":0}"#.utf8)
++        let dates = try JSONCoding.makeDecoder().decode(Dates.self, from: data)
++        XCTAssertEqual(dates.fractional.timeIntervalSince(dates.whole), 0.125, accuracy: 0.001)
++        XCTAssertEqual(dates.legacy, Date(timeIntervalSinceReferenceDate: 0))
++    }
++
++    func testManyIndependentEventDecodersReuseDateFormatters() throws {
++        let data = Data(#"{"whole":"2026-11-22T00:00:00Z","fractional":"2026-11-22T00:00:00.125Z","legacy":0}"#.utf8)
++        let start = Date()
++        for _ in 0 ..< 2_000 { _ = try JSONCoding.makeDecoder().decode(Dates.self, from: data) }
++        let elapsed = Date().timeIntervalSince(start)
++        print("DATE_DECODERS_2000_SECONDS=\(elapsed)")
++        XCTAssertLessThan(elapsed, 8, "Large SSE histories must not recreate expensive formatters per event")
++    }
++
++    func testViewerBudgetsStayBoundedForExpandedJSONAndPlainText() {
++        XCTAssertLessThanOrEqual(BodyViewerPolicy.loadLimit(contentType: "application/json", requestedFullLoad: true, isBinary: false), 384 * 1024)
++        XCTAssertLessThanOrEqual(BodyViewerPolicy.loadLimit(contentType: "text/plain", requestedFullLoad: true, isBinary: false), 768 * 1024)
++        XCTAssertTrue(BodyViewerPolicy.shouldPreferLightweightRenderer(contentType: "application/json", byteCount: 542_866))
++        XCTAssertTrue(BodyViewerPolicy.shouldBypassJSONStructuredParsing(byteCount: 542_866))
++    }
++}
+diff --git a/ci/run-critical-network-regressions.py b/ci/run-critical-network-regressions.py
+--- a/ci/run-critical-network-regressions.py
++++ b/ci/run-critical-network-regressions.py
+@@ -18,7 +18,13 @@
+ files = [
+     ('TraceFeatures/Request/LegacyHTTPClientBridge.swift', sources),
+     ('TraceProxy/MITM/NIOMITMStreamingResponseDeadline.swift', sources),
++    ('TraceProxy/MITM/NIOMITMRequestBodyPolicy.swift', sources),
++    ('TraceUI/Body/BodyTextPagination.swift', sources),
++    ('TraceUI/Body/BodyViewerPolicy.swift', sources),
++    ('TraceCore/Utilities/JSONCoding.swift', sources),
++    ('TraceCore/Models/SSECompletionPolicy.swift', sources),
+     ('TraceLogicTests/TraceCriticalNetworkingRegressionTests.swift', tests),
++    ('TraceLogicTests/TraceLargeBodyRegressionTests.swift', tests),
+ ]
+ for name, directory in files:
+     source = root / name
