@@ -1,0 +1,114 @@
+     inputSchema: JSONValue([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "id": .object(["type": .string("string"), "description": "被重放的请求 UUID"]),
+                        "headers": .object(["type": .string("object"), "description": "要覆盖或新增的请求头（字符串值）"]),
+                        "body": .object(["type": .string("string"), "description": "用这段文本替换请求体"]),
+                        "timeout_seconds": .object(["type": .string("integer"), "default": .number(30), "maximum": .number(120)]),
+                        "store": .object(["type": .string("boolean"), "default": .bool(true), "description": "是否把重放结果写回抓包列表"]),
+                    ]),
+                    "required": .array([.string("id")]),
+                ])
+            ),
+            TraceMCPToolDefinition(
+                name: "list_rewrite_rules",
+                description: "列出重写规则（只读）：名称、是否启用、规则类型、匹配描述、动作类型、命中次数。",
+                inputSchema: JSONValue([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "limit": .object(["type": .string("integer"), "default": .number(100), "maximum": .number(500)]),
+                        "enabled_only": .object(["type": .string("boolean"), "default": .bool(false)]),
+                    ]),
+                ])
+            ),
+            TraceMCPToolDefinition(
+                name: "clear_requests",
+                description: "清空抓包记录（危险操作，需 confirm=true）。可选只清某个会话。",
+                inputSchema: JSONValue([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "confirm": .object(["type": .string("boolean"), "description": "必须为 true 才会执行"]),
+                        "session_id": .object(["type": .string("string"), "description": "只清这个会话"]),
+                    ]),
+                    "required": .array([.string("confirm")]),
+                ])
+            ),
+        ]
+    }
+
+    // MARK: - Dispatch
+
+    public func call(tool: String, arguments: JSONValue) async -> JSONValue {
+        do {
+            let result = try await run(tool: tool, arguments: arguments)
+            return .object([
+                "content": .array([.object(["type": .string("text"), "text": .string(result.data(pretty: true).utf8String ?? "{}")])]),
+                "isError": .bool(false),
+            ])
+        } catch let error as MCPError {
+            return failure(error.message)
+        } catch {
+            return failure(error.localizedDescription)
+        }
+    }
+
+    private func failure(_ message: String) -> JSONValue {
+        .object([
+            "content": .array([.object(["type": .string("text"), "text": .string(message)])]),
+            "isError": .bool(true),
+        ])
+    }
+
+    private func run(tool: String, arguments: JSONValue) async throws -> JSONValue {
+        switch tool {
+        case "trace_status":
+            try await status(arguments)
+        case "list_sessions":
+            try await listSessions(arguments)
+        case "list_requests":
+            try await listRequests(arguments)
+        case "get_request":
+            try await getRequest(arguments)
+        case "search_requests":
+            try await searchRequests(arguments)
+        case "replay_request":
+            try await replayRequest(arguments)
+        case "list_rewrite_rules":
+            try await listRewriteRules(arguments)
+        case "clear_requests":
+            try await clearRequests(arguments)
+        default:
+            throw MCPError.toolFailure("未知工具：\(tool)")
+        }
+    }
+
+    // MARK: - Tools
+
+    private func status(_: JSONValue) async throws -> JSONValue {
+        let requests = (try? await storage.loadRequests()) ?? []
+        let sessions = (try? await storage.loadSessions()) ?? []
+        let rules = (try? await storage.loadRewriteRules()) ?? []
+        let runtime = TraceMCPServer.shared.status
+        let info = Bundle.main.infoDictionary ?? [:]
+        return .object([
+            "host": .string(runtime.host),
+            "running": .bool(runtime.isRunning),
+            "port": .number(Double(runtime.port)),
+            "uptime_seconds": .number(runtime.uptime),
+            "app_version": .string(info["CFBundleShortVersionString"] as? String ?? "unknown"),
+            "app_build": .string(info["CFBundleVersion"] as? String ?? "unknown"),
+            "bundle_id": .string(info["CFBundleIdentifier"] as? String ?? "unknown"),
+            "request_count": .number(Double(requests.count)),
+            "session_count": .number(Double(sessions.count)),
+            "rewrite_rule_count": .number(Double(rules.count)),
+            "latest_request_at": requests.max(by: { $0.timestamp < $1.timestamp }).map { .string(iso($0.timestamp)) } ?? .null,
+        ])
+    }
+
+    private func listSessions(_ args: JSONValue) async throws -> JSONValue {
+        let limit = max(1, min(args["limit"]?.int ?? 20, 200))
+        let sessions = try await storage.loadSessions()
+            .sorted { $0.startTime > $1.startTime }
+            .prefix(limit)
+        return .object([
+            "count": .number(D
