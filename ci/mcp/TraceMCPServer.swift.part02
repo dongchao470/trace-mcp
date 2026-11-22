@@ -1,0 +1,144 @@
+urn nil
+        }
+
+        switch request.method {
+        case "initialize":
+            let requested = request.params?["protocolVersion"]?.string
+            return Self.encodeResult(
+                id: request.id ?? .null,
+                result: .object([
+                    "protocolVersion": .string(requested ?? "2025-06-18"),
+                    "capabilities": .object(["tools": .object(["listChanged": .bool(false)])]),
+                    "serverInfo": .object([
+                        "name": .string("trace"),
+                        "title": .string("Trace"),
+                        "version": .string(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.7"),
+                    ]),
+                ])
+            )
+
+        case "ping":
+            return Self.encodeResult(id: request.id ?? .null, result: .object([:]))
+
+        case "tools/list":
+            let tools = await TraceMCPDispatcher.shared.tools
+            return Self.encodeResult(
+                id: request.id ?? .null,
+                result: .object([
+                    "tools": .array(tools.map { tool in
+                        .object([
+                            "name": .string(tool.name),
+                            "description": .string(tool.description),
+                            "inputSchema": tool.inputSchema,
+                        ])
+                    }),
+                ])
+            )
+
+        case "tools/call":
+            guard let name = request.params?["name"]?.string else {
+                return Self.encodeError(id: request.id ?? .null, code: .invalidParams, message: "缺少工具名")
+            }
+            let arguments = request.params?["arguments"] ?? .object([:])
+            let result = await TraceMCPDispatcher.shared.call(tool: name, arguments: arguments)
+            return Self.encodeResult(id: request.id ?? .null, result: result)
+
+        case "resources/list":
+            return Self.encodeResult(id: request.id ?? .null, result: .object(["resources": .array([])]))
+
+        case "resources/templates/list":
+            return Self.encodeResult(id: request.id ?? .null, result: .object(["resourceTemplates": .array([])]))
+
+        case "prompts/list":
+            return Self.encodeResult(id: request.id ?? .null, result: .object(["prompts": .array([])]))
+
+        default:
+            return Self.encodeError(id: request.id ?? .null, code: .methodNotFound, message: "不支持的方法：\(request.method)")
+        }
+    }
+
+    private static func encodeResult(id: JSONValue, result: JSONValue) -> Data {
+        JSONValue.object(["jsonrpc": .string("2.0"), "id": id, "result": result]).data()
+    }
+
+    private static func encodeError(id: JSONValue, code: MCPRPCErrorCode, message: String) -> Data {
+        JSONValue.object([
+            "jsonrpc": .string("2.0"),
+            "id": id,
+            "error": .object(["code": .number(Double(code.rawValue)), "message": .string(message)]),
+        ]).data()
+    }
+}
+
+// MARK: - HTTP connection
+
+/// One HTTP/1.1 request per connection; responses always close the socket.
+final class MCPHTTPConnection: @unchecked Sendable {
+    private let connection: NWConnection
+    private let queue: DispatchQueue
+    private var buffer = Data()
+    private var completed = false
+
+    init(connection: NWConnection, queue: DispatchQueue) {
+        self.connection = connection
+        self.queue = queue
+    }
+
+    func start() {
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                self?.receive()
+            case .failed, .cancelled:
+                self?.finish()
+            default:
+                break
+            }
+        }
+        connection.start(queue: queue)
+    }
+
+    private func receive() {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            if let data, !data.isEmpty {
+                buffer.append(data)
+                if let request = takeRequest() {
+                    handle(request)
+                    return
+                }
+            }
+            if error != nil || isComplete {
+                finish()
+                return
+            }
+            receive()
+        }
+    }
+
+    private struct ParsedRequest {
+        let method: String
+        let path: String
+        let body: Data
+    }
+
+    private func takeRequest() -> ParsedRequest? {
+        guard let separator = buffer.range(of: Data([13, 10, 13, 10])) else {
+            return nil
+        }
+        let head = buffer[buffer.startIndex..<separator.lowerBound]
+        guard let headText = String(data: Data(head), encoding: .utf8) else {
+            return nil
+        }
+        var lines = headText.components(separatedBy: "\r\n")
+        guard !lines.isEmpty else { return nil }
+        let requestLine = lines.removeFirst().split(separator: " ")
+        guard requestLine.count >= 2 else { return nil }
+        let method = String(requestLine[0])
+        let path = String(requestLine[1])
+
+        var contentLength = 0
+        for line in lines {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let name = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            let value = line[line.index(after: colon)...].trimmi
