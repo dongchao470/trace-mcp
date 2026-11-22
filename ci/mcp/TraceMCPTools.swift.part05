@@ -1,4 +1,6 @@
-    if let status = args["status"]?.int {
+iveCompare(method) == .orderedSame }
+        }
+        if let status = args["status"]?.int {
             requests = requests.filter { $0.statusCode == status }
         }
         if let minStatus = args["status_min"]?.int {
