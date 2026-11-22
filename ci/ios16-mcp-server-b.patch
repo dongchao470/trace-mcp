@@ -1,6 +1,6 @@
 --- a/TraceCore/MCP/TraceMCPServer.swift
 +++ b/TraceCore/MCP/TraceMCPServer.swift
-@@ -85,48 +166,99 @@
+@@ -85,48 +166,101 @@
              return
          }
  
@@ -106,7 +106,9 @@
 +
 +        // A listener bound to the loopback interface cannot receive external traffic,
 +        // so the peer check only guards the wildcard fallback.
-+        guard boundToLoopback || Self.isLoopback(connection.endpoint) else {
++        guard boundToLoopback || Self.isLoopback(connection.endpoint)
++            || peer.contains("127.0.0.1") || peer.contains("::1")
++        else {
 +            mcpLog.error("mcp.reject peer=\(peer, privacy: .public)")
 +            TraceMCPStatusStore.publish(snapshot())
 +            connection.cancel()
