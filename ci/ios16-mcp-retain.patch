@@ -1,0 +1,64 @@
+--- a/TraceCore/MCP/TraceMCPServer.swift
++++ b/TraceCore/MCP/TraceMCPServer.swift
+@@ -41,6 +41,10 @@
+         var connectionCount: Int = 0
+         var selfCheck: String?
+         var selfCheckStatus: Int?
++        /// Strong references to the live HTTP handlers. Both the state handler and the
++        /// receive loop only capture the handler weakly, so without this the connection
++        /// object deallocates right after `start()` and the socket accepts but never answers.
++        var handlers: [ObjectIdentifier: MCPHTTPConnection] = [:]
+     }
+ 
+     private let lock = NSLock()
+@@ -234,7 +238,18 @@
+             return
+         }
+         TraceMCPStatusStore.publish(snapshot())
+-        MCPHTTPConnection(connection: connection, queue: queue).start()
++        let handler = MCPHTTPConnection(connection: connection, queue: queue)
++        let key = ObjectIdentifier(handler)
++        handler.onFinish = { [weak self] in
++            guard let self else { return }
++            self.lock.lock()
++            self.state.handlers.removeValue(forKey: key)
++            self.lock.unlock()
++        }
++        lock.lock()
++        state.handlers[key] = handler
++        lock.unlock()
++        handler.start()
+     }
+ 
+     private static func describe(_ endpoint: NWEndpoint) -> String {
+@@ -384,6 +399,9 @@
+     private let queue: DispatchQueue
+     private var buffer = Data()
+     private var completed = false
++    /// Called exactly once when the connection closes; the server drops its strong reference here.
++    var onFinish: (() -> Void)?
++    private var didFinish = false
+ 
+     init(connection: NWConnection, queue: DispatchQueue) {
+         self.connection = connection
+@@ -395,6 +413,8 @@
+             switch state {
+             case .ready:
+                 self?.receive()
++            case let .waiting(error):
++                mcpLog.error("mcp.conn waiting \(error.localizedDescription, privacy: .public)")
+             case .failed, .cancelled:
+                 self?.finish()
+             default:
+@@ -518,6 +538,11 @@
+     }
+ 
+     private func finish() {
++        if !didFinish {
++            didFinish = true
++            onFinish?()
++            onFinish = nil
++        }
+         connection.cancel()
+     }
+ }
