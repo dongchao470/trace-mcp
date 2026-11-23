@@ -1,0 +1,236 @@
+diff --git a/TraceCore/MCP/TraceMCPServer.swift b/TraceCore/MCP/TraceMCPServer.swift
+index 1cfe511..995d19e 100644
+--- a/TraceCore/MCP/TraceMCPServer.swift
++++ b/TraceCore/MCP/TraceMCPServer.swift
+@@ -45,6 +45,10 @@ public final class TraceMCPServer: @unchecked Sendable {
+         var connectionCount: Int = 0
+         var selfCheck: String?
+         var selfCheckStatus: Int?
++        /// Mirrors `NWListener.State`; a non-nil listener is not proof of a usable bind.
++        var listenerState = "idle"
++        /// Last listener state transition, used by the watchdog before forcing a rebind.
++        var listenerStateChangedAt = Date()
+         /// Strong references to the live HTTP handlers. Both the state handler and the
+         /// receive loop only capture the handler weakly, so without this the connection
+         /// object deallocates right after `start()` and the socket accepts but never answers.
+@@ -53,9 +57,12 @@ public final class TraceMCPServer: @unchecked Sendable {
+ 
+     private let lock = NSLock()
+     private var state = State()
+-    private let queue = DispatchQueue(label: "com.justin.trace.mcp.server", qos: .utility)
++    private let queue = DispatchQueue(label: "com.justin.trace.mcp.server", qos: .userInitiated)
+     /// Serial queue used to retry binding after the other process releases the loopback port.
+-    private let retryQueue = DispatchQueue(label: "com.justin.trace.mcp.retry", qos: .utility)
++    /// Both queues run user-initiated: the tunnel keeps forwarding packets while it hosts the
++    /// endpoint, and `.utility` accept/receive work was starved there, so requests timed out
++    /// even though the listener reported itself as ready.
++    private let retryQueue = DispatchQueue(label: "com.justin.trace.mcp.retry", qos: .userInitiated)
+ 
+     private init() {}
+ 
+@@ -89,7 +96,8 @@ public final class TraceMCPServer: @unchecked Sendable {
+         return TraceMCPRuntimeSnapshot(
+             host: state.host,
+             port: state.port,
+-            listening: state.listener != nil,
++            listening: state.listener != nil && state.listenerState == "ready",
++            listenerState: state.listenerState,
+             loopbackInterface: state.loopbackInterface,
+             lastError: state.lastError,
+             lastPeer: state.lastPeer,
+@@ -148,7 +156,7 @@ public final class TraceMCPServer: @unchecked Sendable {
+     /// Starts the loopback listener once; repeated calls with the same port are no-ops.
+     public func start(port: UInt16 = TraceMCPServer.defaultPort, host: String) {
+         lock.lock()
+-        if let listener = state.listener {
++        if state.listener != nil, state.listenerState == "ready" {
+             let samePort = state.port == port
+             lock.unlock()
+             if !samePort {
+@@ -157,10 +165,20 @@ public final class TraceMCPServer: @unchecked Sendable {
+             }
+             return
+         }
++        // A listener that exists but never reached `.ready` - usually `.waiting` because the
++        // other process still owns the port - cannot accept connections. Drop it and rebind.
++        let stale = state.listener
++        state.listener = nil
++        state.listenerState = "idle"
+         state.host = host
+         state.port = port
+         state.lastError = nil
+         lock.unlock()
++        if let stale {
++            stale.stateUpdateHandler = nil
++            stale.newConnectionHandler = nil
++            stale.cancel()
++        }
+ 
+         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+             record(error: "非法端口 \(port)")
+@@ -186,7 +204,7 @@ public final class TraceMCPServer: @unchecked Sendable {
+     public var isListening: Bool {
+         lock.lock()
+         defer { lock.unlock() }
+-        return state.listener != nil
++        return state.listener != nil && state.listenerState == "ready"
+     }
+ 
+     /// Binds, retrying while another process still owns the loopback port: the host app
+@@ -202,10 +220,22 @@ public final class TraceMCPServer: @unchecked Sendable {
+         retryQueue.asyncAfter(deadline: .now() + interval) { [weak self] in
+             guard let self else { return }
+             if self.isListening { return }
++            self.dropUnreadyListener()
+             self.startRetrying(port: port, host: host, interval: interval, remaining: remaining - 1)
+         }
+     }
+ 
++    /// Cancels a bound-but-unusable listener so the retry loop can rebind it.
++    private func dropUnreadyListener() {
++        lock.lock()
++        let listener = state.listener
++        let name = state.listenerState
++        lock.unlock()
++        guard listener != nil, name != "ready" else { return }
++        mcpLog.info("mcp.retry drop state=\(name, privacy: .public)")
++        stopListener()
++    }
++
+     private func launchListener(port: NWEndpoint.Port, loopbackInterface: Bool, host: String) throws {
+         let parameters = NWParameters.tcp
+         parameters.allowLocalEndpointReuse = true
+@@ -216,6 +246,7 @@ public final class TraceMCPServer: @unchecked Sendable {
+         let listener = try NWListener(using: parameters, on: port)
+         listener.stateUpdateHandler = { [weak self] newState in
+             guard let self else { return }
++            self.noteListenerState(newState)
+             switch newState {
+             case .ready:
+                 let current = self.status
+@@ -224,6 +255,13 @@ public final class TraceMCPServer: @unchecked Sendable {
+                 )
+                 TraceMCPStatusStore.publish(self.snapshot())
+                 self.scheduleSelfCheck()
++                self.startWatchdog()
++            case let .waiting(error):
++                // Usually "address in use" while the host app still owns the port.
++                // Network.framework keeps the listener alive in this state, so without an
++                // explicit rebind the endpoint stayed silent with `listening: true`.
++                self.record(error: "listener waiting: \(error.localizedDescription)")
++                self.rebindSoon(reason: "waiting")
+             case let .failed(error):
+                 self.record(error: "listener failed: \(error.localizedDescription)")
+                 self.stopListener()
+@@ -249,6 +287,78 @@ public final class TraceMCPServer: @unchecked Sendable {
+         mcpLog.info("mcp.start port=\(Int(port.rawValue), privacy: .public) host=\(host, privacy: .public) loopbackIf=\(loopbackInterface)")
+     }
+ 
++    private func noteListenerState(_ newState: NWListener.State) {
++        let name: String
++        switch newState {
++        case .setup:
++            name = "setup"
++        case let .waiting(error):
++            name = "waiting: \(error.localizedDescription)"
++        case .ready:
++            name = "ready"
++        case let .failed(error):
++            name = "failed: \(error.localizedDescription)"
++        case .cancelled:
++            name = "cancelled"
++        @unknown default:
++            name = "unknown"
++        }
++        lock.lock()
++        state.listenerState = name
++        state.listenerStateChangedAt = Date()
++        lock.unlock()
++        mcpLog.info("mcp.listener state=\(name, privacy: .public)")
++        TraceMCPStatusStore.publish(snapshot())
++    }
++
++    /// Republishes the snapshot every few seconds so `updatedAt` reflects a live process and
++    /// forces a rebind when the listener stops making progress.
++    private func startWatchdog() {
++        retryQueue.asyncAfter(deadline: .now() + 5) { [weak self] in
++            self?.watchdogTick()
++        }
++    }
++
++    private func watchdogTick() {
++        lock.lock()
++        let hasListener = state.listener != nil
++        let name = state.listenerState
++        let changedAt = state.listenerStateChangedAt
++        let port = state.port
++        let host = state.host
++        lock.unlock()
++        guard hasListener else { return }
++        TraceMCPStatusStore.publish(snapshot())
++        if name != "ready", Date().timeIntervalSince(changedAt) > 10 {
++            mcpLog.error("mcp.watchdog rebind state=\(name, privacy: .public) port=\(Int(port), privacy: .public)")
++            rebind(port: port, host: host, reason: "watchdog \(name)")
++            return
++        }
++        startWatchdog()
++    }
++
++    private func rebindSoon(reason: String) {
++        lock.lock()
++        let port = state.port
++        let host = state.host
++        lock.unlock()
++        guard port != 0 else { return }
++        retryQueue.asyncAfter(deadline: .now() + 3) { [weak self] in
++            guard let self else { return }
++            guard !self.isListening else { return }
++            self.rebind(port: port, host: host, reason: reason)
++        }
++    }
++
++    private func rebind(port: UInt16, host: String, reason: String) {
++        mcpLog.info("mcp.rebind reason=\(reason, privacy: .public) port=\(Int(port), privacy: .public) host=\(host, privacy: .public)")
++        stopListener()
++        guard port != 0 else { return }
++        retryQueue.asyncAfter(deadline: .now() + 1) { [weak self] in
++            self?.start(port: port, host: host)
++        }
++    }
++
+     private func accept(_ connection: NWConnection) {
+         let peer = Self.describe(connection.endpoint)
+         lock.lock()
+@@ -305,6 +415,7 @@ public final class TraceMCPServer: @unchecked Sendable {
+         lock.lock()
+         let listener = state.listener
+         state.listener = nil
++        state.listenerState = "idle"
+         state.startedAt = nil
+         state.host = "idle"
+         state.port = 0
+@@ -585,6 +696,8 @@ public struct TraceMCPRuntimeSnapshot: Codable, Sendable {
+     public let host: String
+     public let port: UInt16
+     public let listening: Bool
++    /// Human readable `NWListener.State` such as `ready`, `waiting: ...` or `failed: ...`.
++    public let listenerState: String
+     public let loopbackInterface: Bool
+     public let lastError: String?
+     public let lastPeer: String?
+@@ -598,6 +711,7 @@ public struct TraceMCPRuntimeSnapshot: Codable, Sendable {
+         host: String,
+         port: UInt16,
+         listening: Bool,
++        listenerState: String,
+         loopbackInterface: Bool,
+         lastError: String?,
+         lastPeer: String?,
+@@ -610,6 +724,7 @@ public struct TraceMCPRuntimeSnapshot: Codable, Sendable {
+         self.host = host
+         self.port = port
+         self.listening = listening
++        self.listenerState = listenerState
+         self.loopbackInterface = loopbackInterface
+         self.lastError = lastError
+         self.lastPeer = lastPeer
