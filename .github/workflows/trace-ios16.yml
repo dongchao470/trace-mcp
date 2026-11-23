@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   device-baseline:
-    runs-on: macos-13
+    runs-on: macos-15-intel
     timeout-minutes: 55
     env:
       IPHONEOS_DEPLOYMENT_TARGET: '16.0'
