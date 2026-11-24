@@ -1,0 +1,17 @@
+diff --git a/Trace/TraceApp.swift b/Trace/TraceApp.swift
+index 6e9f450..95c3f4f 100644
+--- a/Trace/TraceApp.swift
++++ b/Trace/TraceApp.swift
+@@ -48,6 +48,12 @@ struct TraceApp: App {
+         }
+         .onChangeCompat(of: scenePhase) { newPhase in
+             viewModel.setSceneActive(newPhase == .active)
++            if newPhase == .background {
++                // Rule: the loopback port belongs to one process at a time. A suspended app
++                // keeps its listening socket, so the port has to be released here; the scene
++                // lifecycle never calls `applicationDidEnterBackground`.
++                TraceMCPServer.shared.stop()
++            }
+             if newPhase == .active {
+                 // Rule: Avoid VPN setup before onboarding completion.
+                 if OnboardingState.hasCompleted {
