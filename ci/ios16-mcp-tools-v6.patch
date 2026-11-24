@@ -1,5 +1,5 @@
 diff --git a/TraceCore/MCP/TraceMCPTools.swift b/TraceCore/MCP/TraceMCPTools.swift
-index fe7a5ca..10c8f19 100644
+index fe7a5ca..49fc7ff 100644
 --- a/TraceCore/MCP/TraceMCPTools.swift
 +++ b/TraceCore/MCP/TraceMCPTools.swift
 @@ -7,6 +7,7 @@
@@ -229,7 +229,7 @@ index fe7a5ca..10c8f19 100644
 +        let statuses = managers.map { Self.statusName($0.connection.status) }
 +        let entries = managers.map { manager -> JSONValue in
 +            .object([
-+                "name": .string(manager.localizedDescription),
++                "name": .string(manager.localizedDescription ?? "Trace"),
 +                "enabled": .bool(manager.isEnabled),
 +                "status": .string(Self.statusName(manager.connection.status)),
 +                "on_demand": .bool(manager.isOnDemandEnabled),
