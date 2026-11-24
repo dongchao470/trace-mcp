@@ -1,0 +1,227 @@
+diff --git a/TraceCore/Utilities/CaptureBodyPolicy.swift b/TraceCore/Utilities/CaptureBodyPolicy.swift
+index 268f96e..bd760b4 100644
+--- a/TraceCore/Utilities/CaptureBodyPolicy.swift
++++ b/TraceCore/Utilities/CaptureBodyPolicy.swift
+@@ -8,10 +8,10 @@
+ import Foundation
+ 
+ public enum CaptureBodyPolicy {
+-    public static let constrainedInlineThreshold = 128 * 1024
+-    public static let constrainedBinaryCaptureLimit = 64 * 1024
+-    public static let constrainedCompressedCaptureLimit = 128 * 1024
+-    public static let constrainedTextCaptureLimit = 256 * 1024
++    public static let constrainedInlineThreshold = 512 * 1024
++    public static let constrainedBinaryCaptureLimit = 512 * 1024
++    public static let constrainedCompressedCaptureLimit = 2 * 1024 * 1024
++    public static let constrainedTextCaptureLimit = 2 * 1024 * 1024
+ 
+     public static func effectiveInlineThreshold(
+         configuredThreshold: Int,
+diff --git a/TraceUI/Body/BodyInspectorView.swift b/TraceUI/Body/BodyInspectorView.swift
+index 96b595e..1fd2582 100644
+--- a/TraceUI/Body/BodyInspectorView.swift
++++ b/TraceUI/Body/BodyInspectorView.swift
+@@ -181,20 +181,20 @@ public struct BodyInspectorView: View {
+     private var contentArea: some View {
+         switch viewMode {
+         case .text:
+-            DirectionalScrollView([.horizontal, .vertical]) {
++            ScrollView(.vertical) {
+                 textView
+                     .frame(maxWidth: .infinity, alignment: .leading)
+                     .padding(.vertical, DesignSystem.Spacing.xs)
+             }
+-            .frame(maxHeight: 420)
++            .frame(maxHeight: 560)
+ 
+         case .hex:
+-            DirectionalScrollView([.horizontal, .vertical]) {
++            ScrollView(.vertical) {
+                 hexView
+                     .frame(maxWidth: .infinity, alignment: .leading)
+                     .padding(.vertical, DesignSystem.Spacing.xs)
+             }
+-            .frame(maxHeight: 420)
++            .frame(maxHeight: 560)
+ 
+         case .auto:
+             autoContentView
+@@ -239,20 +239,20 @@ public struct BodyInspectorView: View {
+             }
+ 
+         case .plainText, .none:
+-            DirectionalScrollView([.horizontal, .vertical]) {
++            ScrollView(.vertical) {
+                 textView
+                     .frame(maxWidth: .infinity, alignment: .leading)
+                     .padding(.vertical, DesignSystem.Spacing.xs)
+             }
+-            .frame(maxHeight: 420)
++            .frame(maxHeight: 560)
+ 
+         case .binary:
+-            DirectionalScrollView([.horizontal, .vertical]) {
++            ScrollView(.vertical) {
+                 hexView
+                     .frame(maxWidth: .infinity, alignment: .leading)
+                     .padding(.vertical, DesignSystem.Spacing.xs)
+             }
+-            .frame(maxHeight: 420)
++            .frame(maxHeight: 560)
+         }
+     }
+ 
+@@ -336,7 +336,7 @@ public struct BodyInspectorView: View {
+                 case .image:
+                     imageFullScreenView
+                 default:
+-                    DirectionalScrollView([.horizontal, .vertical]) {
++                    ScrollView(.vertical) {
+                         textView
+                             .padding()
+                             .frame(maxWidth: .infinity, alignment: .leading)
+diff --git a/TraceUI/Body/BodyViewerPolicy.swift b/TraceUI/Body/BodyViewerPolicy.swift
+index f634419..ea25678 100644
+--- a/TraceUI/Body/BodyViewerPolicy.swift
++++ b/TraceUI/Body/BodyViewerPolicy.swift
+@@ -9,17 +9,17 @@ import Foundation
+ 
+ /// Centralized viewer budgets so large payloads can degrade gracefully without changing core UX.
+ public enum BodyViewerPolicy {
+-    public static let initialStructuredTextLoadBytes = 128 * 1024
+-    public static let initialPlainTextLoadBytes = 256 * 1024
+-    public static let initialBinaryLoadBytes = 256 * 1024
++    public static let initialStructuredTextLoadBytes = 1024 * 1024
++    public static let initialPlainTextLoadBytes = 1024 * 1024
++    public static let initialBinaryLoadBytes = 512 * 1024
+ 
+-    public static let expandedStructuredTextLoadBytes = 384 * 1024
+-    public static let expandedPlainTextLoadBytes = 768 * 1024
+-    public static let expandedBinaryLoadBytes = 512 * 1024
++    public static let expandedStructuredTextLoadBytes = 4 * 1024 * 1024
++    public static let expandedPlainTextLoadBytes = 4 * 1024 * 1024
++    public static let expandedBinaryLoadBytes = 2 * 1024 * 1024
+ 
+-    public static let automaticStructuredRenderBytes = 32 * 1024
+-    public static let jsonStructuredParsingBytes = 32 * 1024
+-    public static let jsonSyntaxHighlightBytes = 8 * 1024
++    public static let automaticStructuredRenderBytes = 512 * 1024
++    public static let jsonStructuredParsingBytes = 512 * 1024
++    public static let jsonSyntaxHighlightBytes = 64 * 1024
+     public static let networkBodySearchBytes = 32 * 1024
+     public static let imageThumbnailMaxPixelSize = 2400
+ 
+diff --git a/TraceUI/Body/JSONViewerView.swift b/TraceUI/Body/JSONViewerView.swift
+index 6d8665c..3369e83 100644
+--- a/TraceUI/Body/JSONViewerView.swift
++++ b/TraceUI/Body/JSONViewerView.swift
+@@ -78,7 +78,7 @@ public struct JSONViewerView: View {
+ 
+             switch viewMode {
+             case .formatted:
+-                DirectionalScrollView([.horizontal, .vertical]) {
++                ScrollView(.vertical) {
+                     formattedView
+                         .padding()
+                 }
+@@ -88,7 +88,7 @@ public struct JSONViewerView: View {
+                         .padding()
+                 }
+             case .raw:
+-                ScrollView([.horizontal]) {
++                ScrollView(.vertical) {
+                     rawView
+                         .padding()
+                 }
+diff --git a/TraceUI/Body/PagedBodyTextView.swift b/TraceUI/Body/PagedBodyTextView.swift
+index e4043e4..d91cc8e 100644
+--- a/TraceUI/Body/PagedBodyTextView.swift
++++ b/TraceUI/Body/PagedBodyTextView.swift
+@@ -1,6 +1,7 @@
+ import SwiftUI
+ 
+-/// Renders at most one small page; reading another page never rebuilds a giant Text.
++/// Renders one bounded page at a time so a huge body never builds a single giant `Text`.
++/// Pages are display-only chunks: the underlying body is never modified or truncated here.
+ public struct PagedBodyTextView: View {
+     public let content: String
+     @State private var pages: [String] = []
+@@ -9,29 +10,28 @@ public struct PagedBodyTextView: View {
+     public init(content: String) { self.content = content }
+ 
+     public var body: some View {
+-        VStack(alignment: .leading, spacing: 10) {
++        VStack(alignment: .leading, spacing: 8) {
+             if pages.isEmpty {
+                 ProgressView("正在准备正文…")
++                    .frame(maxWidth: .infinity, alignment: .leading)
+             } else {
+                 if pages.count > 1 {
+-                    HStack(spacing: 12) {
+-                        Button("上一页") { page = max(0, page - 1) }
+-                            .disabled(page == 0)
+-                        Text("第 \(page + 1) / \(pages.count) 页")
+-                            .font(.caption)
+-                            .foregroundStyle(.secondary)
+-                        Button("下一页") { page = min(pages.count - 1, page + 1) }
+-                            .disabled(page + 1 >= pages.count)
+-                    }
+-                    .buttonStyle(.bordered)
+-                    Text("分页仅影响显示，不会截断实际转发的数据。")
+-                        .font(.caption2)
+-                        .foregroundStyle(.secondary)
++                    pageBar
+                 }
++
+                 Text(pages[min(page, pages.count - 1)])
+-                    .font(.system(.caption, design: .monospaced))
++                    .font(.system(.footnote, design: .monospaced))
+                     .textSelection(.enabled)
+                     .frame(maxWidth: .infinity, alignment: .leading)
++                    .fixedSize(horizontal: false, vertical: true)
++
++                if pages.count > 1 {
++                    Text("分页只影响显示，正文本身没有被截断。")
++                        .font(.caption2)
++                        .foregroundStyle(.secondary)
++                        .frame(maxWidth: .infinity, alignment: .leading)
++                        .fixedSize(horizontal: false, vertical: true)
++                }
+             }
+         }
+         .task(id: content) {
+@@ -44,4 +44,34 @@ public struct PagedBodyTextView: View {
+             pages = prepared
+         }
+     }
++
++    private var pageBar: some View {
++        HStack(spacing: 8) {
++            Button {
++                page = max(0, page - 1)
++            } label: {
++                Image(systemName: "chevron.left")
++            }
++            .disabled(page == 0)
++            .accessibilityLabel("上一页")
++
++            Text("第 \(page + 1) / \(pages.count) 页")
++                .font(.caption)
++                .monospacedDigit()
++                .foregroundStyle(.secondary)
++                .fixedSize()
++
++            Button {
++                page = min(pages.count - 1, page + 1)
++            } label: {
++                Image(systemName: "chevron.right")
++            }
++            .disabled(page + 1 >= pages.count)
++            .accessibilityLabel("下一页")
++
++            Spacer(minLength: 0)
++        }
++        .buttonStyle(.bordered)
++        .controlSize(.small)
++    }
+ }
