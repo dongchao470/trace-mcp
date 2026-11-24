@@ -1,0 +1,121 @@
+diff --git a/TraceCore/MCP/TraceMCPServer.swift b/TraceCore/MCP/TraceMCPServer.swift
+index 995d19e..4b7ba94 100644
+--- a/TraceCore/MCP/TraceMCPServer.swift
++++ b/TraceCore/MCP/TraceMCPServer.swift
+@@ -192,9 +192,11 @@ public final class TraceMCPServer: @unchecked Sendable {
+             try launchListener(port: nwPort, loopbackInterface: true, host: host)
+         } catch {
+             mcpLog.error("mcp.bind loopback failed \(error.localizedDescription, privacy: .public)")
++            TraceMCPStatusStore.appendDiagnostic(host: host, "bind_loopback_failed \(error.localizedDescription)")
+             do {
+                 try launchListener(port: nwPort, loopbackInterface: false, host: host)
+             } catch {
++                TraceMCPStatusStore.appendDiagnostic(host: host, "bind_wildcard_failed \(error.localizedDescription)")
+                 record(error: "listener init failed: \(error.localizedDescription)")
+             }
+         }
+@@ -209,19 +211,28 @@ public final class TraceMCPServer: @unchecked Sendable {
+ 
+     /// Binds, retrying while another process still owns the loopback port: the host app
+     /// releases it when it backgrounds and the tunnel extension keeps serving afterwards.
++    /// - Parameter remaining: number of attempts left, or a negative value to retry forever.
+     public func startRetrying(
+         port: UInt16,
+         host: String,
+-        interval: TimeInterval = 10,
+-        remaining: Int = 90
++        interval: TimeInterval = 5,
++        remaining: Int = -1
+     ) {
+         start(port: port, host: host)
+-        guard remaining > 0 else { return }
+         retryQueue.asyncAfter(deadline: .now() + interval) { [weak self] in
+             guard let self else { return }
+             if self.isListening { return }
++            if remaining == 0 {
++                TraceMCPStatusStore.appendDiagnostic(host: host, "retry_exhausted")
++                return
++            }
+             self.dropUnreadyListener()
+-            self.startRetrying(port: port, host: host, interval: interval, remaining: remaining - 1)
++            self.startRetrying(
++                port: port,
++                host: host,
++                interval: interval,
++                remaining: remaining < 0 ? -1 : remaining - 1
++            )
+         }
+     }
+ 
+@@ -308,6 +319,7 @@ public final class TraceMCPServer: @unchecked Sendable {
+         state.listenerStateChangedAt = Date()
+         lock.unlock()
+         mcpLog.info("mcp.listener state=\(name, privacy: .public)")
++        TraceMCPStatusStore.appendDiagnostic(host: currentHost, "state \(name)")
+         TraceMCPStatusStore.publish(snapshot())
+     }
+ 
+@@ -427,11 +439,18 @@ public final class TraceMCPServer: @unchecked Sendable {
+         TraceMCPStatusStore.publish(snapshot())
+     }
+ 
++    private var currentHost: String {
++        lock.lock()
++        defer { lock.unlock() }
++        return state.host
++    }
++
+     private func record(error: String) {
+         lock.lock()
+         state.lastError = error
+         lock.unlock()
+         mcpLog.error("mcp.error \(error, privacy: .public)")
++        TraceMCPStatusStore.appendDiagnostic(host: currentHost, "error \(error)")
+         TraceMCPStatusStore.publish(snapshot())
+     }
+ 
+@@ -743,12 +762,42 @@ public enum TraceMCPStatusStore {
+         AppGroupStorage.shared.containerURL?.appendingPathComponent(fileName)
+     }
+ 
++    /// Each host keeps its own snapshot: the app and the tunnel extension share one legacy
++    /// file, and the last writer used to hide whether the other process was serving at all.
++    public static func hostFileURL(_ host: String) -> URL? {
++        guard let base = AppGroupStorage.shared.containerURL else { return nil }
++        let safe = host.replacingOccurrences(of: "/", with: "-")
++        return base.appendingPathComponent("mcp-status-\(safe).json")
++    }
++
+     public static func publish(_ snapshot: TraceMCPRuntimeSnapshot) {
+-        guard let url = fileURL else { return }
+         let encoder = JSONEncoder()
+         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+         guard let data = try? encoder.encode(snapshot) else { return }
+-        try? data.write(to: url, options: .atomic)
++        if let url = fileURL {
++            try? data.write(to: url, options: .atomic)
++        }
++        if let hostURL = hostFileURL(snapshot.host) {
++            try? data.write(to: hostURL, options: .atomic)
++        }
++    }
++
++    /// Appends one line of diagnostics, keeping the file small enough to read from a shell.
++    public static func appendDiagnostic(host: String, _ message: String) {
++        guard let base = AppGroupStorage.shared.containerURL else { return }
++        let safe = host.replacingOccurrences(of: "/", with: "-")
++        let url = base.appendingPathComponent("mcp-diag-\(safe).ndjson")
++        let stamp = ISO8601DateFormatter().string(from: Date())
++        let pid = ProcessInfo.processInfo.processIdentifier
++        let line = "{\"at\":\"\(stamp)\",\"pid\":\(pid),\"event\":\"\(message)\"}\n"
++        guard let data = line.data(using: .utf8) else { return }
++        if let handle = try? FileHandle(forWritingTo: url) {
++            defer { try? handle.close() }
++            _ = try? handle.seekToEnd()
++            try? handle.write(contentsOf: data)
++        } else {
++            try? data.write(to: url, options: .atomic)
++        }
+     }
+ 
+     public static func loadLastSnapshot() -> TraceMCPRuntimeSnapshot? {
