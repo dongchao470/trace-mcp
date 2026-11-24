@@ -1,0 +1,435 @@
+diff --git a/TraceCore/MCP/TraceMCPTools.swift b/TraceCore/MCP/TraceMCPTools.swift
+index fe7a5ca..10c8f19 100644
+--- a/TraceCore/MCP/TraceMCPTools.swift
++++ b/TraceCore/MCP/TraceMCPTools.swift
+@@ -7,6 +7,7 @@
+ 
+ import AsyncHTTPClient
+ import Foundation
++import NetworkExtension
+ import NIOCore
+ 
+ public struct TraceMCPToolDefinition: Sendable {
+@@ -47,6 +48,9 @@ public actor TraceMCPDispatcher {
+         replayDefinition,
+         rulesDefinition,
+         clearDefinition,
++        cookiesDefinition,
++        vpnStatusDefinition,
++        vpnDisconnectDefinition,
+     ]
+ 
+     // MARK: - Definitions
+@@ -131,6 +135,34 @@ public actor TraceMCPDispatcher {
+         ], required: ["confirm"])
+     )
+ 
++    private static let cookiesDefinition = TraceMCPToolDefinition(
++        name: "extract_cookies",
++        description: "汇总抓包里的 Cookie：按名聚合出现次数、所属域名与样例值（默认掩码，reveal=true 返回完整值）。",
++        inputSchema: schema([
++            "host": stringField("只看域名包含该串的请求"),
++            "name": stringField("只看 cookie 名包含该串的键，例如 pt_"),
++            "from": stringField("起始时间：ISO8601 或相对量 30m / 12h / 7d"),
++            "to": stringField("结束时间：同上"),
++            "reveal": boolField("返回完整 cookie 值（默认掩码）", defaultValue: false),
++            "limit": intField(defaultValue: 40, maximum: 200),
++        ])
++    )
++
++    private static let vpnStatusDefinition = TraceMCPToolDefinition(
++        name: "vpn_status",
++        description: "查看 VPN 隧道状态：配置数量、是否连接、每个隧道的状态与按需连接开关。",
++        inputSchema: schema([:])
++    )
++
++    private static let vpnDisconnectDefinition = TraceMCPToolDefinition(
++        name: "vpn_disconnect",
++        description: "断开正在连接或已连接的 VPN 隧道（破坏性操作，需要 confirm=true）。",
++        inputSchema: schema([
++            "confirm": boolField("必须为 true 才会执行", defaultValue: false),
++            "force": boolField("状态不明时也发送断开指令", defaultValue: false),
++        ], required: ["confirm"])
++    )
++
+     // MARK: - Schema helpers
+ 
+     private static func schema(_ properties: [String: JSONValue], required: [String] = []) -> JSONValue {
+@@ -229,6 +261,12 @@ public actor TraceMCPDispatcher {
+             try await listRewriteRules(arguments)
+         case "clear_requests":
+             try await clearRequests(arguments)
++        case "extract_cookies":
++            try await extractCookies(arguments)
++        case "vpn_status":
++            try await vpnStatus(arguments)
++        case "vpn_disconnect":
++            try await vpnDisconnect(arguments)
+         default:
+             throw MCPError.toolFailure("未知工具：\(tool)")
+         }
+@@ -308,30 +346,29 @@ public actor TraceMCPDispatcher {
+         }
+         let scope = args["scope"]?.string ?? "all"
+         let limit = max(1, min(args["limit"]?.int ?? 50, 500))
+-        var requests = try await storage.loadRequests()
+-        if let sessionID = args["session_id"]?.string, let uuid = UUID(uuidString: sessionID) {
+-            requests = requests.filter { $0.sessionId == uuid }
+-        }
+-        let matches = requests.filter { request in
+-            switch scope {
+-            case "url":
+-                return request.url.localizedCaseInsensitiveContains(query)
+-            case "headers":
+-                return matchesHeaders(request, query)
+-            case "body":
+-                return matchesBody(request, query)
+-            default:
+-                return request.url.localizedCaseInsensitiveContains(query)
+-                    || matchesHeaders(request, query)
+-                    || matchesBody(request, query)
++        let offset = max(0, args["offset"]?.int ?? 0)
++        let reveal = args["reveal"]?.bool ?? false
++        let requests = try await matchingRequests(args)
++        var hits: [(NetworkRequest, JSONValue)] = []
++        hits.reserveCapacity(requests.count)
++        for request in requests {
++            if let evidence = matchEvidence(in: request, query: query, scope: scope, reveal: reveal) {
++                hits.append((request, evidence))
+             }
+         }
+-        let sorted = sortRequests(matches, mode: "newest")
++        let sorted = hits.sorted { $0.0.timestamp > $1.0.timestamp }
++        let page = Array(sorted.dropFirst(offset).prefix(limit))
+         return .object([
+             "query": .string(query),
+             "scope": .string(scope),
+-            "total_matched": .number(Double(matches.count)),
+-            "requests": .array(sorted.prefix(limit).map(summary)),
++            "total_matched": .number(Double(sorted.count)),
++            "returned": .number(Double(page.count)),
++            "offset": .number(Double(offset)),
++            "requests": .array(page.map { entry in
++                var fields = summaryFields(entry.0)
++                fields["match"] = entry.1
++                return .object(fields)
++            }),
+         ])
+     }
+ 
+@@ -466,17 +503,169 @@ public actor TraceMCPDispatcher {
+         guard args["confirm"]?.bool == true else {
+             throw MCPError.invalidParams("这是破坏性操作，必须传 confirm=true")
+         }
++        let dryRun = args["dry_run"]?.bool ?? false
++        let hasFilter = ["session_id", "host", "hosts", "exclude_hosts", "url_contains", "method", "status",
++                         "status_min", "status_max", "only_errors", "from", "to", "older_than"]
++            .contains { args[$0] != nil }
+         let all = try await storage.loadRequests()
+-        if let sessionID = args["session_id"]?.string, let uuid = UUID(uuidString: sessionID) {
+-            let remaining = all.filter { $0.sessionId != uuid }
+-            try await storage.saveRequests(remaining)
++        let targets = hasFilter ? try await matchingRequests(args) : all
++        let doomed = Set(targets.map(\.id))
++        let remaining = all.filter { !doomed.contains($0.id) }
++        if dryRun {
+             return .object([
+-                "deleted": .number(Double(all.count - remaining.count)),
+-                "session_id": .string(sessionID),
++                "dry_run": .bool(true),
++                "would_delete": .number(Double(targets.count)),
++                "remaining": .number(Double(remaining.count)),
+             ])
+         }
+-        try await storage.saveRequests([])
+-        return .object(["deleted": .number(Double(all.count))])
++        try await storage.saveRequests(remaining)
++        return .object([
++            "dry_run": .bool(false),
++            "deleted": .number(Double(targets.count)),
++            "remaining": .number(Double(remaining.count)),
++        ])
++    }
++
++    private func extractCookies(_ args: JSONValue) async throws -> JSONValue {
++        let reveal = args["reveal"]?.bool ?? false
++        let limit = max(1, min(args["limit"]?.int ?? 40, 200))
++        let nameFilter = (args["name"]?.string ?? "").lowercased()
++        var requests = try await matchingRequests(args)
++        requests.sort { $0.timestamp > $1.timestamp }
++
++        struct CookieAggregate {
++            var count = 0
++            var hosts: Set<String> = []
++            var sample = ""
++            var sampleRequestID: UUID?
++            var earliest = Date.distantFuture
++            var latest = Date.distantPast
++        }
++
++        var aggregates: [String: CookieAggregate] = [:]
++        var scanned = 0
++        var requestsWithCookie = 0
++
++        for request in requests {
++            scanned += 1
++            guard let cookie = request.requestHeaders.first(where: { $0.key.caseInsensitiveCompare("Cookie") == .orderedSame })?.value else {
++                continue
++            }
++            requestsWithCookie += 1
++            let host = URL(string: request.url)?.host ?? ""
++            for pair in cookie.split(separator: ";") {
++                let item = pair.trimmingCharacters(in: .whitespaces)
++                guard let separator = item.firstIndex(of: "=") else { continue }
++                let key = String(item[..<separator])
++                let value = String(item[item.index(after: separator)...])
++                if !nameFilter.isEmpty && !key.lowercased().contains(nameFilter) { continue }
++                var aggregate = aggregates[key] ?? CookieAggregate()
++                aggregate.count += 1
++                aggregate.hosts.insert(host)
++                aggregate.earliest = min(aggregate.earliest, request.timestamp)
++                aggregate.latest = max(aggregate.latest, request.timestamp)
++                if aggregate.sample.isEmpty {
++                    aggregate.sample = value
++                    aggregate.sampleRequestID = request.id
++                }
++                aggregates[key] = aggregate
++            }
++        }
++
++        let ordered = aggregates.sorted { lhs, rhs in
++            lhs.value.count == rhs.value.count ? lhs.key < rhs.key : lhs.value.count > rhs.value.count
++        }
++        let rows: [JSONValue] = ordered.prefix(limit).map { entry in
++            let name = entry.key
++            let aggregate = entry.value
++            return .object([
++                "name": .string(name),
++                "count": .number(Double(aggregate.count)),
++                "value_length": .number(Double(aggregate.sample.count)),
++                "value": .string(reveal ? aggregate.sample : Self.maskValue(aggregate.sample)),
++                "masked": .bool(!reveal),
++                "hosts": .array(aggregate.hosts.sorted().map { .string($0) }),
++                "sample_request_id": aggregate.sampleRequestID.map { .string($0.uuidString) } ?? .null,
++                "first_seen": .string(iso(aggregate.earliest)),
++                "last_seen": .string(iso(aggregate.latest)),
++            ])
++        }
++        return .object([
++            "scanned_requests": .number(Double(scanned)),
++            "requests_with_cookie": .number(Double(requestsWithCookie)),
++            "distinct_names": .number(Double(aggregates.count)),
++            "returned": .number(Double(rows.count)),
++            "cookies": .array(rows),
++        ])
++    }
++
++    private func vpnStatus(_: JSONValue) async throws -> JSONValue {
++        let managers = try await tunnelManagers()
++        let statuses = managers.map { Self.statusName($0.connection.status) }
++        let entries = managers.map { manager -> JSONValue in
++            .object([
++                "name": .string(manager.localizedDescription),
++                "enabled": .bool(manager.isEnabled),
++                "status": .string(Self.statusName(manager.connection.status)),
++                "on_demand": .bool(manager.isOnDemandEnabled),
++            ])
++        }
++        return .object([
++            "host": .string(TraceMCPServer.shared.status.host),
++            "tunnel_count": .number(Double(managers.count)),
++            "connected": .bool(statuses.contains("connected")),
++            "tunnels": .array(entries),
++        ])
++    }
++
++    private func vpnDisconnect(_ args: JSONValue) async throws -> JSONValue {
++        guard args["confirm"]?.bool == true else {
++            throw MCPError.invalidParams("断开 VPN 需要 confirm=true")
++        }
++        let force = args["force"]?.bool ?? false
++        let managers = try await tunnelManagers()
++        var stopped = 0
++        for manager in managers {
++            switch manager.connection.status {
++            case .connected, .connecting, .reasserting:
++                manager.connection.stopVPNTunnel()
++                stopped += 1
++            default:
++                if force {
++                    manager.connection.stopVPNTunnel()
++                    stopped += 1
++                }
++            }
++        }
++        return .object([
++            "host": .string(TraceMCPServer.shared.status.host),
++            "stopped": .number(Double(stopped)),
++            "note": .string(stopped > 0 ? "已发送断开指令" : "没有处于连接状态的隧道"),
++        ])
++    }
++
++    private func tunnelManagers() async throws -> [NETunnelProviderManager] {
++        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[NETunnelProviderManager], Error>) in
++            NETunnelProviderManager.loadAllFromPreferences { managers, error in
++                if let error {
++                    continuation.resume(throwing: error)
++                } else {
++                    continuation.resume(returning: managers ?? [])
++                }
++            }
++        }
++    }
++
++    private static func statusName(_ status: NEVPNStatus) -> String {
++        switch status {
++        case .connected: return "connected"
++        case .connecting: return "connecting"
++        case .disconnecting: return "disconnecting"
++        case .reasserting: return "reasserting"
++        case .disconnected: return "disconnected"
++        case .invalid: return "invalid"
++        @unknown default: return "unknown"
++        }
+     }
+ 
+     // MARK: - Helpers
+@@ -495,6 +684,32 @@ public actor TraceMCPDispatcher {
+         if let needle = args["url_contains"]?.string, !needle.isEmpty {
+             requests = requests.filter { $0.url.localizedCaseInsensitiveContains(needle) }
+         }
++        if let from = parseDateArg(args["from"]?.string) {
++            requests = requests.filter { $0.timestamp >= from }
++        }
++        if let to = parseDateArg(args["to"]?.string) {
++            requests = requests.filter { $0.timestamp <= to }
++        }
++        if let older = args["older_than"]?.string, !older.isEmpty {
++            guard let cutoff = parseDateArg(older) else {
++                throw MCPError.invalidParams("older_than 需要形如 30m / 12h / 7d")
++            }
++            requests = requests.filter { $0.timestamp >= cutoff }
++        }
++        if let hosts = args["hosts"]?.string, !hosts.isEmpty {
++            let wanted = hosts.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
++            requests = requests.filter { request in
++                let host = (URL(string: request.url)?.host ?? "").lowercased()
++                return wanted.contains { host.contains($0) }
++            }
++        }
++        if let excluded = args["exclude_hosts"]?.string, !excluded.isEmpty {
++            let blocked = excluded.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
++            requests = requests.filter { request in
++                let host = (URL(string: request.url)?.host ?? "").lowercased()
++                return !blocked.contains { host.contains($0) }
++            }
++        }
+         if let method = args["method"]?.string, !method.isEmpty {
+             requests = requests.filter { ($0.requestMethodRaw ?? $0.method.rawValue).caseInsensitiveCompare(method) == .orderedSame }
+         }
+@@ -528,7 +743,11 @@ public actor TraceMCPDispatcher {
+     }
+ 
+     private func summary(_ request: NetworkRequest) -> JSONValue {
+-        .object([
++        .object(summaryFields(request))
++    }
++
++    private func summaryFields(_ request: NetworkRequest) -> [String: JSONValue] {
++        [
+             "id": .string(request.id.uuidString),
+             "method": .string(request.requestMethodRaw ?? request.method.rawValue),
+             "url": .string(request.url),
+@@ -540,7 +759,7 @@ public actor TraceMCPDispatcher {
+             "response_bytes": .number(Double(request.responseBody.totalSize)),
+             "rewritten": .bool(request.wasRewritten),
+             "blocked": .bool(request.wasBlocked),
+-        ])
++        ]
+     }
+ 
+     private func detail(_ request: NetworkRequest, maxBodyBytes: Int) -> JSONValue {
+@@ -591,6 +810,83 @@ public actor TraceMCPDispatcher {
+         return "<二进制 \(data.count) 字节>"
+     }
+ 
++    private func matchEvidence(in request: NetworkRequest, query: String, scope: String, reveal: Bool) -> JSONValue? {
++        if scope == "url" || scope == "all" {
++            if request.url.localizedCaseInsensitiveContains(query) {
++                return .object([
++                    "field": .string("url"),
++                    "value": .string(request.url),
++                ])
++            }
++        }
++        if scope == "headers" || scope == "all" {
++            for header in request.requestHeaders + request.responseHeaders {
++                guard header.key.localizedCaseInsensitiveContains(query) || header.value.localizedCaseInsensitiveContains(query) else {
++                    continue
++                }
++                let sensitive = Self.sensitiveHeaderNames.contains(header.key.lowercased())
++                let masked = sensitive && !reveal
++                return .object([
++                    "field": .string("header"),
++                    "name": .string(header.key),
++                    "masked": .bool(masked),
++                    "value": .string(masked ? Self.maskValue(header.value) : Self.truncate(header.value, limit: 240)),
++                ])
++            }
++        }
++        if scope == "body" || scope == "all" {
++            for (label, body) in [("request_body", request.requestBody), ("response_body", request.responseBody)] {
++                guard let bodyText = body.getString(maxBytes: 512 * 1024), bodyText.localizedCaseInsensitiveContains(query) else {
++                    continue
++                }
++                return .object([
++                    "field": .string(label),
++                    "bytes": .number(Double(body.totalSize)),
++                    "snippet": .string(Self.snippet(bodyText, around: query)),
++                ])
++            }
++        }
++        return nil
++    }
++
++    private func parseDateArg(_ raw: String?) -> Date? {
++        guard let raw, !raw.isEmpty else { return nil }
++        let lowered = raw.lowercased()
++        if let unit = lowered.last, let amount = Int(lowered.dropLast()), amount > 0 {
++            let seconds: TimeInterval
++            switch unit {
++            case "m": seconds = 60
++            case "h": seconds = 3600
++            case "d": seconds = 86400
++            default: seconds = 0
++            }
++            if seconds > 0 { return Date().addingTimeInterval(-Double(amount) * seconds) }
++        }
++        if let date = isoFormatter.date(from: raw) { return date }
++        return ISO8601DateFormatter().date(from: raw)
++    }
++
++    private static let sensitiveHeaderNames: Set<String> = [
++        "cookie", "set-cookie", "authorization", "proxy-authorization",
++        "x-api-key", "x-auth-token", "x-access-token", "token",
++    ]
++
++    private static func maskValue(_ value: String) -> String {
++        guard value.count > 12 else { return "***" }
++        return String(value.prefix(4)) + "…" + String(value.suffix(3)) + " (\(value.count) 字符)"
++    }
++
++    private static func truncate(_ value: String, limit: Int) -> String {
++        value.count <= limit ? value : String(value.prefix(limit)) + "…"
++    }
++
++    private static func snippet(_ text: String, around query: String) -> String {
++        guard let range = text.range(of: query, options: .caseInsensitive) else { return "" }
++        let lower = text.index(range.lowerBound, offsetBy: -60, limitedBy: text.startIndex) ?? text.startIndex
++        let upper = text.index(range.upperBound, offsetBy: 60, limitedBy: text.endIndex) ?? text.endIndex
++        return String(text[lower..<upper])
++    }
++
+     private func matchesHeaders(_ request: NetworkRequest, _ query: String) -> Bool {
+         request.requestHeaders.contains { $0.key.localizedCaseInsensitiveContains(query) || $0.value.localizedCaseInsensitiveContains(query) }
+             || request.responseHeaders.contains { $0.key.localizedCaseInsensitiveContains(query) || $0.value.localizedCaseInsensitiveContains(query) }
