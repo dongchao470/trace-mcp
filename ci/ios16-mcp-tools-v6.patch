@@ -1,5 +1,5 @@
 diff --git a/TraceCore/MCP/TraceMCPTools.swift b/TraceCore/MCP/TraceMCPTools.swift
-index fe7a5ca..49fc7ff 100644
+index fe7a5ca..5bd49fa 100644
 --- a/TraceCore/MCP/TraceMCPTools.swift
 +++ b/TraceCore/MCP/TraceMCPTools.swift
 @@ -7,6 +7,7 @@
@@ -117,7 +117,7 @@ index fe7a5ca..49fc7ff 100644
          ])
      }
  
-@@ -466,17 +503,169 @@ public actor TraceMCPDispatcher {
+@@ -466,17 +503,185 @@ public actor TraceMCPDispatcher {
          guard args["confirm"]?.bool == true else {
              throw MCPError.invalidParams("这是破坏性操作，必须传 confirm=true")
          }
@@ -133,16 +133,12 @@ index fe7a5ca..49fc7ff 100644
 +        let doomed = Set(targets.map(\.id))
 +        let remaining = all.filter { !doomed.contains($0.id) }
 +        if dryRun {
-             return .object([
--                "deleted": .number(Double(all.count - remaining.count)),
--                "session_id": .string(sessionID),
++            return .object([
 +                "dry_run": .bool(true),
 +                "would_delete": .number(Double(targets.count)),
 +                "remaining": .number(Double(remaining.count)),
-             ])
-         }
--        try await storage.saveRequests([])
--        return .object(["deleted": .number(Double(all.count))])
++            ])
++        }
 +        try await storage.saveRequests(remaining)
 +        return .object([
 +            "dry_run": .bool(false),
@@ -203,7 +199,9 @@ index fe7a5ca..49fc7ff 100644
 +        let rows: [JSONValue] = ordered.prefix(limit).map { entry in
 +            let name = entry.key
 +            let aggregate = entry.value
-+            return .object([
+             return .object([
+-                "deleted": .number(Double(all.count - remaining.count)),
+-                "session_id": .string(sessionID),
 +                "name": .string(name),
 +                "count": .number(Double(aggregate.count)),
 +                "value_length": .number(Double(aggregate.sample.count)),
@@ -213,8 +211,10 @@ index fe7a5ca..49fc7ff 100644
 +                "sample_request_id": aggregate.sampleRequestID.map { .string($0.uuidString) } ?? .null,
 +                "first_seen": .string(iso(aggregate.earliest)),
 +                "last_seen": .string(iso(aggregate.latest)),
-+            ])
-+        }
+             ])
+         }
+-        try await storage.saveRequests([])
+-        return .object(["deleted": .number(Double(all.count))])
 +        return .object([
 +            "scanned_requests": .number(Double(scanned)),
 +            "requests_with_cookie": .number(Double(requestsWithCookie)),
@@ -225,21 +225,17 @@ index fe7a5ca..49fc7ff 100644
 +    }
 +
 +    private func vpnStatus(_: JSONValue) async throws -> JSONValue {
-+        let managers = try await tunnelManagers()
-+        let statuses = managers.map { Self.statusName($0.connection.status) }
-+        let entries = managers.map { manager -> JSONValue in
-+            .object([
-+                "name": .string(manager.localizedDescription ?? "Trace"),
-+                "enabled": .bool(manager.isEnabled),
-+                "status": .string(Self.statusName(manager.connection.status)),
-+                "on_demand": .bool(manager.isOnDemandEnabled),
-+            ])
++        let tunnels = try await tunnelSummaries()
++        let connected = tunnels.contains { entry in
++            guard case let .object(fields) = entry,
++                  case let .string(status)? = fields["status"] else { return false }
++            return status == "connected"
 +        }
 +        return .object([
 +            "host": .string(TraceMCPServer.shared.status.host),
-+            "tunnel_count": .number(Double(managers.count)),
-+            "connected": .bool(statuses.contains("connected")),
-+            "tunnels": .array(entries),
++            "tunnel_count": .number(Double(tunnels.count)),
++            "connected": .bool(connected),
++            "tunnels": .array(tunnels),
 +        ])
 +    }
 +
@@ -248,20 +244,7 @@ index fe7a5ca..49fc7ff 100644
 +            throw MCPError.invalidParams("断开 VPN 需要 confirm=true")
 +        }
 +        let force = args["force"]?.bool ?? false
-+        let managers = try await tunnelManagers()
-+        var stopped = 0
-+        for manager in managers {
-+            switch manager.connection.status {
-+            case .connected, .connecting, .reasserting:
-+                manager.connection.stopVPNTunnel()
-+                stopped += 1
-+            default:
-+                if force {
-+                    manager.connection.stopVPNTunnel()
-+                    stopped += 1
-+                }
-+            }
-+        }
++        let stopped = try await stopTunnels(force: force)
 +        return .object([
 +            "host": .string(TraceMCPServer.shared.status.host),
 +            "stopped": .number(Double(stopped)),
@@ -269,14 +252,47 @@ index fe7a5ca..49fc7ff 100644
 +        ])
 +    }
 +
-+    private func tunnelManagers() async throws -> [NETunnelProviderManager] {
-+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[NETunnelProviderManager], Error>) in
++    private func tunnelSummaries() async throws -> [JSONValue] {
++        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[JSONValue], Error>) in
 +            NETunnelProviderManager.loadAllFromPreferences { managers, error in
 +                if let error {
 +                    continuation.resume(throwing: error)
-+                } else {
-+                    continuation.resume(returning: managers ?? [])
++                    return
 +                }
++                let rows: [JSONValue] = (managers ?? []).map { manager in
++                    .object([
++                        "name": .string(manager.localizedDescription ?? "Trace"),
++                        "enabled": .bool(manager.isEnabled),
++                        "status": .string(Self.statusName(manager.connection.status)),
++                        "on_demand": .bool(manager.isOnDemandEnabled),
++                    ])
++                }
++                continuation.resume(returning: rows)
++            }
++        }
++    }
++
++    private func stopTunnels(force: Bool) async throws -> Int {
++        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int, Error>) in
++            NETunnelProviderManager.loadAllFromPreferences { managers, error in
++                if let error {
++                    continuation.resume(throwing: error)
++                    return
++                }
++                var stopped = 0
++                for manager in managers ?? [] {
++                    switch manager.connection.status {
++                    case .connected, .connecting, .reasserting:
++                        manager.connection.stopVPNTunnel()
++                        stopped += 1
++                    default:
++                        if force {
++                            manager.connection.stopVPNTunnel()
++                            stopped += 1
++                        }
++                    }
++                }
++                continuation.resume(returning: stopped)
 +            }
 +        }
 +    }
@@ -294,7 +310,7 @@ index fe7a5ca..49fc7ff 100644
      }
  
      // MARK: - Helpers
-@@ -495,6 +684,32 @@ public actor TraceMCPDispatcher {
+@@ -495,6 +700,32 @@ public actor TraceMCPDispatcher {
          if let needle = args["url_contains"]?.string, !needle.isEmpty {
              requests = requests.filter { $0.url.localizedCaseInsensitiveContains(needle) }
          }
@@ -327,7 +343,7 @@ index fe7a5ca..49fc7ff 100644
          if let method = args["method"]?.string, !method.isEmpty {
              requests = requests.filter { ($0.requestMethodRaw ?? $0.method.rawValue).caseInsensitiveCompare(method) == .orderedSame }
          }
-@@ -528,7 +743,11 @@ public actor TraceMCPDispatcher {
+@@ -528,7 +759,11 @@ public actor TraceMCPDispatcher {
      }
  
      private func summary(_ request: NetworkRequest) -> JSONValue {
@@ -340,7 +356,7 @@ index fe7a5ca..49fc7ff 100644
              "id": .string(request.id.uuidString),
              "method": .string(request.requestMethodRaw ?? request.method.rawValue),
              "url": .string(request.url),
-@@ -540,7 +759,7 @@ public actor TraceMCPDispatcher {
+@@ -540,7 +775,7 @@ public actor TraceMCPDispatcher {
              "response_bytes": .number(Double(request.responseBody.totalSize)),
              "rewritten": .bool(request.wasRewritten),
              "blocked": .bool(request.wasBlocked),
@@ -349,7 +365,7 @@ index fe7a5ca..49fc7ff 100644
      }
  
      private func detail(_ request: NetworkRequest, maxBodyBytes: Int) -> JSONValue {
-@@ -591,6 +810,83 @@ public actor TraceMCPDispatcher {
+@@ -591,6 +826,83 @@ public actor TraceMCPDispatcher {
          return "<二进制 \(data.count) 字节>"
      }
  
