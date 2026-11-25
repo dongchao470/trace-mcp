@@ -1,0 +1,420 @@
+diff --git a/TraceUI/Body/BodyInspectorView.swift b/TraceUI/Body/BodyInspectorView.swift
+index 9d74605..8ea01a7 100644
+--- a/TraceUI/Body/BodyInspectorView.swift
++++ b/TraceUI/Body/BodyInspectorView.swift
+@@ -23,9 +23,63 @@ public struct BodyInspectorView: View {
+     public var onShare: (() -> Void)?
+ 
+     @State private var viewMode: ViewMode = .auto
++    @State private var jsonMode: JSONViewerView.ViewMode = .tree
+     @State private var previewImageItem: PreviewImageItem?
+     @State private var showingFullViewer = false
+ 
++    /// 页面上唯一的显示模式入口，避免出现两条分段控件。
++    private enum DisplayChoice: String, CaseIterable, Identifiable {
++        case auto = "自动"
++        case tree = "树形"
++        case formatted = "格式化"
++        case raw = "原文"
++        case hex = "十六进制"
++
++        var id: String { rawValue }
++    }
++
++    private var detectedIsJSON: Bool {
++        detectedContentType == .json
++    }
++
++    private var availableChoices: [DisplayChoice] {
++        detectedIsJSON ? [.tree, .formatted, .raw, .hex] : [.auto, .raw, .hex]
++    }
++
++    private var displayChoice: DisplayChoice {
++        switch viewMode {
++        case .hex:
++            return .hex
++        case .text:
++            return .raw
++        case .auto:
++            guard detectedIsJSON else { return .auto }
++            switch jsonMode {
++            case .tree: return .tree
++            case .formatted: return .formatted
++            case .raw: return .raw
++            }
++        }
++    }
++
++    private func apply(_ choice: DisplayChoice) {
++        switch choice {
++        case .auto:
++            viewMode = .auto
++            jsonMode = .tree
++        case .tree:
++            viewMode = .auto
++            jsonMode = .tree
++        case .formatted:
++            viewMode = .auto
++            jsonMode = .formatted
++        case .raw:
++            viewMode = .text
++        case .hex:
++            viewMode = .hex
++        }
++    }
++
+     public init(
+         title: String,
+         headerSystemImage: String? = "doc.text",
+@@ -62,7 +116,6 @@ public struct BodyInspectorView: View {
+         SectionCard(title: title, systemImage: headerSystemImage) {
+             VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+                 metadataRow
+-                viewModePicker
+                 fileInfoRow
+                 viewerNoticeRow
+                 contentArea
+@@ -78,10 +131,8 @@ public struct BodyInspectorView: View {
+             .presentationDetents([.large])
+             .presentationDragIndicator(.visible)
+         }
+-        .sheet(isPresented: $showingFullViewer) {
++        .fullScreenCover(isPresented: $showingFullViewer) {
+             fullViewerSheet
+-                .presentationDetents([.large])
+-                .presentationDragIndicator(.visible)
+         }
+     }
+ 
+@@ -106,6 +157,19 @@ public struct BodyInspectorView: View {
+ 
+             Spacer()
+ 
++            modeMenu
++
++            if showsFullScreenOption {
++                Button {
++                    showingFullViewer = true
++                } label: {
++                    Image(systemName: "arrow.up.left.and.arrow.down.right")
++                        .font(.footnote.weight(.semibold))
++                }
++                .buttonStyle(.plain)
++                .accessibilityLabel("全屏查看")
++            }
++
+             if onCopy != nil || onShare != nil || showsFullScreenOption {
+                 Menu {
+                     if let onCopy {
+@@ -138,15 +202,36 @@ public struct BodyInspectorView: View {
+         }
+     }
+ 
+-    private var viewModePicker: some View {
+-        Picker("View Mode", selection: $viewMode) {
+-            ForEach(ViewMode.allCases) { mode in
+-                Text(mode.rawValue).tag(mode)
++    private var modeMenu: some View {
++        Menu {
++            ForEach(availableChoices) { choice in
++                Button {
++                    apply(choice)
++                } label: {
++                    if displayChoice == choice {
++                        Label(choice.rawValue, systemImage: "checkmark")
++                    } else {
++                        Text(choice.rawValue)
++                    }
++                }
++            }
++        } label: {
++            HStack(spacing: 2) {
++                Text(displayChoice.rawValue)
++                    .font(.caption.weight(.medium))
++                Image(systemName: "chevron.down")
++                    .font(.system(size: 9, weight: .semibold))
+             }
++            .padding(.horizontal, 8)
++            .padding(.vertical, 4)
++            .background(Capsule().fill(Color(.tertiarySystemFill)))
++            .foregroundStyle(.secondary)
+         }
+-        .pickerStyle(.segmented)
+-        .labelsHidden()
+-        .accessibilityLabel("Body view mode")
++        .accessibilityLabel("显示方式")
++    }
++
++    private var viewModePicker: some View {
++        EmptyView()
+     }
+ 
+     @ViewBuilder
+@@ -207,7 +292,7 @@ public struct BodyInspectorView: View {
+     private var autoContentView: some View {
+         switch effectiveDetectedContentType {
+         case .json:
+-            JSONViewerView(jsonString: content)
++            JSONViewerView(jsonString: content, mode: $jsonMode)
+                 .frame(minHeight: 200)
+ 
+         case .html:
+@@ -328,7 +413,7 @@ public struct BodyInspectorView: View {
+             Group {
+                 switch effectiveDetectedContentType {
+                 case .json:
+-                    JSONViewerView(jsonString: content)
++                    JSONViewerView(jsonString: content, mode: $jsonMode)
+                 case .html:
+                     HTMLViewerView(htmlString: content)
+                 case .xml:
+@@ -355,6 +440,9 @@ public struct BodyInspectorView: View {
+             .navigationTitle(effectiveDetectedContentType?.displayName ?? "Body")
+             .navigationBarTitleDisplayMode(.inline)
+             .toolbar {
++                ToolbarItem(placement: .principal) {
++                    modeMenu
++                }
+                 ToolbarItem(placement: .confirmationAction) {
+                     Button("Done") {
+                         showingFullViewer = false
+diff --git a/TraceUI/Body/JSONViewerView.swift b/TraceUI/Body/JSONViewerView.swift
+index 3369e83..870b445 100644
+--- a/TraceUI/Body/JSONViewerView.swift
++++ b/TraceUI/Body/JSONViewerView.swift
+@@ -10,12 +10,30 @@ import SwiftUI
+ /// Presents JSON content with syntax highlighting and a tree view.
+ public struct JSONViewerView: View {
+     public let jsonString: String
++    private let externalMode: Binding<ViewMode>?
+ 
+     public init(jsonString: String) {
+         self.jsonString = jsonString
++        self.externalMode = nil
+     }
+ 
+-    @State private var viewMode: ViewMode = .formatted
++    /// 由宿主页统一提供视图模式，页面上只出现一个控件。
++    public init(jsonString: String, mode: Binding<ViewMode>) {
++        self.jsonString = jsonString
++        self.externalMode = mode
++    }
++
++    private var viewMode: ViewMode { externalMode?.wrappedValue ?? internalMode }
++
++    private func setMode(_ mode: ViewMode) {
++        if let externalMode {
++            externalMode.wrappedValue = mode
++        } else {
++            internalMode = mode
++        }
++    }
++
++    @State private var internalMode: ViewMode = .tree
+     @State private var parsedJSON: JSONValue?
+     @State private var parseError: String?
+     @State private var expandedPaths: Set<String> = []
+@@ -31,33 +49,6 @@ public struct JSONViewerView: View {
+ 
+     public var body: some View {
+         VStack(spacing: 0) {
+-            HStack {
+-                Picker("View Mode", selection: $viewMode) {
+-                    ForEach(ViewMode.allCases, id: \.self) { mode in
+-                        Text(mode.rawValue).tag(mode)
+-                    }
+-                }
+-                .pickerStyle(.segmented)
+-
+-                Spacer()
+-
+-                if viewMode == .tree, !shouldBypassStructuredParsing {
+-                    Button {
+-                        if expandedPaths.isEmpty || expandedPaths == ["root"] {
+-                            didTruncateExpansion = expandAllNodes(maxNodes: maxExpandedNodes)
+-                        } else {
+-                            expandedPaths = ["root"]
+-                            didTruncateExpansion = false
+-                        }
+-                    } label: {
+-                        Image(systemName: expandedPaths.isEmpty || expandedPaths == ["root"] ? "arrow.up.left.and.arrow.down.right" : "arrow.down.right.and.arrow.up.left")
+-                    }
+-                    .buttonStyle(.bordered)
+-                    .controlSize(.small)
+-                }
+-            }
+-            .padding()
+-
+             Divider()
+ 
+             if isLargePayload {
+@@ -83,9 +74,12 @@ public struct JSONViewerView: View {
+                         .padding()
+                 }
+             case .tree:
+-                DirectionalScrollView([.horizontal, .vertical]) {
+-                    treeView
+-                        .padding()
++                ScrollView(.vertical) {
++                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
++                        treeToolbar
++                        treeView
++                    }
++                    .padding()
+                 }
+             case .raw:
+                 ScrollView(.vertical) {
+@@ -99,6 +93,28 @@ public struct JSONViewerView: View {
+         }
+     }
+ 
++    private var treeToolbar: some View {
++        HStack(spacing: DesignSystem.Spacing.sm) {
++            if !shouldBypassStructuredParsing {
++                Text("已展开 \(expandedPaths.count) 个节点")
++                    .font(.caption2)
++                    .foregroundStyle(.secondary)
++                Spacer()
++                Button(expandedPaths.isEmpty || expandedPaths == ["root"] ? "展开全部" : "全部收起") {
++                    if expandedPaths.isEmpty || expandedPaths == ["root"] {
++                        didTruncateExpansion = expandAllNodes(maxNodes: maxExpandedNodes)
++                    } else {
++                        expandedPaths = ["root"]
++                        didTruncateExpansion = false
++                    }
++                }
++                .font(.caption2.weight(.semibold))
++                .buttonStyle(.borderless)
++            }
++        }
++        .frame(maxWidth: .infinity, alignment: .leading)
++    }
++
+     // MARK: - Formatted View
+ 
+     private var formattedView: some View {
+@@ -152,11 +168,14 @@ public struct JSONViewerView: View {
+     private func jsonNode(_ value: JSONValue, key: String?, path: String, level: Int) -> AnyView {
+         let isExpanded = expandedPaths.contains(path)
+         let hasChildren = value.hasChildren
++        var longString = false
++        if case let .string(text) = value, text.count > 50 { longString = true }
++        let canToggle = hasChildren || longString
+ 
+         return AnyView(
+             VStack(alignment: .leading, spacing: 0) {
+                 Button {
+-                    guard hasChildren else { return }
++                    guard canToggle else { return }
+                     withAnimation(DesignSystem.Accessibility.preferredAnimation) {
+                         if isExpanded {
+                             expandedPaths.remove(path)
+@@ -168,10 +187,10 @@ public struct JSONViewerView: View {
+                     HStack(spacing: DesignSystem.Spacing.xs) {
+                         if level > 0 {
+                             Color.clear
+-                                .frame(width: CGFloat(level) * DesignSystem.Spacing.indent)
++                                .frame(width: CGFloat(level) * 12)
+                         }
+ 
+-                        if hasChildren {
++                        if canToggle {
+                             Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                                 .font(.caption2)
+                                 .foregroundStyle(.secondary)
+@@ -182,10 +201,10 @@ public struct JSONViewerView: View {
+ 
+                         if let key {
+                             Text("\"\(key)\"")
+-                                .font(.system(.callout, design: .monospaced))
++                                .font(.system(.footnote, design: .monospaced))
+                                 .foregroundStyle(DesignSystem.Colors.accent)
+                             Text(":")
+-                                .font(.system(.callout, design: .monospaced))
++                                .font(.system(.footnote, design: .monospaced))
+                                 .foregroundStyle(.secondary)
+                         }
+ 
+@@ -222,27 +241,27 @@ public struct JSONViewerView: View {
+         switch value {
+         case .null:
+             Text("null")
+-                .font(.system(.callout, design: .monospaced))
++                .font(.system(.footnote, design: .monospaced))
+                 .foregroundStyle(DesignSystem.Colors.muted)
+ 
+         case let .bool(b):
+             Text(b ? "true" : "false")
+-                .font(.system(.callout, design: .monospaced))
++                .font(.system(.footnote, design: .monospaced))
+                 .foregroundStyle(DesignSystem.Colors.warning)
+ 
+         case let .number(n):
+             Text(formatNumber(n))
+-                .font(.system(.callout, design: .monospaced))
++                .font(.system(.footnote, design: .monospaced))
+                 .foregroundStyle(DesignSystem.Colors.warning)
+ 
+         case let .string(s):
+             if s.count > 50 && !expanded {
+                 Text("\"\(s.prefix(50))...\"")
+-                    .font(.system(.callout, design: .monospaced))
++                    .font(.system(.footnote, design: .monospaced))
+                     .foregroundStyle(DesignSystem.Colors.success)
+             } else {
+                 Text("\"\(s)\"")
+-                    .font(.system(.callout, design: .monospaced))
++                    .font(.system(.footnote, design: .monospaced))
+                     .foregroundStyle(DesignSystem.Colors.success)
+                     .textSelection(.enabled)
+             }
+@@ -250,22 +269,22 @@ public struct JSONViewerView: View {
+         case let .array(arr):
+             if expanded {
+                 Text("[")
+-                    .font(.system(.callout, design: .monospaced))
++                    .font(.system(.footnote, design: .monospaced))
+                     .foregroundStyle(.secondary)
+             } else {
+                 Text("[\(arr.count) items]")
+-                    .font(.system(.callout, design: .monospaced))
++                    .font(.system(.footnote, design: .monospaced))
+                     .foregroundStyle(.secondary)
+             }
+ 
+         case let .object(obj):
+             if expanded {
+                 Text("{")
+-                    .font(.system(.callout, design: .monospaced))
++                    .font(.system(.footnote, design: .monospaced))
+                     .foregroundStyle(.secondary)
+             } else {
+                 Text("{\(obj.count) keys}")
+-                    .font(.system(.callout, design: .monospaced))
++                    .font(.system(.footnote, design: .monospaced))
+                     .foregroundStyle(.secondary)
+             }
+         }
+@@ -298,11 +317,11 @@ public struct JSONViewerView: View {
+         HStack(spacing: DesignSystem.Spacing.xs) {
+             if level > 0 {
+                 Color.clear
+-                    .frame(width: CGFloat(level) * DesignSystem.Spacing.indent)
++                    .frame(width: CGFloat(level) * 12)
+             }
+             Color.clear.frame(width: 12)
+             Text(bracket)
+-                .font(.system(.callout, design: .monospaced))
++                .font(.system(.footnote, design: .monospaced))
+                 .foregroundStyle(.secondary)
+         }
+         .padding(.vertical, DesignSystem.Spacing.xxs)
+@@ -345,7 +364,7 @@ public struct JSONViewerView: View {
+         didTruncateExpansion = false
+         if shouldBypassStructuredParsing {
+             if viewMode == .tree {
+-                viewMode = .raw
++                setMode(.raw)
+             }
+             isParsing = false
+             return
