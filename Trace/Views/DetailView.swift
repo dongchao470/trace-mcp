@@ -47,13 +47,15 @@ struct DetailView: View {
             .accessibilityElement(children: .contain)
             .accessibilityLabel("Quick actions")
 
-            Picker("Detail Tab", selection: $viewModel.selectedTab) {
-                ForEach(availableTabs, id: \.self) { tab in
-                    Text(tab.rawValue).tag(tab)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(availableTabs, id: \.self) { tab in
+                        tabChip(tab)
+                    }
                 }
+                .padding(.horizontal)
             }
-            .pickerStyle(.segmented)
-            .padding()
+            .padding(.vertical, DesignSystem.Spacing.sm)
             .accessibilityLabel("Request detail tabs")
 
             tabContent
@@ -88,12 +90,38 @@ struct DetailView: View {
         viewModel.availableTabs(for: request)
     }
 
+    private func tabChip(_ tab: DetailTab) -> some View {
+        let isSelected = viewModel.selectedTab == tab
+        return Button {
+            viewModel.selectedTab = tab
+        } label: {
+            Text(tab.rawValue)
+                .font(.subheadline.weight(isSelected ? .semibold : .regular))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(
+                    Capsule().fill(
+                        isSelected
+                            ? DesignSystem.Colors.accent.opacity(0.18)
+                            : Color(.secondarySystemBackground)
+                    )
+                )
+                .foregroundStyle(isSelected ? DesignSystem.Colors.accent : Color.secondary)
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+    }
+
     @ViewBuilder
     private var tabContent: some View {
         switch viewModel.selectedTab {
         case .overview:
             ScrollView {
-                OverviewSection(request: request)
+                VStack(spacing: DesignSystem.Spacing.lg) {
+                    RequestTimelineCard(request: request)
+                    OverviewSection(request: request)
+                }
+                .padding()
             }
 
         case .requestHeaders:
@@ -112,6 +140,12 @@ struct DetailView: View {
                     responseBodySection
                 }
                 .padding()
+            }
+
+        case .cookies:
+            ScrollView {
+                CookiesSection(request: request)
+                    .padding()
             }
 
         case .body:

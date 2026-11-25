@@ -16,6 +16,7 @@ enum DetailTab: String, CaseIterable {
     case overview = "Overview"
     case requestHeaders = "Request"
     case responseHeaders = "Response"
+    case cookies = "Cookies"
     case body = "Body"
     case sse = "SSE Events"
 }
@@ -40,7 +41,7 @@ final class RequestDetailViewModel: ObservableObject {
     private var responseBodyShareSourceRequest: NetworkRequest?
 
     func availableTabs(for request: NetworkRequest) -> [DetailTab] {
-        var tabs: [DetailTab] = [.overview, .requestHeaders, .responseHeaders, .body]
+        var tabs: [DetailTab] = [.overview, .requestHeaders, .responseHeaders, .cookies, .body]
         if request.isSSE {
             tabs.append(.sse)
         }
