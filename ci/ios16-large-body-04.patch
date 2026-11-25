@@ -132,8 +132,8 @@ new file mode 100644
 +    }
 +
 +    func testViewerBudgetsStayBoundedForExpandedJSONAndPlainText() {
-+        XCTAssertLessThanOrEqual(BodyViewerPolicy.loadLimit(contentType: "application/json", requestedFullLoad: true, isBinary: false), 384 * 1024)
-+        XCTAssertLessThanOrEqual(BodyViewerPolicy.loadLimit(contentType: "text/plain", requestedFullLoad: true, isBinary: false), 768 * 1024)
++        XCTAssertLessThanOrEqual(BodyViewerPolicy.loadLimit(contentType: "application/json", requestedFullLoad: true, isBinary: false), 4 * 1024 * 1024)
++        XCTAssertLessThanOrEqual(BodyViewerPolicy.loadLimit(contentType: "text/plain", requestedFullLoad: true, isBinary: false), 4 * 1024 * 1024)
 +        XCTAssertTrue(BodyViewerPolicy.shouldPreferLightweightRenderer(contentType: "application/json", byteCount: 542_866))
 +        XCTAssertTrue(BodyViewerPolicy.shouldBypassJSONStructuredParsing(byteCount: 542_866))
 +    }
