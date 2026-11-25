@@ -238,10 +238,6 @@ public struct BodyInspectorView: View {
                     .padding(.vertical, DesignSystem.Spacing.sm)
             }
 
-        case .form:
-            FormBodyView(text: content)
-                .frame(minHeight: 120)
-
         case .plainText, .none:
             DirectionalScrollView([.horizontal, .vertical]) {
                 textView
@@ -341,11 +337,6 @@ public struct BodyInspectorView: View {
                     JavaScriptViewerView(code: content)
                 case .css:
                     CSSViewerView(code: content)
-                case .form:
-                    ScrollView(.vertical) {
-                        FormBodyView(text: content)
-                            .padding()
-                    }
                 case .image:
                     imageFullScreenView
                 default:
@@ -428,7 +419,6 @@ public struct BodyInspectorView: View {
         case css
         case image
         case multipart
-        case form
         case plainText
         case binary
 
@@ -441,7 +431,6 @@ public struct BodyInspectorView: View {
             case .css: "CSS"
             case .image: "Image"
             case .multipart: "Multipart"
-            case .form: "Form"
             case .plainText: "Plain Text"
             case .binary: "Binary"
             }
@@ -456,7 +445,6 @@ public struct BodyInspectorView: View {
             case .css: "paintbrush"
             case .image: "photo"
             case .multipart: "doc.on.doc"
-            case .form: "list.bullet.rectangle.portrait"
             case .plainText: "text.alignleft"
             case .binary: "doc.zipper"
             }
@@ -481,8 +469,7 @@ public struct BodyInspectorView: View {
         if ct.contains("css") { return .css }
         if ct.hasPrefix("image/") { return .image }
         if ct.contains("multipart") { return .multipart }
-        if ct.contains("x-www-form-urlencoded") { return .form }
-        if ct.contains("text/plain") { return detectFromContent() ?? .plainText }
+        if ct.contains("text/plain") { return .plainText }
         if ct.contains("octet-stream") ||
             ct.contains("application/zip") ||
             ct.contains("application/x-zip-compressed") ||
