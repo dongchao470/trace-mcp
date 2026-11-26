@@ -1,0 +1,1876 @@
+--- a/Trace/QuickActionHandler.swift
++++ b/Trace/QuickActionHandler.swift
+@@ -36,11 +36,11 @@
+ 
+         switch shortcutItem.type {
+         case TraceQuickActionType.startCapture:
+-            await startCapture()
++            await startCapture(viewModel: viewModel)
+             return true
+ 
+         case TraceQuickActionType.stopCapture:
+-            stopCapture()
++            await stopCapture(viewModel: viewModel)
+             return true
+ 
+         case TraceQuickActionType.viewLastSession:
+@@ -58,34 +58,24 @@
+ 
+     // MARK: - Action Handlers
+ 
+-    private func startCapture() async {
+-        let vpnManager = VPNManager.shared
+-
+-        guard !vpnManager.isConnected else {
+-            FeatureLog.vpn.info("event=vpn.start outcome=skipped reason=already_connected source=quick_action")
+-            return
+-        }
+-
++    private func startCapture(viewModel: CaptureViewModel) async {
+         do {
+-            try await vpnManager.start()
+-            FeatureLog.vpn.info("event=vpn.start outcome=success source=quick_action")
++            try await viewModel.setCaptureEnabled(true)
+         } catch {
+             FeatureLog.vpn.error(
+-                "event=vpn.start outcome=failure source=quick_action error=\(error.localizedDescription, privacy: .public)"
++                "event=vpn.capture_start outcome=unconfirmed source=quick_action error=\(error.localizedDescription, privacy: .public)"
+             )
+         }
+     }
+ 
+-    private func stopCapture() {
+-        let vpnManager = VPNManager.shared
+-
+-        guard vpnManager.isConnected else {
+-            FeatureLog.vpn.info("event=vpn.stop outcome=skipped reason=already_disconnected source=quick_action")
+-            return
++    private func stopCapture(viewModel: CaptureViewModel) async {
++        do {
++            try await viewModel.setCaptureEnabled(false)
++        } catch {
++            FeatureLog.vpn.error(
++                "event=vpn.capture_stop outcome=unconfirmed source=quick_action error=\(error.localizedDescription, privacy: .public)"
++            )
+         }
+-
+-        vpnManager.stop()
+-        FeatureLog.vpn.info("event=vpn.stop outcome=success source=quick_action")
+     }
+ 
+     private func viewLastSession(viewModel: CaptureViewModel) {
+--- a/Trace/Services/NetworkCaptureService.swift
++++ b/Trace/Services/NetworkCaptureService.swift
+@@ -12,92 +12,220 @@
+ import TraceCore
+ import TraceFeatures
+ 
+-/// Opens and closes the capture record around a real capture run.
+-///
+-/// Discussion: The capture session belongs to a run of the tunnel, so it is created when capture
+-/// starts and closed when it stops — never at app launch, in previews, or while browsing requests.
++/// Capture records belong to recording intervals, not to the lifetime of the VPN service.
+ @MainActor
+ protocol CaptureSessionCoordinating: AnyObject {
+-    /// Opens the record for the run that is starting now.
+-    func beginCaptureSession()
+-    /// Removes the record when the tunnel never came up.
+-    func abortCaptureSession()
+-    /// Closes the record with `reason` and the totals of the run.
++    /// Returns only the ID created by this call; nil means an existing session was reused.
++    func beginCaptureSession() throws -> UUID?
++    func abortCaptureSession(_ newlyCreatedID: UUID)
+     func endCaptureSession(reason: SessionEndReason)
+ }
+ 
+-/// Defines network capture operations.
+ @MainActor
+ protocol NetworkCaptureServiceProtocol {
+     var isCapturing: Bool { get }
++    func startService() async throws
++    func stopService() async throws
+     func startCapture() async throws
+     func stopCapture() async throws
+     func observeCaptureStatus() async -> AsyncStream<Bool>
+ }
+ 
+-/// Handles network capture through the VPN extension.
++/// The tunnel hosts forwarding and MCP independently of optional traffic recording.
+ @MainActor
+ class NetworkCaptureService: NetworkCaptureServiceProtocol {
+-    // MARK: - Dependencies
++    enum RecordingState: Equatable { case paused, recording, unknown }
++
++    enum ServiceError: LocalizedError {
++        case recordingStateUnconfirmed, busy, sessionUnavailable
++        var errorDescription: String? {
++            switch self {
++            case .recordingStateUnconfirmed:
++                return NSLocalizedString("The network service did not confirm the recording state. Check the service before trying again.", comment: "Unconfirmed recording state")
++            case .busy:
++                return NSLocalizedString("A network service change is already in progress. Wait for it to finish.", comment: "Busy service")
++            case .sessionUnavailable:
++                return NSLocalizedString("The capture session could not be created. Recording was not started.", comment: "Session unavailable")
++            }
++        }
++    }
+ 
+     private let vpnManager: VPNManaging
+     private weak var sessionCoordinator: CaptureSessionCoordinating?
+-
+-    // MARK: - Properties
+-
+-    var isCapturing: Bool {
+-        vpnManager.isConnected
+-    }
+-
+-    // MARK: - Initialization
++    private let loadConfiguration: () -> CaptureConfiguration
++    private let saveConfiguration: (CaptureConfiguration) throws -> Void
++    private var operationInProgress = false
++    @Published private(set) var recordingState: RecordingState
++
++    var isCapturing: Bool { vpnManager.isConnected && recordingState == .recording }
+ 
+     init(
+         vpnManager: VPNManaging = VPNManager.shared,
+-        sessionCoordinator: CaptureSessionCoordinating? = nil
++        sessionCoordinator: CaptureSessionCoordinating? = nil,
++        loadConfiguration: @escaping () -> CaptureConfiguration = { AppGroupStorage.shared.loadConfiguration() },
++        saveConfiguration: @escaping (CaptureConfiguration) throws -> Void = { try AppGroupStorage.shared.saveConfiguration($0) }
+     ) {
+         self.vpnManager = vpnManager
+         self.sessionCoordinator = sessionCoordinator
+-    }
+-
+-    // MARK: - Public Methods
++        self.loadConfiguration = loadConfiguration
++        self.saveConfiguration = saveConfiguration
++        self.recordingState = vpnManager.isDefinitelyStopped ? .paused : .unknown
++    }
++
++    private func beginOperation() throws {
++        guard !operationInProgress else { throw ServiceError.busy }
++        operationInProgress = true
++    }
++
++    private func prepareForControl() async throws {
++        do { try await vpnManager.prepareForControl() }
++        catch { recordingState = .unknown; throw error }
++    }
++
++    /// A read-only query is safe after an unknown result; never automatically resend the change.
++    func refreshRecordingState() async throws {
++        try beginOperation()
++        defer { operationInProgress = false }
++        try await prepareForControl()
++        if vpnManager.isConnected {
++            do { recordingState = try await queryRecordingState() ? .recording : .paused }
++            catch { recordingState = .unknown; throw error }
++        } else if vpnManager.isDefinitelyStopped {
++            recordingState = .paused
++        } else {
++            recordingState = .unknown
++            throw ServiceError.recordingStateUnconfirmed
++        }
++    }
++
++    /// No session is created when the user only needs the network service / MCP.
++    func startService() async throws {
++        try beginOperation()
++        defer { operationInProgress = false }
++        try await prepareForControl()
++        if vpnManager.isConnected {
++            recordingState = .unknown
++            recordingState = try await queryRecordingState() ? .recording : .paused
++            return
++        }
++        try setRecordingRequested(false)
++        recordingState = .unknown
++        do {
++            try await vpnManager.start()
++            try await confirmRecordingState(false)
++        } catch {
++            recordingState = vpnManager.isDefinitelyStopped ? .paused : .unknown
++            throw error
++        }
++    }
++
++    func stopService() async throws {
++        try beginOperation()
++        defer { operationInProgress = false }
++        do {
++            try await prepareForControl()
++            try await stopCaptureInternal()
++        } catch {
++            // Explicit service shutdown must still happen after an unconfirmed recording stop.
++            FeatureLog.vpn.warning("event=vpn.capture_stop outcome=unconfirmed proceeding_to_service_stop=true")
++        }
++        do {
++            try await vpnManager.stopAndWait()
++            recordingState = .paused
++            sessionCoordinator?.endCaptureSession(reason: .userStopped)
++        } catch {
++            recordingState = .unknown
++            throw error
++        }
++    }
+ 
+     func startCapture() async throws {
+-        // Rule: the session exists only once capture actually starts. The directory has to be
+-        // ready before the tunnel writes the first packet into it.
+-        sessionCoordinator?.beginCaptureSession()
+-
+-        do {
+-            try await vpnManager.start()
+-        } catch {
+-            // Nothing was captured, so the record must not survive the failed start.
+-            sessionCoordinator?.abortCaptureSession()
+-            FeatureLog.vpn.error(
+-                "event=vpn.capture_start outcome=failure source=app error=\(error.localizedDescription, privacy: .public)"
+-            )
++        try beginOperation()
++        defer { operationInProgress = false }
++        try await prepareForControl()
++        if vpnManager.isConnected {
++            recordingState = .unknown
++            recordingState = try await queryRecordingState() ? .recording : .paused
++            if isCapturing { return }
++        }
++        let newlyCreatedID = try sessionCoordinator?.beginCaptureSession()
++        do {
++            try setRecordingRequested(true)
++            recordingState = .unknown
++            if !vpnManager.isConnected { try await vpnManager.start() }
++            try await confirmRecordingState(true)
++        } catch {
++            // Delete only a record owned by this attempt, with the tunnel definitely stopped.
++            if vpnManager.isDefinitelyStopped {
++                try? setRecordingRequested(false)
++                if let newlyCreatedID { sessionCoordinator?.abortCaptureSession(newlyCreatedID) }
++                recordingState = .paused
++            } else {
++                recordingState = .unknown
++            }
+             throw error
+         }
+-
+-        FeatureLog.vpn.info("event=vpn.capture_start outcome=success source=app")
+-    }
+-
++        FeatureLog.vpn.info("event=vpn.capture_start outcome=confirmed source=app")
++    }
++
++    /// Stops writers and closes the session, but leaves forwarding and MCP alive.
+     func stopCapture() async throws {
+-        vpnManager.stop()
+-        // The extension writes the same reason if it finalises first; `endCurrentSession` keeps it.
++        try beginOperation()
++        defer { operationInProgress = false }
++        try await prepareForControl()
++        try await stopCaptureInternal()
++    }
++
++    private func stopCaptureInternal() async throws {
++        try setRecordingRequested(false)
++        if vpnManager.isConnected {
++            recordingState = .unknown
++            try await confirmRecordingState(false)
++        } else if vpnManager.isDefinitelyStopped {
++            recordingState = .paused
++        } else {
++            recordingState = .unknown
++            throw ServiceError.recordingStateUnconfirmed
++        }
+         sessionCoordinator?.endCaptureSession(reason: .userStopped)
+-        FeatureLog.vpn.info("event=vpn.capture_stop outcome=success source=app")
++        FeatureLog.vpn.info("event=vpn.capture_stop outcome=confirmed service_kept_running=true source=app")
++    }
++
++    private func setRecordingRequested(_ enabled: Bool) throws {
++        var config = loadConfiguration()
++        config.isRecordingEnabled = enabled
++        try saveConfiguration(config)
++    }
++
++    private func queryRecordingState() async throws -> Bool {
++        let data = try await vpnManager.sendMessage(["command": "getRecordingState"])
++        return try decodeRecordingState(data)
++    }
++
++    private func decodeRecordingState(_ data: Data?) throws -> Bool {
++        guard let data,
++              let response = try JSONSerialization.jsonObject(with: data) as? [String: Any],
++              let recording = response["recording"] as? Bool else {
++            throw ServiceError.recordingStateUnconfirmed
++        }
++        return recording
++    }
++
++    private func confirmRecordingState(_ expected: Bool) async throws {
++        let data = try await vpnManager.sendMessage(["command": "setRecordingState"])
++        let recording = try decodeRecordingState(data)
++        guard recording == expected else { throw ServiceError.recordingStateUnconfirmed }
++        recordingState = recording ? .recording : .paused
+     }
+ 
+     func observeCaptureStatus() async -> AsyncStream<Bool> {
+         AsyncStream { continuation in
+-            var cancellable: AnyCancellable?
+-            cancellable = vpnManager.isConnectedPublisher
+-                .sink { isConnected in
+-                    continuation.yield(isConnected)
+-                }
+-
+-            continuation.onTermination = { _ in
+-                cancellable?.cancel()
+-            }
++            let cancellable = vpnManager.isConnectedPublisher
++                .combineLatest($recordingState)
++                .map { $0 && $1 == .recording }
++                .removeDuplicates()
++                .sink { continuation.yield($0) }
++            continuation.onTermination = { _ in cancellable.cancel() }
+         }
+     }
+ }
+--- a/Trace/TraceApp.swift
++++ b/Trace/TraceApp.swift
+@@ -45,6 +45,9 @@
+                     VPNManager.shared.initializeIfNeeded()
+                     updateQuickActions()
+                 }
++                .onReceive(viewModel.$isCapturing.removeDuplicates()) { _ in
++                    if OnboardingState.hasCompleted { updateQuickActions() }
++                }
+         }
+         .onChangeCompat(of: scenePhase) { newPhase in
+             viewModel.setSceneActive(newPhase == .active)
+@@ -86,7 +89,7 @@
+ 
+         var shortcutItems: [UIApplicationShortcutItem] = []
+ 
+-        if vpnManager.isConnected {
++        if vpnManager.isConnected && AppGroupStorage.shared.loadConfiguration().isRecordingEnabled {
+             shortcutItems.append(
+                 UIApplicationShortcutItem(
+                     type: TraceQuickActionType.stopCapture,
+--- a/Trace/ViewModels/CaptureViewModel.swift
++++ b/Trace/ViewModels/CaptureViewModel.swift
+@@ -99,6 +99,9 @@
+     @Published private(set) var transportRequestsChangeToken: UInt64 = 0
+ 
+     @Published var isCapturing: Bool = false
++    @Published private(set) var isServiceRunning = false
++    @Published private(set) var isRecordingStateUnknown = true
++    @Published private(set) var isCaptureTransitioning = false
+     @Published var searchText: String = "" {
+         didSet { debounceBodySearch() }
+     }
+@@ -383,10 +386,14 @@
+             notificationObservers.append(vpnStatusObserver)
+         }
+ 
+-        // Observe VPN connection state changes to sync isCapturing
++        // Forwarding / MCP may run while recording is paused.
+         VPNManager.shared.$isConnected
+-            .sink { [weak self] isConnected in
+-                self?.isCapturing = isConnected
++            .combineLatest(captureService.$recordingState)
++            .sink { [weak self] isConnected, recordingState in
++                guard let self else { return }
++                self.isServiceRunning = isConnected
++                self.isRecordingStateUnknown = recordingState == .unknown
++                self.isCapturing = isConnected && recordingState == .recording
+             }
+             .store(in: &cancellables)
+ 
+@@ -633,6 +640,7 @@
+         }
+ 
+         flushDeferredRefreshesIfNeeded()
++        if ownsCaptureLifecycle { runStartupSessionRecovery() }
+     }
+ 
+     private func handleObservedNewRequest() {
+@@ -1449,25 +1457,68 @@
+     }
+ 
+     func toggleCapture() {
+-        if isCapturing {
+-            isCapturing = false
+-            Task {
+-                // Ends the capture session with `endReason = .userStopped` and the run's totals.
+-                try? await captureService.stopCapture()
+-            }
++        let enabled = !isCapturing
++        Task {
++            do {
++                if isRecordingStateUnknown {
++                    try await refreshCaptureState()
++                } else {
++                    try await setCaptureEnabled(enabled)
++                }
++            } catch {
++                FeatureLog.vpn.error(
++                    "event=vpn.capture_toggle outcome=unconfirmed source=ui error=\(error.localizedDescription, privacy: .public)"
++                )
++            }
++        }
++    }
++
++    func setCaptureEnabled(_ enabled: Bool) async throws {
++        guard !isCaptureTransitioning else { throw NetworkCaptureService.ServiceError.busy }
++        isCaptureTransitioning = true
++        defer {
++            syncServiceDisplayState()
++            isCaptureTransitioning = false
++            updateWidget()
++        }
++        if enabled {
++            try await captureService.startCapture()
+         } else {
+-            isCapturing = true
+-            Task {
+-                do {
+-                    try await captureService.startCapture()
+-                } catch {
+-                    isCapturing = false
+-                    FeatureLog.vpn.error(
+-                        "event=vpn.start outcome=failure source=ui error=\(error.localizedDescription, privacy: .public)"
+-                    )
+-                }
+-            }
+-        }
++            try await captureService.stopCapture()
++        }
++    }
++
++    func setNetworkServiceEnabled(_ enabled: Bool) async throws {
++        guard !isCaptureTransitioning else { throw NetworkCaptureService.ServiceError.busy }
++        isCaptureTransitioning = true
++        defer {
++            syncServiceDisplayState()
++            isCaptureTransitioning = false
++            updateWidget()
++        }
++        if enabled {
++            try await captureService.startService()
++        } else {
++            try await captureService.stopService()
++        }
++    }
++
++    func refreshCaptureState() async throws {
++        guard !isCaptureTransitioning else { throw NetworkCaptureService.ServiceError.busy }
++        isCaptureTransitioning = true
++        defer {
++            syncServiceDisplayState()
++            isCaptureTransitioning = false
++            updateWidget()
++        }
++        try await captureService.refreshRecordingState()
++        if captureService.isCapturing { adoptActiveSessionIfNeeded() }
++    }
++
++    private func syncServiceDisplayState() {
++        isServiceRunning = VPNManager.shared.isConnected
++        isRecordingStateUnknown = captureService.recordingState == .unknown
++        isCapturing = captureService.isCapturing
+     }
+ 
+     func clearFilters() {
+@@ -1710,27 +1761,26 @@
+         recoveryTask?.cancel()
+         recoveryTask = Task { [weak self] in
+             guard let self else { return }
+-            await self.waitForVPNStatusResolution()
+-            guard !Task.isCancelled else { return }
++            guard await self.waitForVPNStatusResolution(), !Task.isCancelled else { return }
+             self.recoverInterruptedSessions()
+         }
+     }
+ 
+-    /// Waits a bounded time for the VPN layer to report the real tunnel state.
+-    private func waitForVPNStatusResolution(timeout: TimeInterval = 2) async {
+-        let deadline = Date().addingTimeInterval(timeout)
+-        while Date() < deadline {
+-            if VPNManager.shared.status != .invalid || VPNManager.shared.isConnected {
+-                return
+-            }
+-            try? await Task.sleep(nanoseconds: 100_000_000)
++    /// Loading the existing profile and checking recording is read-only and bounded.
++    private func waitForVPNStatusResolution() async -> Bool {
++        do {
++            try await refreshCaptureState()
++            return true
++        } catch {
++            CoreLog.storage.info("event=storage.session_recovery outcome=deferred reason=service_state_unconfirmed")
++            return false
+         }
+     }
+ 
+     private func recoverInterruptedSessions() {
+-        guard !VPNManager.shared.isConnected else {
+-            adoptActiveSessionIfNeeded()
+-            CoreLog.storage.info("event=storage.session_recovery outcome=skipped reason=capture_active")
++        guard VPNManager.shared.isDefinitelyStopped else {
++            if isCapturing { adoptActiveSessionIfNeeded() }
++            CoreLog.storage.info("event=storage.session_recovery outcome=skipped reason=service_not_stopped")
+             return
+         }
+ 
+@@ -1890,16 +1940,18 @@
+     }
+ 
+     private func handleVPNStatusChange() {
+-        // Sync capture state with VPN connection state
+-        isCapturing = VPNManager.shared.isConnected
+-
+-        // Rule: a VPN status change never opens a session. A session exists because capture
+-        // started, so here we only adopt what the extension is already writing, and close the
+-        // record when the tunnel goes away.
+-        if VPNManager.shared.isConnected {
++        syncServiceDisplayState()
++        // Connecting / reasserting is not termination; an in-flight start owns its session.
++        if isCapturing {
+             adoptActiveSessionIfNeeded()
+-        } else if currentSession != nil {
++        } else if VPNManager.shared.isDefinitelyStopped, !isCaptureTransitioning, currentSession != nil {
+             endCurrentSession(reason: .appTerminated)
++        }
++        updateWidget()
++        guard !isCaptureTransitioning else { return }
++        Task { [weak self] in
++            guard let self, !self.isCaptureTransitioning else { return }
++            try? await self.refreshCaptureState()
+         }
+     }
+ 
+@@ -2077,7 +2129,7 @@
+ 
+     /// Update widget with current state
+     private func updateWidget() {
+-        let isCapturing = VPNManager.shared.isConnected
++        let isCapturing = self.isCapturing
+         let requestCount = requests.count
+ 
+         // Calculate total data transferred
+@@ -2154,12 +2206,21 @@
+ /// Lets `NetworkCaptureService` open and close the capture record around a real start/stop.
+ extension CaptureViewModel: CaptureSessionCoordinating {
+     /// Opens the capture record for the run that is starting now.
+-    func beginCaptureSession() {
+-        startNewSession()
+-    }
+-
+-    /// Removes the record when the tunnel never came up.
+-    func abortCaptureSession() {
++    func beginCaptureSession() throws -> UUID? {
++        // The extension may have closed the cached session while the app was suspended.
++        if let cached = currentSession {
++            currentSession = try storage.loadAllSessions().first { $0.id == cached.id }
++        }
++        let reusedID = currentSession.flatMap { $0.isActive ? $0.id : nil }
++        guard let session = startNewSession() else {
++            throw NetworkCaptureService.ServiceError.sessionUnavailable
++        }
++        return session.id == reusedID ? nil : session.id
++    }
++
++    /// Removes only this attempt's new record after the tunnel is confirmed stopped.
++    func abortCaptureSession(_ newlyCreatedID: UUID) {
++        guard VPNManager.shared.isDefinitelyStopped, currentSession?.id == newlyCreatedID else { return }
+         abortCurrentSession()
+     }
+ 
+--- a/Trace/Views/NetworkView.swift
++++ b/Trace/Views/NetworkView.swift
+@@ -210,7 +210,20 @@
+                 onShowFavorites: { showingFavorites = true },
+                 onShowCurlImport: { showingCurlImport = true },
+                 onShowThrottling: { showingThrottling = true },
+-                onClearAll: { showingClearAllAlert = true }
++                onClearAll: { showingClearAllAlert = true },
++                onToggleService: {
++                    Task {
++                        do {
++                            try await viewModel.setNetworkServiceEnabled(!viewModel.isServiceRunning)
++                        } catch {
++                            if let vpnError = error as? VPNError, vpnError == .notConfigured {
++                                showingVPNSetupAlert = true
++                            } else {
++                                toastMessage = error.localizedDescription
++                            }
++                        }
++                    }
++                }
+             )
+         }
+         .overlay {
+@@ -228,24 +241,22 @@
+ 
+     private var bottomActionBar: some View {
+         BottomActionBar(
+-            isCapturing: vpnManager.isConnected,
++            isCapturing: viewModel.isCapturing,
++            isServiceRunning: viewModel.isServiceRunning,
++            isStateUnknown: viewModel.isRecordingStateUnknown,
+             onToggleCapture: {
+                 Task {
+-                    if vpnManager.isConnected {
+-                        vpnManager.stop()
+-                    } else {
+-                        do {
+-                            try await vpnManager.start()
+-                        } catch {
+-                            await MainActor.run {
+-                                withAnimation(DesignSystem.Accessibility.preferredAnimation) {
+-                                    if let vpnError = error as? VPNError, vpnError == .notConfigured {
+-                                        showingVPNSetupAlert = true
+-                                    } else {
+-                                        toastMessage = "VPN error: \(error.localizedDescription)"
+-                                    }
+-                                }
+-                            }
++                    do {
++                        if viewModel.isRecordingStateUnknown {
++                            try await viewModel.refreshCaptureState()
++                        } else {
++                            try await viewModel.setCaptureEnabled(!viewModel.isCapturing)
++                        }
++                    } catch {
++                        if let vpnError = error as? VPNError, vpnError == .notConfigured {
++                            showingVPNSetupAlert = true
++                        } else {
++                            toastMessage = error.localizedDescription
+                         }
+                     }
+                 }
+--- a/Trace/Views/NetworkViewToolbar.swift
++++ b/Trace/Views/NetworkViewToolbar.swift
+@@ -17,6 +17,7 @@
+     let onShowCurlImport: () -> Void
+     let onShowThrottling: () -> Void
+     let onClearAll: () -> Void
++    let onToggleService: () -> Void
+ 
+     var body: some ToolbarContent {
+         // Grouping menu (HTTP only)
+@@ -68,6 +69,16 @@
+         // More menu
+         ToolbarItem(placement: .topBarTrailing) {
+             Menu {
++                Section("Network Service") {
++                    Text(LocalizedStringKey(viewModel.isServiceRunning ? "Service Running" : "Service Stopped"))
++                    Button(action: onToggleService) {
++                        Label(LocalizedStringKey(viewModel.isServiceRunning ? "Stop Network Service" : "Start Network Service"), systemImage: "power")
++                    }
++                    .disabled(viewModel.isCaptureTransitioning)
++                }
++                Section {
++                    Text("Stopping capture keeps the network service and MCP running.")
++                }
+                 Button {
+                     onShowFavorites()
+                 } label: {
+--- a/TraceCore/Config/CaptureConfiguration.swift
++++ b/TraceCore/Config/CaptureConfiguration.swift
+@@ -52,6 +52,8 @@
+     public static let defaultFullTunnelDNSServers = ["1.1.1.1", "8.8.8.8"]
+ 
+     public var isEnabled: Bool
++    /// Controls whether network traffic is persisted as a capture session. The VPN service and MCP can stay active while this is false.
++    public var isRecordingEnabled: Bool
+     public var filterMode: FilterMode
+     public var domainFilters: [String] // Domains to include/exclude based on filterMode
+     public var captureHeaders: Bool
+@@ -109,6 +111,7 @@
+ 
+     enum CodingKeys: String, CodingKey {
+         case isEnabled
++        case isRecordingEnabled
+         case filterMode
+         case domainFilters
+         case captureHeaders
+@@ -158,9 +161,11 @@
+         quicNoProgressAbsoluteMs: Int = 20000,
+         quicNoProgressMinClientDatagrams: Int = 6,
+         quicAuthorityRetryAttempts: Int = 1,
+-        quicCertMaterialCacheTTLSeconds: Int = 1800
++        quicCertMaterialCacheTTLSeconds: Int = 1800,
++        isRecordingEnabled: Bool = true
+     ) {
+         self.isEnabled = isEnabled
++        self.isRecordingEnabled = isRecordingEnabled
+         self.filterMode = filterMode
+         self.domainFilters = domainFilters
+         self.captureHeaders = captureHeaders
+@@ -191,6 +196,8 @@
+ 
+         let defaults = CaptureConfiguration.default
+         isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? defaults.isEnabled
++        isRecordingEnabled = try container.decodeIfPresent(Bool.self, forKey: .isRecordingEnabled)
++            ?? defaults.isRecordingEnabled
+         filterMode = try container.decodeIfPresent(FilterMode.self, forKey: .filterMode) ?? defaults.filterMode
+         domainFilters = try container.decodeIfPresent([String].self, forKey: .domainFilters) ?? defaults.domainFilters
+         captureHeaders = try container.decodeIfPresent(Bool.self, forKey: .captureHeaders) ?? defaults.captureHeaders
+@@ -238,6 +245,7 @@
+         let normalized = normalized()
+         var container = encoder.container(keyedBy: CodingKeys.self)
+         try container.encode(normalized.isEnabled, forKey: .isEnabled)
++        try container.encode(normalized.isRecordingEnabled, forKey: .isRecordingEnabled)
+         try container.encode(normalized.filterMode, forKey: .filterMode)
+         try container.encode(normalized.domainFilters, forKey: .domainFilters)
+         try container.encode(normalized.captureHeaders, forKey: .captureHeaders)
+--- /dev/null
++++ b/TraceCore/Config/CaptureRecordingState.swift
+@@ -0,0 +1,57 @@
++import Foundation
++
++/// Process-local recording window. The tunnel updates it before acknowledging a toggle.
++/// Persisting under this lock makes Stop a barrier for queued capture database writes.
++/// Manual requests, replay results and browsing deliberately do not use this gate.
++public final class CaptureRecordingState: @unchecked Sendable {
++    public static let shared = CaptureRecordingState(enabled: false)
++
++    private let lock = NSLock()
++    private var startedAt: Date?
++    private var serviceStopping = false
++
++    public init(enabled: Bool = true, startedAt: Date = .distantPast) {
++        self.startedAt = enabled ? startedAt : nil
++    }
++
++    public var isRecording: Bool {
++        lock.lock()
++        defer { lock.unlock() }
++        return startedAt != nil
++    }
++
++    public func beginService() {
++        lock.lock()
++        serviceStopping = false
++        startedAt = nil
++        lock.unlock()
++    }
++
++    public func endService() {
++        lock.lock()
++        serviceStopping = true
++        startedAt = nil
++        lock.unlock()
++    }
++
++    public func setRecording(_ enabled: Bool, startedAt: Date = Date()) {
++        lock.lock()
++        self.startedAt = enabled && !serviceStopping ? startedAt : nil
++        lock.unlock()
++    }
++
++    /// A response / stream opened before this recording interval cannot leak into the new one.
++    public func allows(startedAt timestamp: Date) -> Bool {
++        lock.lock()
++        defer { lock.unlock() }
++        return startedAt.map { timestamp >= $0 } ?? false
++    }
++
++    @discardableResult
++    public func withRecording<T>(startedAt timestamp: Date, _ action: () throws -> T) rethrows -> T? {
++        lock.lock()
++        defer { lock.unlock() }
++        guard let boundary = startedAt, timestamp >= boundary else { return nil }
++        return try action()
++    }
++}
+--- /dev/null
++++ b/TraceCore/Config/RecordingTransitionQueue.swift
+@@ -0,0 +1,18 @@
++import Foundation
++
++/// Actor isolation alone permits re-entry at await points. Chain whole transitions instead.
++public actor RecordingTransitionQueue {
++    private var tail: Task<Void, Never>?
++
++    public init() {}
++
++    public func perform(_ operation: @escaping @Sendable () async -> Void) async {
++        let predecessor = tail
++        let next = Task {
++            await predecessor?.value
++            await operation()
++        }
++        tail = next
++        await next.value
++    }
++}
+--- a/TraceFeatures/VPN/VPNManager.swift
++++ b/TraceFeatures/VPN/VPNManager.swift
+@@ -16,8 +16,12 @@
+ public protocol VPNManaging: AnyObject {
+     var isConnected: Bool { get }
+     var isConnectedPublisher: AnyPublisher<Bool, Never> { get }
++    var isDefinitelyStopped: Bool { get }
++    func prepareForControl() async throws
+     func start() async throws
+     func stop()
++    func stopAndWait() async throws
++    func sendMessage(_ message: [String: Any]) async throws -> Data?
+ }
+ 
+ /// Manages the VPN connection lifecycle for packet capture
+@@ -91,6 +95,50 @@
+ 
+     public var isConnectedPublisher: AnyPublisher<Bool, Never> {
+         $isConnected.eraseToAnyPublisher()
++    }
++
++    /// False during initial discovery, connecting, reasserting and disconnecting.
++    public var isDefinitelyStopped: Bool {
++        guard isInitialized else { return false }
++        guard let connection = tunnelManager?.connection else { return true }
++        return connection.status == .disconnected || connection.status == .invalid
++    }
++
++    /// Resolves the existing profile without prompting or starting any tunnel.
++    public func prepareForControl() async throws {
++        if isSimulator { throw VPNError.simulatorNotSupported }
++        if !isInitialized || tunnelManager == nil {
++            try await loadExistingVPNConfiguration()
++            isInitialized = true
++        }
++        try await waitForStableStatus(expectedConnected: nil)
++    }
++
++    public func stopAndWait() async throws {
++        if !isInitialized || tunnelManager == nil {
++            try await loadExistingVPNConfiguration()
++            isInitialized = true
++        }
++        stop()
++        try await waitForStableStatus(expectedConnected: false)
++    }
++
++    private func waitForStableStatus(expectedConnected: Bool?, timeout: TimeInterval = 20) async throws {
++        let deadline = Date().addingTimeInterval(timeout)
++        repeat {
++            updateStatus()
++            let current = tunnelManager?.connection.status ?? .invalid
++            if let expectedConnected {
++                if expectedConnected, current == .connected { return }
++                if !expectedConnected, current == .disconnected || current == .invalid { return }
++            } else if current == .connected || current == .disconnected || current == .invalid {
++                return
++            }
++            try await Task.sleep(nanoseconds: 100_000_000)
++        } while Date() < deadline
++        throw VPNError.connectionFailed(NSError(domain: "Trace.NetworkService", code: 408, userInfo: [
++            NSLocalizedDescriptionKey: NSLocalizedString("The network service did not finish changing state. Check its status before trying again.", comment: "VPN lifecycle timeout")
++        ]))
+     }
+ 
+     // MARK: - Simulator Detection
+@@ -437,10 +485,12 @@
+             throw VPNError.notConfigured
+         }
+ 
+-        // Guard against repeated start calls (can lead to reconnect/reassert loops).
++        // A pending stop is not a successful start. Resolve transitions before deciding.
++        try await waitForStableStatus(expectedConnected: nil)
+         let currentStatus = manager.connection.status
+-        if currentStatus == .connected || currentStatus == .connecting || currentStatus == .reasserting || currentStatus == .disconnecting {
+-            FeatureLog.vpn.debug("event=vpn.start outcome=skipped reason=already_active status=\(currentStatus.description, privacy: .public)")
++        if currentStatus == .connected {
++            updateStatus()
++            FeatureLog.vpn.debug("event=vpn.start outcome=skipped reason=already_connected")
+             return
+         }
+ 
+@@ -476,6 +526,8 @@
+         do {
+             try manager.connection.startVPNTunnel()
+             FeatureLog.vpn.info("event=vpn.start outcome=pending tunnel_start_called=true")
++            try await waitForStableStatus(expectedConnected: true)
++            FeatureLog.vpn.info("event=vpn.start outcome=connected")
+         } catch {
+             FeatureLog.vpn.error("event=vpn.start outcome=failure error=\(error.localizedDescription, privacy: .public)")
+             throw error
+@@ -508,12 +560,16 @@
+         let data = try JSONSerialization.data(withJSONObject: message)
+ 
+         return try await withCheckedThrowingContinuation { continuation in
++            let reply = VPNMessageReply(continuation)
++            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 8) {
++                reply.finish(.failure(VPNMessageReply.ReplyError.unconfirmed))
++            }
+             do {
+                 try session.sendProviderMessage(data) { response in
+-                    continuation.resume(returning: response)
++                    reply.finish(.success(response))
+                 }
+             } catch {
+-                continuation.resume(throwing: error)
++                reply.finish(.failure(error))
+             }
+         }
+     }
+--- /dev/null
++++ b/TraceFeatures/VPN/VPNMessageReply.swift
+@@ -0,0 +1,26 @@
++import Foundation
++
++/// A timed-out provider message may still reply later. Resume its continuation only once.
++final class VPNMessageReply: @unchecked Sendable {
++    enum ReplyError: LocalizedError {
++        case unconfirmed
++        var errorDescription: String? {
++            NSLocalizedString("The network service response timed out; the requested change may already have applied. Check its state before trying again.", comment: "Provider message outcome is unknown")
++        }
++    }
++
++    private let lock = NSLock()
++    private var continuation: CheckedContinuation<Data?, Error>?
++
++    init(_ continuation: CheckedContinuation<Data?, Error>) {
++        self.continuation = continuation
++    }
++
++    func finish(_ result: Result<Data?, Error>) {
++        lock.lock()
++        let pending = continuation
++        continuation = nil
++        lock.unlock()
++        pending?.resume(with: result)
++    }
++}
+--- a/TraceProxy/MITM/MITMProxyServer.swift
++++ b/TraceProxy/MITM/MITMProxyServer.swift
+@@ -115,7 +115,14 @@
+             eventLog: eventLog,
+             throttler: throttler,
+             interceptor: interceptor,
+-            captureConfigProvider: { AppGroupStorage.shared.loadConfiguration() },
++            captureConfigProvider: {
++                var configuration = AppGroupStorage.shared.loadConfiguration()
++                if !CaptureRecordingState.shared.isRecording {
++                    configuration.captureHeaders = false
++                    configuration.captureBody = false
++                }
++                return configuration
++            },
+             onRequestCaptured: { [weak self] request in
+                 self?.performOnQueue {
+                     self?.handleCapturedRequest(request)
+@@ -345,6 +352,7 @@
+     }
+ 
+     private func handleCapturedRequest(_ request: NetworkRequest) {
++        guard CaptureRecordingState.shared.allows(startedAt: request.timestamp) else { return }
+         let captureState = Self.captureLifecycleState(for: request)
+         if logSampler.shouldLog(key: "proxy.request_captured", first: 10, every: 200) {
+             let protocolVersion = request.protocolVersion?.rawValue ?? "unknown"
+@@ -406,7 +414,10 @@
+             return
+         }
+         do {
+-            try AppGroupStorage.shared.saveRequest(request)
++            guard try CaptureRecordingState.shared.withRecording(startedAt: request.timestamp, {
++                try AppGroupStorage.shared.saveRequest(request)
++                return true
++            }) == true else { return }
+             appendProxyCaptureEvent(
+                 request,
+                 outcome: terminalFailureReason == nil ? "success" : "failure",
+--- a/TraceProxy/MITM/NIOMITMHTTPConnectHandler+Forwarding.swift
++++ b/TraceProxy/MITM/NIOMITMHTTPConnectHandler+Forwarding.swift
+@@ -727,7 +727,8 @@
+         let wsCapture = NIOMITMWebSocketCaptureState(
+             url: normalizedURL,
+             requestHeaders: traceHeaders(from: requestHeaders),
+-            sessionID: streamRuntime?.snapshot().id
++            sessionID: streamRuntime?.snapshot().id,
++            startedAt: outboundContext.requestSnapshot.timestamp
+         )
+         let sendableContext = NIOMITMUncheckedSendableBox(value: context)
+         let taskState = NIOMITMUncheckedSendableBox(
+--- a/TraceProxy/MITM/NIOMITMHTTPConnectHandler+Interception.swift
++++ b/TraceProxy/MITM/NIOMITMHTTPConnectHandler+Interception.swift
+@@ -21,7 +21,9 @@
+     func persistStreamRuntimeSnapshot(_ runtime: StreamSessionRuntime) {
+         let snapshot = runtime.snapshot()
+         DispatchQueue.global(qos: .utility).async {
+-            try? AppGroupStorage.shared.upsertStreamSession(snapshot)
++            try? CaptureRecordingState.shared.withRecording(startedAt: snapshot.startTime) {
++                try AppGroupStorage.shared.upsertStreamSession(snapshot)
++            }
+         }
+     }
+ 
+--- a/TraceProxy/MITM/NIOMITMSSECaptureState.swift
++++ b/TraceProxy/MITM/NIOMITMSSECaptureState.swift
+@@ -47,6 +47,7 @@
+         captureConfig: CaptureConfiguration,
+         onRequestCaptured: ((NetworkRequest) -> Void)? = nil
+     ) {
++        guard CaptureRecordingState.shared.allows(startedAt: baseRequest.timestamp) else { return }
+         lock.lock()
+         defer { lock.unlock() }
+         guard !finished else { return }
+@@ -123,7 +124,8 @@
+         captureConfig: CaptureConfiguration,
+         onRequestCaptured: ((NetworkRequest) -> Void)?
+     ) {
+-        guard !bodyChunk.isEmpty else { return }
++        guard !bodyChunk.isEmpty,
++              CaptureRecordingState.shared.allows(startedAt: baseRequest.timestamp) else { return }
+ 
+         lock.lock()
+         defer { lock.unlock() }
+@@ -437,9 +439,12 @@
+     }
+ 
+     func persist(_ snapshot: SSEConnection) {
++        let startedAt = baseRequest.timestamp
+         Self.persistenceQueue.async {
+             do {
+-                try AppGroupStorage.shared.saveSSEConnection(snapshot)
++                try CaptureRecordingState.shared.withRecording(startedAt: startedAt) {
++                    try AppGroupStorage.shared.saveSSEConnection(snapshot)
++                }
+             } catch {
+                 ProxyLog.mitm.warning(
+                     "event=proxy.nio_sse_capture_persist outcome=failure error=\(error.localizedDescription, privacy: .public)"
+@@ -449,9 +454,12 @@
+     }
+ 
+     func persistStreamSession(_ session: StreamSession) {
++        let startedAt = baseRequest.timestamp
+         Self.persistenceQueue.async {
+             do {
+-                try AppGroupStorage.shared.upsertStreamSession(session)
++                try CaptureRecordingState.shared.withRecording(startedAt: startedAt) {
++                    try AppGroupStorage.shared.upsertStreamSession(session)
++                }
+             } catch {
+                 ProxyLog.mitm.warning(
+                     "event=proxy.nio_sse_stream_session_persist outcome=failure error=\(error.localizedDescription, privacy: .public)"
+@@ -461,9 +469,12 @@
+     }
+ 
+     func persistStreamEvent(_ event: StreamEvent) {
++        let startedAt = baseRequest.timestamp
+         Self.persistenceQueue.async {
+             do {
+-                try AppGroupStorage.shared.appendStreamEvent(event)
++                try CaptureRecordingState.shared.withRecording(startedAt: startedAt) {
++                    try AppGroupStorage.shared.appendStreamEvent(event)
++                }
+             } catch {
+                 ProxyLog.mitm.warning(
+                     "event=proxy.nio_sse_stream_event_persist outcome=failure error=\(error.localizedDescription, privacy: .public)"
+--- a/TraceProxy/MITM/NIOMITMWebSocketCaptureState.swift
++++ b/TraceProxy/MITM/NIOMITMWebSocketCaptureState.swift
+@@ -30,13 +30,13 @@
+ 
+     let maxContinuationPayloadBytes = 5 * 1024 * 1024
+ 
+-    init(url: String, requestHeaders: [TraceHTTPHeader], sessionID: UUID? = nil) {
++    init(url: String, requestHeaders: [TraceHTTPHeader], sessionID: UUID? = nil, startedAt: Date = Date()) {
+         let resolvedID = sessionID ?? UUID()
+         connectionID = resolvedID
+         connection = WebSocketConnection(
+             id: resolvedID,
+             url: url,
+-            startTime: Date(),
++            startTime: startedAt,
+             status: .connecting,
+             requestHeaders: requestHeaders
+         )
+@@ -72,7 +72,7 @@
+     func recordFrame(_ frame: WebSocketFrame, direction: WebSocketDirection) {
+         lock.lock()
+         defer { lock.unlock() }
+-        guard !finalized else { return }
++        guard !finalized, CaptureRecordingState.shared.allows(startedAt: connection.startTime) else { return }
+         if !didLogFirstFrame {
+             didLogFirstFrame = true
+             let payloadBytes = (frame.extensionData?.readableBytes ?? 0) + frame.data.readableBytes
+@@ -165,7 +165,7 @@
+     ) {
+         lock.lock()
+         defer { lock.unlock() }
+-        guard !finalized else { return }
++        guard !finalized, CaptureRecordingState.shared.allows(startedAt: connection.startTime) else { return }
+ 
+         appendMessage(
+             type: type,
+@@ -334,7 +334,9 @@
+     func persist(_ snapshot: WebSocketConnection) {
+         Self.persistenceQueue.async {
+             do {
+-                try AppGroupStorage.shared.saveWebSocketConnection(snapshot)
++                try CaptureRecordingState.shared.withRecording(startedAt: snapshot.startTime) {
++                    try AppGroupStorage.shared.saveWebSocketConnection(snapshot)
++                }
+             } catch {
+                 ProxyLog.mitm.warning(
+                     "event=proxy.nio_ws_capture_persist outcome=failure error=\(error.localizedDescription, privacy: .public)"
+@@ -346,7 +348,9 @@
+     func persistStreamSession(_ session: StreamSession) {
+         Self.persistenceQueue.async {
+             do {
+-                try AppGroupStorage.shared.upsertStreamSession(session)
++                try CaptureRecordingState.shared.withRecording(startedAt: session.startTime) {
++                    try AppGroupStorage.shared.upsertStreamSession(session)
++                }
+             } catch {
+                 ProxyLog.mitm.warning(
+                     "event=proxy.nio_ws_stream_session_persist outcome=failure error=\(error.localizedDescription, privacy: .public)"
+@@ -356,9 +360,12 @@
+     }
+ 
+     func persistStreamEvent(_ event: StreamEvent) {
++        let startedAt = connection.startTime
+         Self.persistenceQueue.async {
+             do {
+-                try AppGroupStorage.shared.appendStreamEvent(event)
++                try CaptureRecordingState.shared.withRecording(startedAt: startedAt) {
++                    try AppGroupStorage.shared.appendStreamEvent(event)
++                }
+             } catch {
+                 ProxyLog.mitm.warning(
+                     "event=proxy.nio_ws_stream_event_persist outcome=failure error=\(error.localizedDescription, privacy: .public)"
+--- a/TraceProxy/MITM/Streams/SSEFlowHandler.swift
++++ b/TraceProxy/MITM/Streams/SSEFlowHandler.swift
+@@ -27,7 +27,7 @@
+             protocolType: .sse,
+             url: outboundContext.url,
+             requestHeaders: outboundContext.requestSnapshot.requestHeaders,
+-            startTime: Date()
++            startTime: outboundContext.requestSnapshot.timestamp
+         )
+         let session = runtime.snapshot()
+ 
+--- a/TraceProxy/MITM/Streams/WebSocketFlowHandler.swift
++++ b/TraceProxy/MITM/Streams/WebSocketFlowHandler.swift
+@@ -27,7 +27,7 @@
+             protocolType: .websocket,
+             url: connectHandler.normalizedWebSocketURL(from: outboundContext.url),
+             requestHeaders: outboundContext.requestSnapshot.requestHeaders,
+-            startTime: Date()
++            startTime: outboundContext.requestSnapshot.timestamp
+         )
+         let session = runtime.snapshot()
+ 
+@@ -72,7 +72,9 @@
+ 
+     private func persistSession(_ session: StreamSession) {
+         DispatchQueue.global(qos: .utility).async {
+-            try? AppGroupStorage.shared.upsertStreamSession(session)
++            try? CaptureRecordingState.shared.withRecording(startedAt: session.startTime) {
++                try AppGroupStorage.shared.upsertStreamSession(session)
++            }
+         }
+     }
+ }
+--- a/TraceTests/EndToEndTests.swift
++++ b/TraceTests/EndToEndTests.swift
+@@ -104,7 +104,8 @@
+ 
+         // THEN: Capture should be stopped
+         XCTAssertFalse(captureService.isCapturing)
+-        XCTAssertTrue(mockVPNManager.stopCalled)
++        XCTAssertFalse(mockVPNManager.stopCalled)
++        XCTAssertTrue(mockVPNManager.isConnected)
+ 
+         // Verify requests are still available after stopping capture
+         XCTAssertGreaterThanOrEqual(viewModel.requests.count, 2)
+@@ -1076,6 +1077,10 @@
+         connectionSubject.eraseToAnyPublisher()
+     }
+ 
++    var isDefinitelyStopped: Bool { !isConnected }
++    func prepareForControl() async throws { }
++    func stopAndWait() async throws { stop() }
++
+     func start() async throws {
+         startCalled = true
+         startCallCount += 1
+@@ -1092,6 +1097,10 @@
+         stopCalled = true
+         stopCallCount += 1
+         isConnected = false
++    }
++
++    func sendMessage(_ message: [String: Any]) async throws -> Data? {
++        try JSONSerialization.data(withJSONObject: ["recording": AppGroupStorage.shared.loadConfiguration().isRecordingEnabled])
+     }
+ }
+ 
+--- a/TraceTests/IntegrationTests.swift
++++ b/TraceTests/IntegrationTests.swift
+@@ -725,6 +725,10 @@
+         connectionSubject.eraseToAnyPublisher()
+     }
+ 
++    var isDefinitelyStopped: Bool { !isConnected }
++    func prepareForControl() async throws { }
++    func stopAndWait() async throws { stop() }
++
+     func start() async throws {
+         startCalled = true
+         if !shouldSucceed {
+@@ -737,6 +741,10 @@
+     func stop() {
+         stopCalled = true
+         isConnected = false
++    }
++
++    func sendMessage(_ message: [String: Any]) async throws -> Data? {
++        try JSONSerialization.data(withJSONObject: ["recording": AppGroupStorage.shared.loadConfiguration().isRecordingEnabled])
+     }
+ }
+ 
+--- a/TraceTests/NetworkCaptureServiceTests.swift
++++ b/TraceTests/NetworkCaptureServiceTests.swift
+@@ -19,7 +19,13 @@
+     override func setUp() {
+         super.setUp()
+         mockVPNManager = MockVPNManager()
+-        sut = NetworkCaptureService(vpnManager: mockVPNManager)
++        var configuration = CaptureConfiguration.default
++        mockVPNManager.recordingStateProvider = { configuration.isRecordingEnabled }
++        sut = NetworkCaptureService(
++            vpnManager: mockVPNManager,
++            loadConfiguration: { configuration },
++            saveConfiguration: { configuration = $0 }
++        )
+     }
+ 
+     override func tearDown() {
+@@ -30,11 +36,12 @@
+ 
+     // MARK: - isCapturing Property Tests
+ 
+-    func testIsCapturing_WhenVPNConnected_ReturnsTrue() {
+-        // Given
+-        mockVPNManager.isConnected = true
+-
+-        // When
++    func testIsCapturing_WhenVPNConnectedAndRecordingConfirmed_ReturnsTrue() async throws {
++        // Given
++        mockVPNManager.isConnected = true
++
++        // When
++        try await sut.refreshRecordingState()
+         let isCapturing = sut.isCapturing
+ 
+         // Then
+@@ -89,16 +96,46 @@
+ 
+     // MARK: - Stop Capture Tests
+ 
+-    func testStopCapture_CallsVPNManagerStop() async throws {
+-        // Given
+-        mockVPNManager.isConnected = true
+-
+-        // When
++    func testStopCapture_KeepsServiceRunningAndConfirmsRecordingOff() async throws {
++        mockVPNManager.isConnected = true
+         try await sut.stopCapture()
+-
+-        // Then
++        XCTAssertFalse(mockVPNManager.stopCalled)
++        XCTAssertTrue(mockVPNManager.isConnected)
++        XCTAssertFalse(sut.isCapturing)
++        XCTAssertEqual(mockVPNManager.sentMessages.last?["command"] as? String, "setRecordingState")
++    }
++
++    func testStartService_DoesNotStartRecording() async throws {
++        try await sut.startService()
++        XCTAssertTrue(mockVPNManager.isConnected)
++        XCTAssertFalse(sut.isCapturing)
++    }
++
++    func testResumeRecording_DoesNotRestartVPN() async throws {
++        try await sut.startService()
++        try await sut.startCapture()
++        XCTAssertTrue(sut.isCapturing)
++        XCTAssertEqual(mockVPNManager.startCallCount, 1)
++        XCTAssertEqual(mockVPNManager.sentMessages.filter { $0["command"] as? String == "setRecordingState" }.count, 2)
++    }
++
++    func testStopService_StopsVPN() async throws {
++        try await sut.startService()
++        try await sut.stopService()
+         XCTAssertTrue(mockVPNManager.stopCalled)
+-        XCTAssertEqual(mockVPNManager.stopCallCount, 1)
++        XCTAssertFalse(mockVPNManager.isConnected)
++    }
++
++    func testMissingAcknowledgement_IsAnErrorNotSuccess() async throws {
++        try await sut.startService()
++        mockVPNManager.omitRecordingReply = true
++        do {
++            try await sut.startCapture()
++            XCTFail("An unknown extension result must not be reported as success")
++        } catch {
++            XCTAssertTrue(mockVPNManager.isConnected)
++            XCTAssertEqual(mockVPNManager.sentMessages.filter { $0["command"] as? String == "setRecordingState" }.count, 2)
++        }
+     }
+ 
+     func testStopCapture_UpdatesIsCapturingStatus() async throws {
+@@ -118,6 +155,7 @@
+     func testObserveCaptureStatus_EmitsInitialStatus() async throws {
+         // Given
+         mockVPNManager.isConnected = true
++        try await sut.refreshRecordingState()
+         var receivedValues: [Bool] = []
+ 
+         // When
+@@ -209,6 +247,10 @@
+         connectionSubject.eraseToAnyPublisher()
+     }
+ 
++    var isDefinitelyStopped: Bool { !isConnected }
++    func prepareForControl() async throws { }
++    func stopAndWait() async throws { stop() }
++
+     func emitConnection(_ value: Bool) {
+         isConnected = value
+     }
+@@ -230,4 +272,18 @@
+         stopCallCount += 1
+         isConnected = false
+     }
++
++    var recordingStateProvider: () -> Bool = { true }
++    var omitRecordingReply = false
++    var actualRecording = true
++    var sentMessages: [[String: Any]] = []
++
++    func sendMessage(_ message: [String: Any]) async throws -> Data? {
++        sentMessages.append(message)
++        if message["command"] as? String == "setRecordingState" {
++            actualRecording = recordingStateProvider()
++            if omitRecordingReply { return nil }
++        }
++        return try JSONSerialization.data(withJSONObject: ["recording": actualRecording])
++    }
+ }
+--- a/TraceUI/Components/Components.swift
++++ b/TraceUI/Components/Components.swift
+@@ -340,11 +340,15 @@
+ /// Represents the primary capture controls anchored to the bottom of the screen.
+ public struct BottomActionBar: View {
+     public let isCapturing: Bool
++    public let isServiceRunning: Bool
++    public let isStateUnknown: Bool
+     public let onToggleCapture: () -> Void
+     public let onNewRequest: () -> Void
+ 
+-    public init(isCapturing: Bool, onToggleCapture: @escaping () -> Void, onNewRequest: @escaping () -> Void) {
++    public init(isCapturing: Bool, isServiceRunning: Bool = false, isStateUnknown: Bool = false, onToggleCapture: @escaping () -> Void, onNewRequest: @escaping () -> Void) {
+         self.isCapturing = isCapturing
++        self.isServiceRunning = isServiceRunning
++        self.isStateUnknown = isStateUnknown
+         self.onToggleCapture = onToggleCapture
+         self.onNewRequest = onNewRequest
+     }
+@@ -358,11 +362,11 @@
+                         .frame(width: 12, height: 12)
+                         .accessibilityHidden(true)
+ 
+-                    Text(isCapturing ? "Capturing" : "Stopped")
++                    Text(LocalizedStringKey(isStateUnknown ? "Check Capture State" : (isCapturing ? "Capturing" : (isServiceRunning ? "Capture Paused" : "Stopped"))))
+                         .font(.subheadline)
+                         .fontWeight(.medium)
+ 
+-                    Image(systemName: isCapturing ? "stop.fill" : "play.fill")
++                    Image(systemName: isStateUnknown ? "arrow.clockwise" : (isCapturing ? "stop.fill" : "play.fill"))
+                         .font(.caption)
+                 }
+                 .padding(.horizontal, DesignSystem.Spacing.lg)
+@@ -377,8 +381,8 @@
+                 .contentShape(Capsule())
+             }
+             .foregroundStyle(.primary)
+-            .accessibilityLabel(isCapturing ? "Stop capturing" : "Start capturing")
+-            .accessibilityHint("Double tap to \(isCapturing ? "stop" : "start") network capture")
++            .accessibilityLabel(isStateUnknown ? "Check Capture State" : (isCapturing ? "Stop capturing" : "Start capturing"))
++            .accessibilityHint(isStateUnknown ? "Check Capture State" : "Double tap to \(isCapturing ? "stop" : "start") network capture")
+ 
+             Spacer()
+ 
+--- a/TraceVPN/Providers/PacketFlowLoop.swift
++++ b/TraceVPN/Providers/PacketFlowLoop.swift
+@@ -39,7 +39,7 @@
+     }
+ 
+     func configure(enabled: Bool, limit: UInt64, writer: PCAPWriting?) {
+-        queue.async { [weak self] in
++        let apply = { [weak self] in
+             guard let self else { return }
+             self.pendingLock.lock()
+             let stopped = self.isStopped
+@@ -66,6 +66,11 @@
+                 VPNLog.tunnel.info("event=vpn.packet_capture_config outcome=success enabled=false")
+             }
+         }
++        if DispatchQueue.getSpecific(key: queueKey) != nil {
++            apply()
++        } else {
++            queue.sync(execute: apply)
++        }
+     }
+ 
+     func updateLimit(_ limit: UInt64) {
+@@ -100,7 +105,8 @@
+ 
+     @discardableResult
+     func enqueue(packets: [Data]) -> Int {
+-        guard !packets.isEmpty else { return 0 }
++        let receivedAt = Date()
++        guard !packets.isEmpty, CaptureRecordingState.shared.allows(startedAt: receivedAt) else { return 0 }
+ 
+         let acceptedPackets: [Data]
+         let droppedCount: Int
+@@ -137,7 +143,7 @@
+                 self?.pendingLock.unlock()
+             }
+ 
+-            guard let self else { return }
++            guard let self, CaptureRecordingState.shared.allows(startedAt: receivedAt) else { return }
+             if self.enabled, let writer = self.writer {
+                 let packetsToWrite: [Data]
+                 if self.limit > 0, !writer.supportsRolling {
+@@ -164,7 +170,7 @@
+             }
+ 
+             for packet in acceptedPackets {
+-                self.processParsedPacket(packet: packet)
++                self.processParsedPacket(packet: packet, receivedAt: receivedAt)
+             }
+         }
+ 
+@@ -185,13 +191,13 @@
+         )
+     }
+ 
+-    private func processParsedPacket(packet: Data) {
++    private func processParsedPacket(packet: Data, receivedAt: Date) {
+         guard let ipPacket = IPPacketParser.parse(packet) else { return }
+-        transportRequestRecorder.process(ipPacket: ipPacket, rawPacket: packet)
+-        flowRecorder.process(ipPacket: ipPacket)
++        transportRequestRecorder.process(ipPacket: ipPacket, rawPacket: packet, receivedAt: receivedAt)
++        flowRecorder.process(ipPacket: ipPacket, receivedAt: receivedAt)
+ 
+         if ipPacket.transport == .udp, let udpPacket = UDPParser.parse(ipPacket.payload) {
+-            udpFlowManager.recordDatagram(ipPacket: ipPacket, udpPacket: udpPacket)
++            udpFlowManager.recordDatagram(ipPacket: ipPacket, udpPacket: udpPacket, receivedAt: receivedAt)
+         }
+ 
+         guard ipPacket.transport == .tcp else { return }
+--- a/TraceVPN/Providers/PacketFlowRecorder.swift
++++ b/TraceVPN/Providers/PacketFlowRecorder.swift
+@@ -112,16 +112,16 @@
+         }
+     }
+ 
+-    func process(ipPacket: IPPacket) {
++    func process(ipPacket: IPPacket, receivedAt: Date = Date()) {
+         queue.async { [weak self] in
+-            guard let self else { return }
++            guard let self, CaptureRecordingState.shared.allows(startedAt: receivedAt) else { return }
+             switch ipPacket.transport {
+             case .tcp:
+                 guard let tcpPacket = TCPParser.parse(ipPacket.payload) else { return }
+-                self.processTCP(ipPacket: ipPacket, tcpPacket: tcpPacket)
++                self.processTCP(ipPacket: ipPacket, tcpPacket: tcpPacket, receivedAt: receivedAt)
+             case .udp:
+                 guard let udpPacket = UDPParser.parse(ipPacket.payload) else { return }
+-                self.processUDP(ipPacket: ipPacket, udpPacket: udpPacket)
++                self.processUDP(ipPacket: ipPacket, udpPacket: udpPacket, receivedAt: receivedAt)
+             case .none:
+                 break
+             }
+@@ -181,9 +181,9 @@
+         }
+     }
+ 
+-    private func processTCP(ipPacket: IPPacket, tcpPacket: TCPPacket) {
+-        evictExpired(now: Date())
+-        let now = Date()
++    private func processTCP(ipPacket: IPPacket, tcpPacket: TCPPacket, receivedAt: Date) {
++        evictExpired(now: receivedAt)
++        let now = receivedAt
+ 
+         let key = ConnectionKey(
+             srcIP: ipPacket.source,
+@@ -197,7 +197,8 @@
+             ipPacket: ipPacket,
+             sourcePort: tcpPacket.sourcePort,
+             destinationPort: tcpPacket.destinationPort,
+-            transport: .tcp
++            transport: .tcp,
++            startedAt: receivedAt
+         )
+ 
+         let isFromSource = ipPacket.source == state.source.ip && tcpPacket.sourcePort == state.source.port
+@@ -233,9 +234,9 @@
+         flows[key] = state
+     }
+ 
+-    private func processUDP(ipPacket: IPPacket, udpPacket: UDPPacket) {
+-        evictExpired(now: Date())
+-        let now = Date()
++    private func processUDP(ipPacket: IPPacket, udpPacket: UDPPacket, receivedAt: Date) {
++        evictExpired(now: receivedAt)
++        let now = receivedAt
+ 
+         let key = ConnectionKey(
+             srcIP: ipPacket.source,
+@@ -249,7 +250,8 @@
+             ipPacket: ipPacket,
+             sourcePort: udpPacket.sourcePort,
+             destinationPort: udpPacket.destinationPort,
+-            transport: .udp
++            transport: .udp,
++            startedAt: receivedAt
+         )
+ 
+         let isFromSource = ipPacket.source == state.source.ip && udpPacket.sourcePort == state.source.port
+@@ -278,7 +280,8 @@
+         ipPacket: IPPacket,
+         sourcePort: UInt16,
+         destinationPort: UInt16,
+-        transport: FlowTransportProtocol
++        transport: FlowTransportProtocol,
++        startedAt: Date
+     ) -> FlowState {
+         if flows.count >= maxFlows {
+             evictExpired(now: Date())
+@@ -297,8 +300,8 @@
+             destinationPort: destinationPort,
+             transport: transport,
+             protocolHints: protocolHints,
+-            startTime: Date(),
+-            lastSeen: Date(),
++            startTime: startedAt,
++            lastSeen: startedAt,
+             isClosed: false
+         )
+ 
+@@ -326,7 +329,10 @@
+ 
+     private func flush(state: inout FlowState) {
+         do {
+-            try AppGroupStorage.shared.savePacketFlowRecord(state.record)
++            let snapshot = state.record
++            try CaptureRecordingState.shared.withRecording(startedAt: snapshot.startTime) {
++                try AppGroupStorage.shared.savePacketFlowRecord(snapshot)
++            }
+             state.lastFlush = Date()
+         } catch {
+             if logSampler.shouldLog(event: "vpn.packet_flow_store", key: "write_failure", first: 3, every: 200) {
+--- a/TraceVPN/Providers/PacketTunnelProvider+Messaging.swift
++++ b/TraceVPN/Providers/PacketTunnelProvider+Messaging.swift
+@@ -14,6 +14,17 @@
+ 
+ extension PacketTunnelProvider {
+     func handleMessage(
++        _ message: AppMessage,
++        completionHandler: AppMessageCompletion
++    ) async {
++        let boxedMessage = UnsafeSendable(message)
++        await recordingTransitions.perform { [weak self] in
++            guard let self else { completionHandler.call(nil); return }
++            await self.handleSerialMessage(boxedMessage.value, completionHandler: completionHandler)
++        }
++    }
++
++    private func handleSerialMessage(
+         _ message: AppMessage,
+         completionHandler: AppMessageCompletion
+     ) async {
+@@ -30,6 +41,17 @@
+             }
+         case .updateCaptureConfig:
+             await refreshCaptureConfiguration()
++        case .getRecordingState, .setRecordingState:
++            if case .setRecordingState = message.command {
++                let runtimeConfiguration = await loadTunnelProviderConfiguration()
++                await syncRecordingState(using: runtimeConfiguration)
++            }
++            let response: [String: Any] = [
++                "recording": CaptureRecordingState.shared.isRecording,
++                "session_id": (captureSessionCoordinator.currentSession?.id.uuidString as Any?) ?? NSNull()
++            ]
++            completionHandler.call(try? JSONSerialization.data(withJSONObject: response))
++            return
+         case .updateHardeningConfig:
+             if let config = message.payload["hardeningConfig"] as? [String: Any] {
+                 await updateHardeningConfiguration(config)
+@@ -92,6 +114,30 @@
+         let boxedConfig = UnsafeSendable(config)
+         await runtimeState.updateProxyServerConfiguration(boxedConfig)
+         await refreshCaptureConfiguration()
++    }
++
++    /// Toggle persistence only: do not reset packet forwarding, active sockets or the MCP listener.
++    func syncRecordingState(using configuration: TunnelProviderConfiguration) async {
++        prepareRecordingSession(using: configuration)
++        await syncCaptureSettings(using: configuration)
++        let writer = createPacketCaptureWriterIfNeeded(enabled: configuration.packetCaptureEnabled)
++        await runtimeState.updatePacketCaptureSettings(
++            enabled: configuration.packetCaptureEnabled && CaptureRecordingState.shared.isRecording,
++            limit: configuration.hardening.maxRawCaptureSize,
++            writer: writer
++        )
++        if !configuration.capture.isRecordingEnabled {
++            captureSessionCoordinator.finalize(endReason: .userStopped)
++        }
++    }
++
++    func prepareRecordingSession(using configuration: TunnelProviderConfiguration) {
++        guard configuration.capture.isRecordingEnabled,
++              let session = captureSessionCoordinator.begin() else {
++            CaptureRecordingState.shared.setRecording(false)
++            return
++        }
++        CaptureRecordingState.shared.setRecording(true, startedAt: session.createdAt)
+     }
+ 
+     func refreshCaptureConfiguration() async {
+@@ -106,7 +152,7 @@
+             msg: runtimeConfiguration.captureLogMessage
+         )
+ 
+-        await syncCaptureSettings(using: runtimeConfiguration)
++        await syncRecordingState(using: runtimeConfiguration)
+         let reconfigEventSink: @Sendable (String, String) -> Void = { [weak self] type, msg in
+             guard let self else { return }
+             Task {
+@@ -382,7 +428,7 @@
+     }
+ 
+     func createPCAPWriterIfNeeded(enabled: Bool) async -> PCAPWriting? {
+-        guard enabled else { return nil }
++        guard enabled, CaptureRecordingState.shared.isRecording else { return nil }
+         guard let writer = captureSessionCoordinator.writer(
+             fileName: CaptureSessionCoordinator.primaryPCAPFileName
+         ) else {
+@@ -393,7 +439,7 @@
+     }
+ 
+     func createPacketCaptureWriterIfNeeded(enabled: Bool) -> PCAPWriting? {
+-        guard enabled else { return nil }
++        guard enabled, CaptureRecordingState.shared.isRecording else { return nil }
+         guard let writer = captureSessionCoordinator.writer(
+             fileName: CaptureSessionCoordinator.packetPCAPFileName
+         ) else {
+--- a/TraceVPN/Providers/PacketTunnelProvider.swift
++++ b/TraceVPN/Providers/PacketTunnelProvider.swift
+@@ -68,6 +68,8 @@
+     case getRootCAFingerprint
+     case updateConfig
+     case updateCaptureConfig
++    case setRecordingState
++    case getRecordingState
+     case updateHardeningConfig
+     case updateThrottlingState
+     case clearRequests
+@@ -108,6 +110,7 @@
+     /// Encapsulates mutable runtime state (proxy server, raw capture, throttling).
+     let runtimeState = PacketTunnelRuntimeState()
+     let captureRuntimeController = CaptureRuntimeController()
++    let recordingTransitions = RecordingTransitionQueue()
+ 
+     /// Owns the capture session and the per-session PCAP files of this tunnel run.
+     let captureSessionCoordinator = CaptureSessionCoordinator()
+@@ -232,6 +235,7 @@
+     }
+ 
+     private func performStart(invocationID: String) async throws {
++        CaptureRecordingState.shared.beginService()
+         VPNLog.tunnel.debug(
+             "event=vpn.tunnel_task_begin id=\(invocationID, privacy: .public)"
+         )
+@@ -242,18 +246,8 @@
+         let captureConfig = runtimeConfiguration.capture
+         currentCaptureMode = runtimeConfiguration.captureMode
+ 
+-        // Rule: a capture session only exists while the tunnel actually runs. The app creates the
+-        // session right before it starts the tunnel; adopt it here so every PCAP file of this run
+-        // lands in that session's directory. Runs the app never saw (widget, Quick Action, system
+-        // start) get a session created on their behalf.
+-        let captureSession = captureSessionCoordinator.begin()
+-        if let captureSession {
+-            VPNLog.tunnel.info(
+-                "event=vpn.capture_session outcome=ready session_id=\(captureSession.id.uuidString, privacy: .public)"
+-            )
+-        } else {
+-            VPNLog.tunnel.error("event=vpn.capture_session outcome=unavailable")
+-        }
++        // Starting only the network service must never create a phantom capture record.
++        prepareRecordingSession(using: runtimeConfiguration)
+ 
+         await HardeningConfig.shared.logCurrentConfig()
+ 
+@@ -390,6 +384,7 @@
+         with reason: NEProviderStopReason,
+         completionHandler: @escaping () -> Void
+     ) {
++        CaptureRecordingState.shared.endService()
+         TraceMCPServer.shared.stop()
+         let reasonName = String(describing: reason)
+         let stopEvent = LogEvent.vpnTunnel("stop_begin")
+--- a/TraceVPN/Providers/TransportRequestRecorder.swift
++++ b/TraceVPN/Providers/TransportRequestRecorder.swift
+@@ -56,10 +56,10 @@
+         }
+     }
+ 
+-    func process(ipPacket: IPPacket, rawPacket: Data) {
++    func process(ipPacket: IPPacket, rawPacket: Data, receivedAt: Date = Date()) {
+         queue.async { [weak self] in
+-            guard let self else { return }
+-            let now = Date()
++            guard let self, CaptureRecordingState.shared.allows(startedAt: receivedAt) else { return }
++            let now = receivedAt
+             self.refreshCaptureSettingsIfNeeded(force: false, now: now)
+             self.cleanupTCPFlowStateIfNeeded(now: now)
+ 
+@@ -539,11 +539,16 @@
+         persistFlushWorkItem?.cancel()
+         persistFlushWorkItem = nil
+ 
+-        let batch = pendingPersistRequests
++        let batch = pendingPersistRequests.filter {
++            CaptureRecordingState.shared.allows(startedAt: $0.timestamp)
++        }
+         pendingPersistRequests.removeAll(keepingCapacity: true)
++        guard let earliest = batch.map(\.timestamp).min() else { return }
+ 
+         do {
+-            try AppGroupStorage.shared.saveTransportRequests(batch)
++            try CaptureRecordingState.shared.withRecording(startedAt: earliest) {
++                try AppGroupStorage.shared.saveTransportRequests(batch)
++            }
+         } catch {
+             if logSampler.shouldLog(event: "vpn.transport_request_store", key: "write_failure", first: 3, every: 200) {
+                 VPNLog.tunnel.warning(
+@@ -553,7 +558,9 @@
+ 
+             for request in batch {
+                 do {
+-                    try AppGroupStorage.shared.saveTransportRequest(request)
++                    try CaptureRecordingState.shared.withRecording(startedAt: request.timestamp) {
++                        try AppGroupStorage.shared.saveTransportRequest(request)
++                    }
+                 } catch {
+                     if logSampler.shouldLog(event: "vpn.transport_request_store", key: "write_failure_fallback", first: 3, every: 200) {
+                         VPNLog.tunnel.warning(
+--- a/TraceVPN/Providers/TunnelProviderConfiguration.swift
++++ b/TraceVPN/Providers/TunnelProviderConfiguration.swift
+@@ -100,11 +100,11 @@
+     }
+ 
+     var proxyRawCaptureEnabled: Bool {
+-        hardening.enableRawCapture && captureMode == .proxyOnly
++        capture.isRecordingEnabled && hardening.enableRawCapture && captureMode == .proxyOnly
+     }
+ 
+     var packetCaptureEnabled: Bool {
+-        hardening.enableRawCapture && captureMode.usesPacketTunnelRouting
++        capture.isRecordingEnabled && hardening.enableRawCapture && captureMode.usesPacketTunnelRouting
+     }
+ 
+     var transparentTCPMITMEnabled: Bool {
+--- a/TraceVPN/UDP/UDPFlowManager.swift
++++ b/TraceVPN/UDP/UDPFlowManager.swift
+@@ -68,7 +68,7 @@
+         shutdown()
+     }
+ 
+-    func recordDatagram(ipPacket: IPPacket, udpPacket: UDPPacket) {
++    func recordDatagram(ipPacket: IPPacket, udpPacket: UDPPacket, receivedAt: Date = Date()) {
+         let sourceIP = ipPacket.source.description
+         let destinationIP = ipPacket.destination.description
+         let key = FlowKey.normalized(
+@@ -77,10 +77,10 @@
+             destinationIP: destinationIP,
+             destinationPort: udpPacket.destinationPort
+         )
+-        let now = Date()
++        let now = receivedAt
+ 
+         queue.async(flags: .barrier) { [weak self] in
+-            guard let self else { return }
++            guard let self, CaptureRecordingState.shared.allows(startedAt: receivedAt) else { return }
+             if self.flows[key] == nil {
+                 self.evictIfNeeded(now: now)
+                 let metadata = UDPFlowMetadata(
+@@ -149,10 +149,10 @@
+             destinationIP: destinationIP,
+             destinationPort: udpPacket.destinationPort
+         )
+-        let now = Date()
++        let now = metadata.capturedAt
+ 
+         queue.async(flags: .barrier) { [weak self] in
+-            guard let self else { return }
++            guard let self, CaptureRecordingState.shared.allows(startedAt: now) else { return }
+             if self.flows[key] == nil {
+                 self.evictIfNeeded(now: now)
+                 let created = UDPFlowMetadata(
+@@ -276,7 +276,7 @@
+             state.metadata.termination = .closed
+             state.metadata.endTime = shutdownTime
+             do {
+-                try AppGroupStorage.shared.saveUDPFlowMetadata(state.metadata)
++                try persistIfRecording(state.metadata)
+             } catch {
+                 if logSampler.shouldLog(event: "vpn.udp_flow_store", key: "shutdown", first: 3, every: 200) {
+                     VPNLog.tunnel.warning("event=vpn.udp_flow_store outcome=failure error=\(error.localizedDescription, privacy: .public)")
+@@ -301,7 +301,7 @@
+                 state.metadata.termination = .timeout
+                 state.metadata.endTime = state.metadata.lastActivity
+                 do {
+-                    try AppGroupStorage.shared.saveUDPFlowMetadata(state.metadata)
++                    try persistIfRecording(state.metadata)
+                 } catch {
+                     if logSampler.shouldLog(event: "vpn.udp_flow_store", key: "timeout", first: 3, every: 200) {
+                         VPNLog.tunnel.warning("event=vpn.udp_flow_store outcome=failure error=\(error.localizedDescription, privacy: .public)")
+@@ -313,6 +313,12 @@
+         }
+     }
+ 
++    private func persistIfRecording(_ metadata: UDPFlowMetadata) throws {
++        try CaptureRecordingState.shared.withRecording(startedAt: metadata.startTime) {
++            try AppGroupStorage.shared.saveUDPFlowMetadata(metadata)
++        }
++    }
++
+     private func persistDirtyFlows() {
+         guard !dirtyFlows.isEmpty else { return }
+         let keys = dirtyFlows
+@@ -321,7 +327,7 @@
+         for key in keys {
+             guard let state = flows[key] else { continue }
+             do {
+-                try AppGroupStorage.shared.saveUDPFlowMetadata(state.metadata)
++                try persistIfRecording(state.metadata)
+             } catch {
+                 if logSampler.shouldLog(event: "vpn.udp_flow_store", key: "write_failure", first: 3, every: 200) {
+                     VPNLog.tunnel.warning("event=vpn.udp_flow_store outcome=failure error=\(error.localizedDescription, privacy: .public)")
+@@ -337,7 +343,7 @@
+         state.metadata.termination = .evicted
+         state.metadata.endTime = now
+         do {
+-            try AppGroupStorage.shared.saveUDPFlowMetadata(state.metadata)
++            try persistIfRecording(state.metadata)
+         } catch {
+             if logSampler.shouldLog(event: "vpn.udp_flow_store", key: "evicted", first: 3, every: 200) {
+                 VPNLog.tunnel.warning("event=vpn.udp_flow_store outcome=failure error=\(error.localizedDescription, privacy: .public)")

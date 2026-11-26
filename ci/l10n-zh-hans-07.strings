@@ -1,0 +1,15 @@
+
+/* Network service and capture recording are independently controlled. */
+"Network Service" = "网络服务";
+"Service Running" = "服务运行中";
+"Service Stopped" = "服务已停止";
+"Start Network Service" = "启动网络服务";
+"Stop Network Service" = "关闭网络服务";
+"Capture Paused" = "抓包已暂停";
+"Check Capture State" = "核对抓包状态";
+"A network service change is already in progress. Wait for it to finish." = "网络服务正在切换，请等待操作完成。";
+"The capture session could not be created. Recording was not started." = "无法创建抓包会话，未启动录制。";
+"The network service did not finish changing state. Check its status before trying again." = "网络服务尚未完成切换，请先核对状态，不要重复操作。";
+"Stopping capture keeps the network service and MCP running." = "停止抓包后，网络服务与 MCP 仍会继续运行。";
+"The network service did not confirm the recording state. Check the service before trying again." = "网络服务尚未确认抓包状态，请先检查服务状态，不要重复操作。";
+"The network service response timed out; the requested change may already have applied. Check its state before trying again." = "网络服务响应超时，操作可能已经生效。请先检查当前状态，不要重复操作。";

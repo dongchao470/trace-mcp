@@ -1,0 +1,17 @@
+--- a/TraceCore/MCP/TraceMCPTools.swift
++++ b/TraceCore/MCP/TraceMCPTools.swift
+@@ -280,9 +280,14 @@
+         let rules = (try? await storage.loadRewriteRules()) ?? []
+         let runtime = TraceMCPServer.shared.status
+         let info = Bundle.main.infoDictionary ?? [:]
++        let serviceRunning = runtime.host == "extension" && runtime.isRunning
++        let recording = serviceRunning && CaptureRecordingState.shared.isRecording
+         return .object([
+             "host": .string(runtime.host),
+             "running": .bool(runtime.isRunning),
++            "network_service_running": .bool(serviceRunning),
++            "recording": .bool(recording),
++            "mode": .string(serviceRunning ? (recording ? "recording" : "service_only") : "foreground_only"),
+             "port": .number(Double(runtime.port)),
+             "uptime_seconds": .number(runtime.uptime),
+             "app_version": .string(info["CFBundleShortVersionString"] as? String ?? "unknown"),

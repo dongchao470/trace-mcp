@@ -175,6 +175,12 @@ jobs:
           set -euo pipefail
           python3 ci/run-critical-network-regressions.py 2>&1 | tee ci-logs/critical-network-regressions.log
 
+      - name: Run exact-source service and recording regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ci/run-service-regressions.py 2>&1 | tee ci-logs/service-regressions.log
+
       - name: Build full device app for iOS 16
         shell: bash
         run: |
