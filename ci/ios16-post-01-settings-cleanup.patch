@@ -1,0 +1,49 @@
+diff --git a/Trace/Views/Settings/SettingsTabView.swift b/Trace/Views/Settings/SettingsTabView.swift
+index 200d168..435c36b 100644
+--- a/Trace/Views/Settings/SettingsTabView.swift
++++ b/Trace/Views/Settings/SettingsTabView.swift
+@@ -52,39 +52,20 @@ struct SettingsTabView: View {
+                     }
+                 }
+ 
+-                Section("Data & Storage") {
+-                    Button {
+-                        exportToHAR()
+-                    } label: {
+-                        Label("Export HAR", systemImage: "square.and.arrow.up")
+-                    }
+-                    .disabled(viewModel.requests.isEmpty)
+-
+-                    Button {
+-                        showingHARImport = true
+-                    } label: {
+-                        Label("Import HAR", systemImage: "square.and.arrow.down")
+-                    }
+-
++                Section("Integrations") {
+                     NavigationLink {
+-                        PCAPExportView()
++                        MCPView()
+                     } label: {
+-                        Label("Packet Captures", systemImage: "doc")
++                        Label("MCP Server", systemImage: "bolt.horizontal.circle")
+                     }
++                }
+ 
++                Section("Data & Storage") {
+                     NavigationLink {
+                         StorageSettingsView()
+                     } label: {
+                         Label("Storage", systemImage: "externaldrive")
+                     }
+-
+-                    if !viewModel.requests.isEmpty {
+-                        Button(role: .destructive) {
+-                            showingClearAlert = true
+-                        } label: {
+-                            Label("Clear \(viewModel.requests.count) Requests", systemImage: "trash")
+-                        }
+-                    }
+                 }
+ 
+                 Section("Notifications") {

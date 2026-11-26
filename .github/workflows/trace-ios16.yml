@@ -143,6 +143,19 @@ jobs:
           git diff --check
           git diff --stat | tee ci-logs/mcp-hooks.log
 
+      - name: Apply post-MCP patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for patch in ci/ios16-post-*.patch; do
+            echo "applying $patch"
+            git apply --check "$patch"
+            git apply "$patch"
+          done
+          git diff --check
+          git diff --stat | tee ci-logs/post-patches.log
+
       - name: Assemble MCP server sources
         shell: bash
         run: |
