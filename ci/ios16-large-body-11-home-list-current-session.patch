@@ -1,0 +1,79 @@
+diff --git a/Trace/ViewModels/CaptureViewModel.swift b/Trace/ViewModels/CaptureViewModel.swift
+index 64a737f..e2094c2 100644
+--- a/Trace/ViewModels/CaptureViewModel.swift
++++ b/Trace/ViewModels/CaptureViewModel.swift
+@@ -340,11 +340,11 @@ final class CaptureViewModel: ObservableObject {
+         }
+ 
+         // Load initial requests from storage
++        loadSessions()
+         loadRequests()
+         loadTransportRequests(forceFullReload: true)
+         loadTransportProtocolHints()
+         loadSavedPresets()
+-        loadSessions()
+         if ownsCaptureLifecycle {
+             runStartupSessionRecovery()
+         }
+@@ -691,8 +691,20 @@ final class CaptureViewModel: ObservableObject {
+                 let sessionForAttribution = await MainActor.run { self.currentSession }
+ 
+                 if shouldRunFullReload {
+-                    var loadedRequests = try await self.storage.loadAllRequestsAsync()
++                    let visibleSessionID = await MainActor.run { self.displayedSessionID }
++                    var loadedRequests: [NetworkRequest]
++                    if let visibleSessionID {
++                        let storage = self.storage
++                        loadedRequests = try await Task.detached(priority: .userInitiated) {
++                            try storage.loadRequestsForSession(visibleSessionID)
++                        }.value
++                    } else {
++                        loadedRequests = []
++                    }
+                     loadedRequests = self.assignCurrentSession(to: loadedRequests, session: sessionForAttribution)
++                    if let visibleSessionID {
++                        loadedRequests = loadedRequests.filter { $0.sessionId == visibleSessionID }
++                    }
+                     loadedRequests = self.optimizeRequestsForList(loadedRequests)
+                     loadedRequests.sort { $0.timestamp > $1.timestamp }
+ 
+@@ -736,6 +748,9 @@ final class CaptureViewModel: ObservableObject {
+                     excludingIDs: self.requestIDSet
+                 )
+                 loadedRequests = self.assignCurrentSession(to: loadedRequests, session: sessionForAttribution)
++                if let visibleSessionID = await MainActor.run({ self.displayedSessionID }) {
++                    loadedRequests = loadedRequests.filter { $0.sessionId == visibleSessionID }
++                }
+                 loadedRequests = self.optimizeRequestsForList(loadedRequests)
+ 
+                 guard !Task.isCancelled else { return }
+@@ -1640,6 +1655,16 @@ final class CaptureViewModel: ObservableObject {
+ 
+     // MARK: - Session Management
+ 
++    /// 首页列表只展示一条会话：正在抓的那条，或最近一次记录。
++    ///
++    /// 历史抓包仍然留在库里，从「抓包记录」里按会话查看，不再混进首页。
++    private var displayedSessionID: UUID? {
++        if let current = currentSession, current.isActive {
++            return current.id
++        }
++        return sessions.max { $0.startTime < $1.startTime }?.id
++    }
++
+     private func loadSessions() {
+         do {
+             sessions = try storage.loadAllSessions()
+@@ -1744,6 +1769,12 @@ final class CaptureViewModel: ObservableObject {
+ 
+             currentSession = newSession
+             sessions.insert(newSession, at: 0)
++            // 首页只显示这一次抓包：开新会话时立刻清空上一轮的列表。
++            requests = []
++            requestIDSet = []
++            lastRequestFullReloadTime = nil
++            requestIncrementalLoadsSinceFullReload = 0
++            loadRequests(forceFullReload: true)
+             CoreLog.storage.info(
+                 "event=storage.session_start outcome=success session_id=\(newSession.id.uuidString, privacy: .public)"
+             )
