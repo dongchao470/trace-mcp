@@ -1,0 +1,3192 @@
+diff --git a/Trace/Repositories/AppGroupCaptureStore.swift b/Trace/Repositories/AppGroupCaptureStore.swift
+index 0a69b0b..8f01351 100644
+--- a/Trace/Repositories/AppGroupCaptureStore.swift
++++ b/Trace/Repositories/AppGroupCaptureStore.swift
+@@ -6,6 +6,7 @@
+ //
+ 
+ import Foundation
++import os
+ import TraceCore
+ 
+ @MainActor
+@@ -27,6 +28,17 @@ protocol CaptureDataStore: AnyObject {
+     func deleteSession(_ id: UUID) async throws
+     func deleteAllSessions() async throws
+     func invalidateSessionCache()
++
++    // MARK: - 抓包会话（会话即一级记录）
++
++    /// 把上次异常退出时仍未结束的会话补记成中断，返回被标记的 id。
++    func markInterruptedSessions(at date: Date) async throws -> [UUID]
++    /// 更新会话统计与结束信息（`endTime` / `endReason` 按传入值写入）。
++    func updateSessionStats(id: UUID, requestCount: Int, totalBytes: Int64, endTime: Date?, endReason: SessionEndReason?) async throws
++    /// 删会话行 + 该会话的所有请求（含 body 文件）+ 会话目录。
++    func deleteSessionAndFiles(_ id: UUID) async throws
++    /// 删会话行 + 该会话的所有请求（含 body 文件）+ 会话目录。
++    func deleteSessionAndFiles(_ session: CaptureSession) async throws
+ }
+ 
+ @MainActor
+@@ -144,16 +156,80 @@ final class AppGroupCaptureStore: CaptureDataStore {
+ 
+     func deleteSession(_ id: UUID) async throws {
+         var sessions = try await loadSessions()
++        let removed = sessions.first { $0.id == id }
+         sessions.removeAll { $0.id == id }
+         try await saveSessions(sessions)
++        // 会话目录（pcap + meta.json）跟着会话一起删，失败只记日志。
++        if let removed {
++            do {
++                try SessionDirectory.delete(for: removed.id, createdAt: removed.startTime)
++            } catch {
++                CoreLog.storage.error(
++                    "event=storage.session_directory_delete outcome=failure session_id=\(removed.id.uuidString, privacy: .public) error=\(String(describing: error), privacy: .public)"
++                )
++            }
++        }
+     }
+ 
+     func deleteAllSessions() async throws {
+         try await saveSessions([])
+     }
+ 
++    func markInterruptedSessions(at date: Date) async throws -> [UUID] {
++        let marked = try storage.markInterruptedSessions(at: date)
++        if !marked.isEmpty {
++            cachedSessions = nil
++            lastSessionCacheTime = nil
++        }
++        return marked
++    }
++
++    func updateSessionStats(
++        id: UUID,
++        requestCount: Int,
++        totalBytes: Int64,
++        endTime: Date?,
++        endReason: SessionEndReason?
++    ) async throws {
++        try storage.updateSessionStats(
++            id: id,
++            requestCount: requestCount,
++            totalBytes: totalBytes,
++            endTime: endTime,
++            endReason: endReason
++        )
++        cachedSessions = nil
++        lastSessionCacheTime = nil
++    }
++
++    func deleteSessionAndFiles(_ id: UUID) async throws {
++        if let session = try await loadSessions().first { $0.id == id } {
++            try await deleteSessionAndFiles(session)
++        } else {
++            try storage.deleteCapturedRequests(forSession: id)
++            try storage.deleteSessionAndFiles(id)
++            removeSessionFromCache(id)
++        }
++    }
++
++    func deleteSessionAndFiles(_ session: CaptureSession) async throws {
++        // 顺序：请求（含 body 文件）→ 会话行 → 会话目录。
++        try storage.deleteCapturedRequests(forSession: session.id)
++        try storage.deleteSessionAndFiles(session)
++        removeSessionFromCache(session.id)
++        invalidateRequestCache()
++    }
++
+     func invalidateSessionCache() {
+         cachedSessions = nil
+         lastSessionCacheTime = nil
+     }
++
++    // MARK: - Private Helpers
++
++    private func removeSessionFromCache(_ id: UUID) {
++        guard let cachedSessions else { return }
++        self.cachedSessions = cachedSessions.filter { $0.id != id }
++        lastSessionCacheTime = Date()
++    }
+ }
+diff --git a/Trace/Repositories/SessionRepository.swift b/Trace/Repositories/SessionRepository.swift
+index 7915918..e351d7a 100644
+--- a/Trace/Repositories/SessionRepository.swift
++++ b/Trace/Repositories/SessionRepository.swift
+@@ -16,6 +16,51 @@ protocol SessionRepository {
+     func saveAll(_ sessions: [CaptureSession]) async throws
+     func delete(_ id: UUID) async throws
+     func deleteAll() async throws
++
++    // MARK: - 抓包会话（会话 = 一级记录）
++
++    /// 把上次异常退出时仍未结束的会话补记成中断，返回被标记的 id（幂等）。
++    func markInterruptedSessions(at date: Date) async throws -> [UUID]
++    /// 更新会话统计与结束信息；`endTime` / `endReason` 按传入值写入。
++    func updateSessionStats(id: UUID, requestCount: Int, totalBytes: Int64, endTime: Date?, endReason: SessionEndReason?) async throws
++    /// 删会话：请求（含 body 文件）+ 会话行 + 会话目录。
++    func deleteSessionAndFiles(_ id: UUID) async throws
++    /// 删会话：请求（含 body 文件）+ 会话行 + 会话目录。
++    func deleteSessionAndFiles(_ session: CaptureSession) async throws
++}
++
++// MARK: - 默认实现
++
++/// 新接口都给了默认实现：既有的测试替身（如 `MockSessionRepository`）不需要跟着改。
++extension SessionRepository {
++    func markInterruptedSessions(at date: Date) async throws -> [UUID] {
++        []
++    }
++
++    func updateSessionStats(id: UUID, requestCount: Int, totalBytes: Int64, endTime: Date?, endReason: SessionEndReason?) async throws {}
++
++    func deleteSessionAndFiles(_ id: UUID) async throws {
++        try await delete(id)
++    }
++
++    func deleteSessionAndFiles(_ session: CaptureSession) async throws {
++        try await deleteSessionAndFiles(session.id)
++    }
++
++    /// 会话目录（纯路径计算，不需要实现方参与）。
++    func sessionDirectory(for session: CaptureSession) -> URL {
++        SessionDirectory.directory(for: session)
++    }
++
++    /// 会话 pcap 的路径。
++    func pcapFileURL(for session: CaptureSession) -> URL {
++        SessionDirectory.pcapURL(for: session)
++    }
++
++    /// 会话 pcap 的字节数，文件不存在时返回 0。
++    func pcapFileSize(for session: CaptureSession) -> Int64 {
++        SessionDirectory.pcapSize(for: session.id, createdAt: session.startTime)
++    }
+ }
+ 
+ /// Implementation of SessionRepository using AppGroupStorage
+@@ -59,6 +104,36 @@ class SessionRepositoryImpl: SessionRepository {
+         try await store.deleteAllSessions()
+     }
+ 
++    // MARK: - 抓包会话
++
++    func markInterruptedSessions(at date: Date) async throws -> [UUID] {
++        try await store.markInterruptedSessions(at: date)
++    }
++
++    func updateSessionStats(
++        id: UUID,
++        requestCount: Int,
++        totalBytes: Int64,
++        endTime: Date?,
++        endReason: SessionEndReason?
++    ) async throws {
++        try await store.updateSessionStats(
++            id: id,
++            requestCount: requestCount,
++            totalBytes: totalBytes,
++            endTime: endTime,
++            endReason: endReason
++        )
++    }
++
++    func deleteSessionAndFiles(_ id: UUID) async throws {
++        try await store.deleteSessionAndFiles(id)
++    }
++
++    func deleteSessionAndFiles(_ session: CaptureSession) async throws {
++        try await store.deleteSessionAndFiles(session)
++    }
++
+     // MARK: - Cache Management
+ 
+     func invalidateCache() {
+diff --git a/Trace/Services/NetworkCaptureService.swift b/Trace/Services/NetworkCaptureService.swift
+index ffcbe8d..ac061cd 100644
+--- a/Trace/Services/NetworkCaptureService.swift
++++ b/Trace/Services/NetworkCaptureService.swift
+@@ -12,6 +12,20 @@ import os
+ import TraceCore
+ import TraceFeatures
+ 
++/// Opens and closes the capture record around a real capture run.
++///
++/// Discussion: The capture session belongs to a run of the tunnel, so it is created when capture
++/// starts and closed when it stops — never at app launch, in previews, or while browsing requests.
++@MainActor
++protocol CaptureSessionCoordinating: AnyObject {
++    /// Opens the record for the run that is starting now.
++    func beginCaptureSession()
++    /// Removes the record when the tunnel never came up.
++    func abortCaptureSession()
++    /// Closes the record with `reason` and the totals of the run.
++    func endCaptureSession(reason: SessionEndReason)
++}
++
+ /// Defines network capture operations.
+ @MainActor
+ protocol NetworkCaptureServiceProtocol {
+@@ -27,6 +41,7 @@ class NetworkCaptureService: NetworkCaptureServiceProtocol {
+     // MARK: - Dependencies
+ 
+     private let vpnManager: VPNManaging
++    private weak var sessionCoordinator: CaptureSessionCoordinating?
+ 
+     // MARK: - Properties
+ 
+@@ -36,19 +51,39 @@ class NetworkCaptureService: NetworkCaptureServiceProtocol {
+ 
+     // MARK: - Initialization
+ 
+-    init(vpnManager: VPNManaging = VPNManager.shared) {
++    init(
++        vpnManager: VPNManaging = VPNManager.shared,
++        sessionCoordinator: CaptureSessionCoordinating? = nil
++    ) {
+         self.vpnManager = vpnManager
++        self.sessionCoordinator = sessionCoordinator
+     }
+ 
+     // MARK: - Public Methods
+ 
+     func startCapture() async throws {
+-        try await vpnManager.start()
++        // Rule: the session exists only once capture actually starts. The directory has to be
++        // ready before the tunnel writes the first packet into it.
++        sessionCoordinator?.beginCaptureSession()
++
++        do {
++            try await vpnManager.start()
++        } catch {
++            // Nothing was captured, so the record must not survive the failed start.
++            sessionCoordinator?.abortCaptureSession()
++            FeatureLog.vpn.error(
++                "event=vpn.capture_start outcome=failure source=app error=\(error.localizedDescription, privacy: .public)"
++            )
++            throw error
++        }
++
+         FeatureLog.vpn.info("event=vpn.capture_start outcome=success source=app")
+     }
+ 
+     func stopCapture() async throws {
+         vpnManager.stop()
++        // The extension writes the same reason if it finalises first; `endCurrentSession` keeps it.
++        sessionCoordinator?.endCaptureSession(reason: .userStopped)
+         FeatureLog.vpn.info("event=vpn.capture_stop outcome=success source=app")
+     }
+ 
+diff --git a/Trace/ViewModels/CaptureViewModel.swift b/Trace/ViewModels/CaptureViewModel.swift
+index cd905cd..64a737f 100644
+--- a/Trace/ViewModels/CaptureViewModel.swift
++++ b/Trace/ViewModels/CaptureViewModel.swift
+@@ -226,6 +226,9 @@ final class CaptureViewModel: ObservableObject {
+         }
+     }
+ 
++    /// Number of sessions that were still open when the previous run died and got closed on launch.
++    @Published private(set) var recoveredSessionCount: Int = 0
++
+     @Published var currentSession: CaptureSession?
+     @Published var selectedSession: CaptureSession?
+     @Published var selectedRequestId: UUID?
+@@ -292,12 +295,33 @@ final class CaptureViewModel: ObservableObject {
+     private var isLoadingThrottlingState = false
+     private var isLoadingSettings = false
+     private var isSceneActive = true
++
++    /// Whether this instance is the one that owns capture session lifecycle.
++    private let ownsCaptureLifecycle: Bool
++    /// Moment this instance came up; sessions opened after it belong to this run, not to a dead one.
++    private let launchTime = Date()
++    private static var hasCaptureLifecycleOwner = false
++    private var recoveryTask: Task<Void, Never>?
++    private lazy var captureService = NetworkCaptureService(
++        vpnManager: VPNManager.shared,
++        sessionCoordinator: self
++    )
+     private var hasPendingRequestRefresh = false
+     private var hasPendingTransportRefresh = false
+     private var hasPendingUDPFlowHintRefresh = false
+     private static let unknownSessionID = UUID(uuidString: "00000000-0000-0000-0000-000000000000") ?? UUID()
+ 
+     init() {
++        // Rule: exactly one instance owns the capture lifecycle. Views, tooling and `#Preview`
++        // blocks build extra `CaptureViewModel`s; only the app's own instance may create or end
++        // sessions, or it would leave duplicated / phantom sessions behind.
++        let isPreviewProcess = ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"
++        let canOwnCaptureLifecycle = !isPreviewProcess && !Self.hasCaptureLifecycleOwner
++        if canOwnCaptureLifecycle {
++            Self.hasCaptureLifecycleOwner = true
++        }
++        ownsCaptureLifecycle = canOwnCaptureLifecycle
++
+         // Unit tests run with the full host app launched. Avoid starting long-lived observers,
+         // VPN hooks, and bulk storage loads during tests to prevent hangs/timeouts and to keep
+         // tests deterministic.
+@@ -321,7 +345,9 @@ final class CaptureViewModel: ObservableObject {
+         loadTransportProtocolHints()
+         loadSavedPresets()
+         loadSessions()
+-        cleanupOrphanedSessions()
++        if ownsCaptureLifecycle {
++            runStartupSessionRecovery()
++        }
+         loadThrottlingState()
+         loadSettings()
+ 
+@@ -344,15 +370,18 @@ final class CaptureViewModel: ObservableObject {
+             }
+         }
+ 
+-        // Observe VPN status changes for session tracking
+-        let vpnStatusObserver = NotificationCenter.default.addObserver(
+-            forName: NSNotification.Name.NEVPNStatusDidChange,
+-            object: nil,
+-            queue: .main
+-        ) { [weak self] _ in
+-            self?.handleVPNStatusChange()
++        // Observe VPN status changes for session tracking.
++        // Only the lifecycle owner reacts: extra instances must never open or close a real session.
++        if ownsCaptureLifecycle {
++            let vpnStatusObserver = NotificationCenter.default.addObserver(
++                forName: NSNotification.Name.NEVPNStatusDidChange,
++                object: nil,
++                queue: .main
++            ) { [weak self] _ in
++                self?.handleVPNStatusChange()
++            }
++            notificationObservers.append(vpnStatusObserver)
+         }
+-        notificationObservers.append(vpnStatusObserver)
+ 
+         // Observe VPN connection state changes to sync isCapturing
+         VPNManager.shared.$isConnected
+@@ -382,6 +411,8 @@ final class CaptureViewModel: ObservableObject {
+         activeUDPFlowHintLoadTask?.cancel()
+         throttlingUpdateTask?.cancel()
+         duplicateDetectionTask?.cancel()
++        recoveryTask?.cancel()
++        recoveryTask = nil
+ 
+         newRequestsObserverToken?.cancel()
+         newRequestsObserverToken = nil
+@@ -657,11 +688,11 @@ final class CaptureViewModel: ObservableObject {
+             )
+ 
+             do {
+-                let currentSessionId = await MainActor.run { self.currentSession?.id }
++                let sessionForAttribution = await MainActor.run { self.currentSession }
+ 
+                 if shouldRunFullReload {
+                     var loadedRequests = try await self.storage.loadAllRequestsAsync()
+-                    loadedRequests = self.assignCurrentSession(to: loadedRequests, currentSessionID: currentSessionId)
++                    loadedRequests = self.assignCurrentSession(to: loadedRequests, session: sessionForAttribution)
+                     loadedRequests = self.optimizeRequestsForList(loadedRequests)
+                     loadedRequests.sort { $0.timestamp > $1.timestamp }
+ 
+@@ -704,7 +735,7 @@ final class CaptureViewModel: ObservableObject {
+                     newerThan: newestKnownTimestamp,
+                     excludingIDs: self.requestIDSet
+                 )
+-                loadedRequests = self.assignCurrentSession(to: loadedRequests, currentSessionID: currentSessionId)
++                loadedRequests = self.assignCurrentSession(to: loadedRequests, session: sessionForAttribution)
+                 loadedRequests = self.optimizeRequestsForList(loadedRequests)
+ 
+                 guard !Task.isCancelled else { return }
+@@ -747,19 +778,24 @@ final class CaptureViewModel: ObservableObject {
+         return Date().timeIntervalSince(lastFullReloadTime) >= requestFullReloadInterval
+     }
+ 
++    /// Attributes requests that carry no session yet to the session being captured.
++    ///
++    /// - Important: Only requests observed at or after the session start are claimed. Otherwise a
++    ///   fresh session would swallow the history that predates it, and its totals would be wrong.
+     private func assignCurrentSession(
+         to loadedRequests: [NetworkRequest],
+-        currentSessionID: UUID?
++        session: CaptureSession?
+     ) -> [NetworkRequest] {
+-        guard let currentSessionID else { return loadedRequests }
++        guard let session else { return loadedRequests }
+         guard !loadedRequests.isEmpty else { return loadedRequests }
+ 
+         var requestsToStore: [NetworkRequest] = []
+         var updatedRequests = loadedRequests
+         requestsToStore.reserveCapacity(updatedRequests.count)
+ 
+-        for index in updatedRequests.indices where updatedRequests[index].sessionId == nil {
+-            updatedRequests[index].sessionId = currentSessionID
++        for index in updatedRequests.indices
++        where updatedRequests[index].sessionId == nil && updatedRequests[index].timestamp >= session.startTime {
++            updatedRequests[index].sessionId = session.id
+             requestsToStore.append(updatedRequests[index])
+         }
+ 
+@@ -1395,12 +1431,15 @@ final class CaptureViewModel: ObservableObject {
+     func toggleCapture() {
+         if isCapturing {
+             isCapturing = false
+-            VPNManager.shared.stop()
++            Task {
++                // Ends the capture session with `endReason = .userStopped` and the run's totals.
++                try? await captureService.stopCapture()
++            }
+         } else {
+             isCapturing = true
+             Task {
+                 do {
+-                    try await VPNManager.shared.start()
++                    try await captureService.startCapture()
+                 } catch {
+                     isCapturing = false
+                     FeatureLog.vpn.error(
+@@ -1614,70 +1653,161 @@ final class CaptureViewModel: ObservableObject {
+         }
+     }
+ 
+-    private func cleanupOrphanedSessions() {
+-        // Mark any orphaned active sessions as ended (e.g., from app crashes)
+-        for session in sessions where session.isActive {
+-            var updatedSession = session
+-            updatedSession.endTime = Date()
+-            do {
+-                try storage.updateSession(updatedSession)
+-                if let index = sessions.firstIndex(where: { $0.id == session.id }) {
+-                    sessions[index] = updatedSession
+-                }
+-            } catch {
+-                CoreLog.storage.error(
+-                    "event=storage.session_cleanup outcome=failure session_id=\(session.id.uuidString, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+-                )
++    /// Closes the sessions a previous run left open and publishes how many were recovered.
++    ///
++    /// - Important: A tunnel that is still connected owns its session, so nothing is marked in
++    ///   that case: the app only re-adopts the running session instead.
++    private func runStartupSessionRecovery() {
++        recoveryTask?.cancel()
++        recoveryTask = Task { [weak self] in
++            guard let self else { return }
++            await self.waitForVPNStatusResolution()
++            guard !Task.isCancelled else { return }
++            self.recoverInterruptedSessions()
++        }
++    }
++
++    /// Waits a bounded time for the VPN layer to report the real tunnel state.
++    private func waitForVPNStatusResolution(timeout: TimeInterval = 2) async {
++        let deadline = Date().addingTimeInterval(timeout)
++        while Date() < deadline {
++            if VPNManager.shared.status != .invalid || VPNManager.shared.isConnected {
++                return
+             }
++            try? await Task.sleep(nanoseconds: 100_000_000)
+         }
+-        currentSession = nil
+     }
+ 
+-    func startNewSession() {
+-        // End current session if active
+-        if let current = currentSession {
+-            endCurrentSession()
++    private func recoverInterruptedSessions() {
++        guard !VPNManager.shared.isConnected else {
++            adoptActiveSessionIfNeeded()
++            CoreLog.storage.info("event=storage.session_recovery outcome=skipped reason=capture_active")
++            return
+         }
+ 
+-        // Create new session
+-        let newSession = CaptureSession(
+-            startTime: Date(),
+-            endTime: nil,
+-            requestCount: 0,
+-            totalDataTransferred: 0
+-        )
++        do {
++            // The cut-off is the launch time: `markInterruptedSessions` skips every session that
++            // started at or after it, so a capture the user began while recovery was waiting for
++            // the VPN state stays open.
++            let recovered = try storage.markInterruptedSessions(at: launchTime)
++            recoveredSessionCount = recovered.count
++            guard !recovered.isEmpty else { return }
++
++            CoreLog.storage.info(
++                "event=storage.session_recovery outcome=success count=\(recovered.count)"
++            )
++            loadSessions()
++        } catch {
++            CoreLog.storage.error(
++                "event=storage.session_recovery outcome=failure error=\(error.localizedDescription, privacy: .public)"
++            )
++        }
++    }
++
++    /// Takes over the session the VPN extension is writing when the app does not hold it yet
++    /// (for example a capture started from a widget or a Quick Action).
++    private func adoptActiveSessionIfNeeded() {
++        if let current = currentSession, current.isActive { return }
++
++        do {
++            let loaded = try storage.loadAllSessions()
++            sessions = loaded
++            guard let active = loaded.first(where: { $0.isActive }) else { return }
++            currentSession = active
++            CoreLog.storage.info(
++                "event=storage.session_adopt outcome=success session_id=\(active.id.uuidString, privacy: .public)"
++            )
++        } catch {
++            CoreLog.storage.error(
++                "event=storage.session_adopt outcome=failure error=\(error.localizedDescription, privacy: .public)"
++            )
++        }
++    }
+ 
++    /// Opens the capture record for a run that is starting now.
++    ///
++    /// - Important: Call this only when capture actually starts. App launch, previews and request
++    ///   browsing must never open a session; doing so used to leave empty sessions behind.
++    /// - Returns: The session that receives the PCAP file and the requests of this run.
++    @discardableResult
++    func startNewSession() -> CaptureSession? {
++        if let current = currentSession, current.isActive {
++            return current
++        }
++
++        let newSession = CaptureSession(startTime: Date())
+         do {
++            // The directory must exist before the tunnel writes its first packet into it.
++            _ = try SessionDirectory.create(for: newSession.id, createdAt: newSession.startTime)
+             try storage.saveSession(newSession)
++            try? SessionDirectory.writeMeta(newSession, createdAt: newSession.startTime)
++
+             currentSession = newSession
+             sessions.insert(newSession, at: 0)
+             CoreLog.storage.info(
+                 "event=storage.session_start outcome=success session_id=\(newSession.id.uuidString, privacy: .public)"
+             )
++            return newSession
+         } catch {
+             CoreLog.storage.error(
+                 "event=storage.session_start outcome=failure error=\(error.localizedDescription, privacy: .public)"
+             )
++            return nil
+         }
+     }
+ 
+-    func endCurrentSession() {
+-        guard var session = currentSession else { return }
++    /// Drops the session opened by `startNewSession()` when the tunnel never came up.
++    func abortCurrentSession() {
++        guard let session = currentSession, session.isActive else { return }
+ 
+-        // Calculate statistics
+-        let sessionRequests = requests.filter { $0.sessionId == session.id }
+-        session.endTime = Date()
+-        session.requestCount = sessionRequests.count
+-        session.totalDataTransferred = sessionRequests.reduce(0) { $0 + Int64($1.responseSize ?? 0) }
++        currentSession = nil
++        sessions.removeAll { $0.id == session.id }
++        // Deletes the row and the session directory (see AppGroupStorage.deleteSession).
++        try? storage.deleteSession(session.id)
++        CoreLog.storage.info(
++            "event=storage.session_abort outcome=success session_id=\(session.id.uuidString, privacy: .public)"
++        )
++    }
++
++    /// Ends the active session with `reason` and the traffic totals of this run.
++    ///
++    /// - Note: Idempotent. If the VPN extension already closed the record, its end reason is kept
++    ///   and only the statistics are refreshed.
++    func endCurrentSession(reason: SessionEndReason = .userStopped) {
++        guard let activeID = currentSession?.id else { return }
++        guard var session = (try? storage.session(id: activeID)) ?? currentSession else {
++            currentSession = nil
++            return
++        }
++        // Stop means stopped: the app must not keep capturing requests into this record even when
++        // the write below fails (the extension closes the same record on tunnel stop).
++        currentSession = nil
++
++        let traffic = sessionTraffic(for: session)
++        session.requestCount = traffic.requestCount
++        session.totalDataTransferred = traffic.totalBytes
++        if session.endTime == nil {
++            session.endTime = Date()
++            session.endReason = reason
++        }
+ 
+         do {
+-            try storage.updateSession(session)
++            try storage.updateSessionStats(
++                id: session.id,
++                requestCount: session.requestCount,
++                totalBytes: session.totalDataTransferred,
++                endTime: session.endTime,
++                endReason: session.endReason
++            )
++            try? SessionDirectory.writeMeta(session, createdAt: session.startTime)
++
+             if let index = sessions.firstIndex(where: { $0.id == session.id }) {
+                 sessions[index] = session
++            } else {
++                sessions.insert(session, at: 0)
+             }
+-            currentSession = nil
+             CoreLog.storage.info(
+-                "event=storage.session_end outcome=success session_id=\(session.id.uuidString, privacy: .public) request_count=\(session.requestCount)"
++                "event=storage.session_end outcome=success session_id=\(session.id.uuidString, privacy: .public) request_count=\(session.requestCount) reason=\((session.endReason ?? reason).rawValue, privacy: .public)"
+             )
+         } catch {
+             CoreLog.storage.error(
+@@ -1686,21 +1816,30 @@ final class CaptureViewModel: ObservableObject {
+         }
+     }
+ 
++    /// Request count and transferred bytes of one session.
++    private func sessionTraffic(for session: CaptureSession) -> (requestCount: Int, totalBytes: Int64) {
++        var sessionRequests = requests.filter { $0.sessionId == session.id }
++        if sessionRequests.isEmpty,
++           let stored = try? storage.loadRequests(newerThan: session.startTime) {
++            sessionRequests = stored.filter { $0.sessionId == session.id }
++        }
++        return (
++            sessionRequests.count,
++            sessionRequests.reduce(Int64(0)) { $0 + Int64($1.responseSize ?? 0) }
++        )
++    }
++
+     private func handleVPNStatusChange() {
+         // Sync capture state with VPN connection state
+         isCapturing = VPNManager.shared.isConnected
+ 
+-        // Handle session management based on VPN state
++        // Rule: a VPN status change never opens a session. A session exists because capture
++        // started, so here we only adopt what the extension is already writing, and close the
++        // record when the tunnel goes away.
+         if VPNManager.shared.isConnected {
+-            // VPN connected - ensure we have an active session
+-            if currentSession == nil {
+-                startNewSession()
+-            }
+-        } else {
+-            // VPN disconnected - end current session if any
+-            if currentSession != nil {
+-                endCurrentSession()
+-            }
++            adoptActiveSessionIfNeeded()
++        } else if currentSession != nil {
++            endCurrentSession(reason: .appTerminated)
+         }
+     }
+ 
+@@ -1949,3 +2088,23 @@ final class CaptureViewModel: ObservableObject {
+         }
+     }
+ }
++
++// MARK: - Session Lifecycle
++
++/// Lets `NetworkCaptureService` open and close the capture record around a real start/stop.
++extension CaptureViewModel: CaptureSessionCoordinating {
++    /// Opens the capture record for the run that is starting now.
++    func beginCaptureSession() {
++        startNewSession()
++    }
++
++    /// Removes the record when the tunnel never came up.
++    func abortCaptureSession() {
++        abortCurrentSession()
++    }
++
++    /// Closes the record with `reason` and the totals of this run.
++    func endCaptureSession(reason: SessionEndReason) {
++        endCurrentSession(reason: reason)
++    }
++}
+diff --git a/Trace/ViewModels/SessionListViewModel.swift b/Trace/ViewModels/SessionListViewModel.swift
+new file mode 100644
+index 0000000..8ed6503
+--- /dev/null
++++ b/Trace/ViewModels/SessionListViewModel.swift
+@@ -0,0 +1,503 @@
++//
++//  SessionListViewModel.swift
++//  Trace
++//
++//  Capture session records: list + detail data access, formatting helpers and
++//  the on-disk session folder lookups.
++//
++
++import Combine
++import Foundation
++import TraceCore
++import os
++import TraceCore
++
++// MARK: - Status
++
++/// Presentation status of a capture session record.
++///
++/// A session with `endTime == nil` is still recording; a session that was
++/// closed by the recovery pass carries `endReason == .interrupted`.
++enum CaptureSessionStatus: Equatable, Sendable {
++    case active
++    case finished
++    case interrupted
++
++    init(session: CaptureSession) {
++        if session.isActive {
++            self = .active
++        } else if session.endReason == .interrupted {
++            self = .interrupted
++        } else {
++            self = .finished
++        }
++    }
++
++    var title: String {
++        switch self {
++        case .active:
++            String(localized: "Recording")
++        case .finished:
++            String(localized: "Finished")
++        case .interrupted:
++            String(localized: "Interrupted")
++        }
++    }
++}
++
++// MARK: - Row model
++
++/// Everything a session row needs, resolved off the main thread before display.
++struct CaptureSessionRowModel: Identifiable, Equatable, Sendable {
++    let session: CaptureSession
++    let requestCount: Int
++    let totalBytes: Int64
++    let pcapBytes: Int64
++    let status: CaptureSessionStatus
++
++    var id: UUID {
++        session.id
++    }
++
++    var shortIdentifier: String {
++        String(session.id.uuidString.prefix(8))
++    }
++
++    var displayTitle: String {
++        CaptureSessionNaming.displayTitle(for: session)
++    }
++}
++
++/// Shared title rules for session records.
++enum CaptureSessionNaming {
++    static func displayTitle(for session: CaptureSession) -> String {
++        if let name = session.name?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
++            return name
++        }
++        let shortIdentifier = String(session.id.uuidString.prefix(8))
++        return String(localized: "Session") + " " + shortIdentifier
++    }
++}
++
++// MARK: - Storage access
++
++/// Nonisolated storage and file helpers shared by the session list and detail screens.
++///
++/// The session screens read the shared store directly instead of going through
++/// `CaptureViewModel`, so they keep working while capture is idle or stopped.
++enum CaptureSessionStore {
++    static func fetchRows(storage: AppGroupStorage) throws -> [CaptureSessionRowModel] {
++        let sessions = try storage.loadAllSessions()
++        return sessions.map { session in
++            var requestCount = session.requestCount
++            var totalBytes = session.totalDataTransferred
++
++            // Sessions that never finished (still recording or interrupted) have no
++            // finalized statistics, so fall back to counting their stored requests.
++            if requestCount <= 0,
++               let requests = try? storage.loadRequestsForSession(session.id),
++               !requests.isEmpty
++            {
++                requestCount = requests.count
++                totalBytes = requests.reduce(Int64(0)) { partial, request in
++                    partial + Int64(request.responseSize ?? request.requestSize ?? 0)
++                }
++            }
++
++            return CaptureSessionRowModel(
++                session: session,
++                requestCount: requestCount,
++                totalBytes: totalBytes,
++                pcapBytes: CaptureSessionFiles.pcapFileSize(for: session),
++                status: CaptureSessionStatus(session: session)
++            )
++        }
++    }
++
++    static func fetchRequests(storage: AppGroupStorage, sessionID: UUID) throws -> [NetworkRequest] {
++        try storage.loadRequestsForSession(sessionID)
++    }
++
++    static func fetchSession(storage: AppGroupStorage, sessionID: UUID) throws -> CaptureSession? {
++        try storage.loadAllSessions().first { $0.id == sessionID }
++    }
++
++    /// Deletes the session's requests, then the session record, then its folder.
++    ///
++    /// Requests are removed one by one so their body files are cleaned up with
++    /// them. If any request cannot be deleted the session record is kept, which
++    /// leaves the row visible so the user can retry.
++    static func deleteSessionAndFiles(storage: AppGroupStorage, session: CaptureSession) throws {
++        let requests = (try? storage.loadRequestsForSession(session.id)) ?? []
++        var failures = 0
++        for request in requests {
++            do {
++                try storage.deleteRequest(request)
++            } catch {
++                failures += 1
++            }
++        }
++        guard failures == 0 else {
++            throw CaptureSessionDeleteError.requestsNotDeleted(failed: failures, total: requests.count)
++        }
++
++        try storage.deleteSession(session.id)
++        CaptureSessionFiles.removeDirectory(for: session)
++    }
++}
++
++enum CaptureSessionDeleteError: LocalizedError {
++    case requestsNotDeleted(failed: Int, total: Int)
++
++    var errorDescription: String? {
++        switch self {
++        case let .requestsNotDeleted(failed, total):
++            return String(localized: "\(failed) of \(total) requests could not be deleted. Nothing else was removed, please try again.")
++        }
++    }
++}
++
++// MARK: - Session files
++
++/// Resolves the on-disk artefacts that belong to a capture session.
++enum CaptureSessionFiles {
++    static let defaultPCAPFileName = "http.pcap"
++
++    static func pcapFileName(for session: CaptureSession) -> String {
++        if let name = session.pcapFileName, !name.isEmpty {
++            return name
++        }
++        return defaultPCAPFileName
++    }
++
++    /// Folder that owns the session's pcap and meta files.
++    ///
++    /// The canonical location is derived from the session id + start time; when
++    /// that folder is missing (older records, or a folder named from a slightly
++    /// different timestamp) the folder is matched by its trailing UUID prefix.
++    static func directoryURL(for session: CaptureSession) -> URL? {
++        let expected = SessionDirectory.directory(for: session.id, createdAt: session.startTime)
++        if FileManager.default.fileExists(atPath: expected.path) {
++            return expected
++        }
++
++        let root = SessionDirectory.root()
++        guard let entries = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else {
++            return nil
++        }
++        let suffix = "-" + session.id.uuidString.prefix(8).lowercased()
++        return entries.first { entry in
++            entry.lastPathComponent.lowercased().hasSuffix(suffix)
++        }
++    }
++
++    static func pcapURL(for session: CaptureSession) -> URL? {
++        let fileName = pcapFileName(for: session)
++
++        if let directory = directoryURL(for: session) {
++            let candidate = directory.appendingPathComponent(fileName)
++            if FileManager.default.fileExists(atPath: candidate.path) {
++                return candidate
++            }
++            if let contents = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil),
++               let fallback = contents.first(where: { $0.pathExtension.lowercased() == "pcap" })
++            {
++                return fallback
++            }
++            return nil
++        }
++
++        let direct = SessionDirectory.url(for: session.id, createdAt: session.startTime, fileName: fileName)
++        if FileManager.default.fileExists(atPath: direct.path) {
++            return direct
++        }
++        return nil
++    }
++
++    static func pcapFileSize(for session: CaptureSession) -> Int64 {
++        guard let url = pcapURL(for: session) else { return 0 }
++        if let values = try? url.resourceValues(forKeys: [.fileSizeKey]), let fileSize = values.fileSize {
++            return Int64(fileSize)
++        }
++        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else { return 0 }
++        return (attributes[.size] as? NSNumber)?.int64Value ?? 0
++    }
++
++    /// Best-effort folder removal. Failure is logged but never fatal: at this
++    /// point the session record is already gone and must stay gone.
++    @discardableResult
++    static func removeDirectory(for session: CaptureSession) -> Bool {
++        guard let directory = directoryURL(for: session) else { return true }
++        do {
++            try FileManager.default.removeItem(at: directory)
++            return true
++        } catch {
++            CoreLog.storage.error(
++                "event=session_directory_delete outcome=failure session_id=\(session.id.uuidString, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
++            )
++            return false
++        }
++    }
++}
++
++// MARK: - Formatting
++
++/// Formatters used by the session screens.
++///
++/// Kept on the main actor because the cached `DateFormatter` and
++/// `RelativeDateTimeFormatter` instances are not thread-safe.
++@MainActor
++enum CaptureSessionFormat {
++    private static let absoluteDateFormatter: DateFormatter = {
++        let formatter = DateFormatter()
++        formatter.dateStyle = .medium
++        formatter.timeStyle = .medium
++        return formatter
++    }()
++
++    private static let shortDateFormatter: DateFormatter = {
++        let formatter = DateFormatter()
++        formatter.dateStyle = .short
++        formatter.timeStyle = .short
++        return formatter
++    }()
++
++    private static let relativeDateFormatter: RelativeDateTimeFormatter = {
++        let formatter = RelativeDateTimeFormatter()
++        formatter.unitsStyle = .abbreviated
++        return formatter
++    }()
++
++    static func absoluteDate(_ date: Date) -> String {
++        absoluteDateFormatter.string(from: date)
++    }
++
++    static func shortDate(_ date: Date) -> String {
++        shortDateFormatter.string(from: date)
++    }
++
++    static func relativeDate(_ date: Date) -> String {
++        relativeDateFormatter.localizedString(for: date, relativeTo: Date())
++    }
++
++    static func duration(_ interval: TimeInterval) -> String {
++        let totalSeconds = max(0, Int(interval.rounded(.down)))
++        let hours = totalSeconds / 3600
++        let minutes = totalSeconds / 60 % 60
++        let seconds = totalSeconds % 60
++        if hours > 0 {
++            return String(format: "%dh %02dm %02ds", hours, minutes, seconds)
++        }
++        if minutes > 0 {
++            return String(format: "%dm %02ds", minutes, seconds)
++        }
++        return String(format: "%ds", seconds)
++    }
++
++    static func bytes(_ count: Int64) -> String {
++        ByteCountFormatter.string(fromByteCount: max(0, count), countStyle: .file)
++    }
++
++    static func endReason(_ reason: SessionEndReason?) -> String? {
++        guard let reason else { return nil }
++        switch reason {
++        case .userStopped:
++            return String(localized: "Stopped by user")
++        case .appTerminated:
++            return String(localized: "App closed while recording")
++        case .interrupted:
++            return String(localized: "Interrupted (unexpected exit)")
++        @unknown default:
++            return nil
++        }
++    }
++}
++
++// MARK: - List view model
++
++@MainActor
++final class SessionListViewModel: ObservableObject {
++    enum LoadState: Equatable {
++        case idle
++        case loading
++        case loaded
++        case failed(String)
++
++        var errorMessage: String? {
++            if case let .failed(message) = self {
++                return message
++            }
++            return nil
++        }
++    }
++
++    @Published private(set) var rows: [CaptureSessionRowModel] = []
++    @Published private(set) var loadState: LoadState = .idle
++    @Published private(set) var deletingIDs: Set<UUID> = []
++
++    private let storage: AppGroupStorage
++    private var hasLoadedOnce = false
++    private var isFetching = false
++
++    init(storage: AppGroupStorage = .shared) {
++        self.storage = storage
++    }
++
++    var hasActiveSession: Bool {
++        rows.contains { $0.status == .active }
++    }
++
++    var isLoading: Bool {
++        loadState == .loading
++    }
++
++    func loadIfNeeded() async {
++        guard !hasLoadedOnce else { return }
++        await reload(showSpinner: true)
++    }
++
++    /// Reloads the session list. `showSpinner == false` keeps the current
++    /// content on screen, which is what the auto refresh and pull-to-refresh use.
++    func reload(showSpinner: Bool) async {
++        guard !isFetching else { return }
++        isFetching = true
++        defer { isFetching = false }
++
++        if showSpinner || (!hasLoadedOnce && rows.isEmpty) {
++            loadState = .loading
++        }
++
++        do {
++            let storage = storage
++            let rows = try await Task.detached(priority: .userInitiated) {
++                try CaptureSessionStore.fetchRows(storage: storage)
++            }.value
++            self.rows = rows
++            self.loadState = .loaded
++            self.hasLoadedOnce = true
++        } catch {
++            CoreLog.storage.error(
++                "event=sessions_load outcome=failure error=\(error.localizedDescription, privacy: .public)"
++            )
++            self.loadState = .failed(error.localizedDescription)
++        }
++    }
++
++    /// Deletes the session record, its requests and its folder.
++    /// - Returns: An error message when the deletion failed, `nil` on success.
++    func delete(_ row: CaptureSessionRowModel) async -> String? {
++        guard !row.session.isActive else {
++            return String(localized: "Stop capturing before deleting this session.")
++        }
++        guard !deletingIDs.contains(row.id) else { return nil }
++
++        deletingIDs.insert(row.id)
++        defer { deletingIDs.remove(row.id) }
++
++        do {
++            let storage = storage
++            let session = row.session
++            try await Task.detached(priority: .userInitiated) {
++                try CaptureSessionStore.deleteSessionAndFiles(storage: storage, session: session)
++            }.value
++            rows.removeAll { $0.id == row.id }
++            return nil
++        } catch {
++            CoreLog.storage.error(
++                "event=sessions_delete outcome=failure session_id=\(row.id.uuidString, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
++            )
++            return error.localizedDescription
++        }
++    }
++}
++
++// MARK: - Detail view model
++
++@MainActor
++final class SessionDetailViewModel: ObservableObject {
++    enum LoadState: Equatable {
++        case idle
++        case loading
++        case loaded
++        case failed(String)
++
++        var errorMessage: String? {
++            if case let .failed(message) = self {
++                return message
++            }
++            return nil
++        }
++    }
++
++    @Published private(set) var session: CaptureSession
++    @Published private(set) var requests: [NetworkRequest] = []
++    @Published private(set) var pcapBytes: Int64 = 0
++    @Published private(set) var loadState: LoadState = .idle
++
++    private let storage: AppGroupStorage
++    private var hasLoadedOnce = false
++    private var isFetching = false
++
++    init(session: CaptureSession, storage: AppGroupStorage = .shared) {
++        self.session = session
++        self.storage = storage
++    }
++
++    var status: CaptureSessionStatus {
++        CaptureSessionStatus(session: session)
++    }
++
++    var displayTitle: String {
++        CaptureSessionNaming.displayTitle(for: session)
++    }
++
++    var shortIdentifier: String {
++        String(session.id.uuidString.prefix(8))
++    }
++
++    var pcapFileName: String {
++        CaptureSessionFiles.pcapFileName(for: session)
++    }
++
++    var endReasonText: String? {
++        CaptureSessionFormat.endReason(session.endReason)
++    }
++
++    func loadIfNeeded() async {
++        guard !hasLoadedOnce else { return }
++        await reload(showSpinner: true)
++    }
++
++    func reload(showSpinner: Bool) async {
++        guard !isFetching else { return }
++        isFetching = true
++        defer { isFetching = false }
++
++        if showSpinner || (!hasLoadedOnce && requests.isEmpty) {
++            loadState = .loading
++        }
++
++        do {
++            let storage = storage
++            let sessionID = session.id
++            let fallback = session
++            let result = try await Task.detached(priority: .userInitiated) {
++                let refreshed = try CaptureSessionStore.fetchSession(storage: storage, sessionID: sessionID) ?? fallback
++                let requests = try CaptureSessionStore.fetchRequests(storage: storage, sessionID: sessionID)
++                let pcapBytes = CaptureSessionFiles.pcapFileSize(for: refreshed)
++                return (refreshed, requests, pcapBytes)
++            }.value
++
++            session = result.0
++            requests = result.1
++            pcapBytes = result.2
++            loadState = .loaded
++            hasLoadedOnce = true
++        } catch {
++            CoreLog.storage.error(
++                "event=sessions_detail_load outcome=failure session_id=\(session.id.uuidString, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
++            )
++            loadState = .failed(error.localizedDescription)
++        }
++    }
++}
+diff --git a/Trace/Views/RootTabView.swift b/Trace/Views/RootTabView.swift
+index 1806142..4552c95 100644
+--- a/Trace/Views/RootTabView.swift
++++ b/Trace/Views/RootTabView.swift
+@@ -151,6 +151,15 @@ struct ToolsTabView: View {
+     var body: some View {
+         NavigationStack {
+             List {
++                Section("Capture") {
++                    NavigationLink {
++                        SessionListView()
++                    } label: {
++                        Label("Capture Sessions", systemImage: "record.circle")
++                    }
++                    .accessibilityHint("Saved capture sessions with their requests and pcap files")
++                }
++
+                 Section("Traffic Modification") {
+                     NavigationLink {
+                         RewriteRulesView()
+diff --git a/Trace/Views/Sessions/SessionDetailView.swift b/Trace/Views/Sessions/SessionDetailView.swift
+new file mode 100644
+index 0000000..8afefb3
+--- /dev/null
++++ b/Trace/Views/Sessions/SessionDetailView.swift
+@@ -0,0 +1,205 @@
++//
++//  SessionDetailView.swift
++//  Trace
++//
++//  One capture session: header with timing, traffic and pcap details, followed
++//  by the requests that were recorded during that session.
++//
++
++import SwiftUI
++import TraceCore
++import TraceFeatures
++import TraceUI
++
++struct SessionDetailView: View {
++    @StateObject private var viewModel: SessionDetailViewModel
++    @ObservedObject private var favorites = FavoritesManager.shared
++    @Environment(\.scenePhase) private var scenePhase
++
++    /// Keeps an in-progress session's duration and requests up to date.
++    private let autoRefreshTimer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
++
++    init(session: CaptureSession) {
++        _viewModel = StateObject(wrappedValue: SessionDetailViewModel(session: session))
++    }
++
++    var body: some View {
++        List {
++            headerSection
++            statisticsSection
++            requestsSection
++        }
++        .listStyle(.insetGrouped)
++        .navigationTitle(viewModel.displayTitle)
++        .navigationBarTitleDisplayMode(.inline)
++        .task {
++            await viewModel.loadIfNeeded()
++        }
++        .refreshable {
++            await viewModel.reload(showSpinner: false)
++        }
++        .onChangeCompat(of: scenePhase) { phase in
++            guard phase == .active else { return }
++            Task { await viewModel.reload(showSpinner: false) }
++        }
++        .onReceive(autoRefreshTimer) { _ in
++            guard viewModel.status == .active else { return }
++            Task { await viewModel.reload(showSpinner: false) }
++        }
++    }
++
++    // MARK: - Header
++
++    private var headerSection: some View {
++        Section {
++            HStack(spacing: DesignSystem.Spacing.sm) {
++                SessionStatusBadge(status: viewModel.status)
++                Spacer(minLength: DesignSystem.Spacing.xs)
++                Text(CaptureSessionFormat.relativeDate(viewModel.session.startTime))
++                    .font(.subheadline)
++                    .foregroundStyle(.secondary)
++            }
++            .accessibilityElement(children: .combine)
++
++            LabeledContent("Started", value: CaptureSessionFormat.absoluteDate(viewModel.session.startTime))
++
++            if let endTime = viewModel.session.endTime {
++                LabeledContent("Ended", value: CaptureSessionFormat.absoluteDate(endTime))
++            } else {
++                LabeledContent("Ended") {
++                    Text("Recording")
++                        .foregroundStyle(DesignSystem.Colors.danger)
++                }
++            }
++
++            LabeledContent("Duration") {
++                durationValue
++            }
++
++            if let endReason = viewModel.endReasonText {
++                LabeledContent("End Reason", value: endReason)
++            }
++        } footer: {
++            Text("Session \(viewModel.shortIdentifier)")
++        }
++    }
++
++    /// Recording sessions tick once a second; finished ones are static.
++    @ViewBuilder
++    private var durationValue: some View {
++        if viewModel.status == .active {
++            TimelineView(.periodic(from: .now, by: 1)) { context in
++                Text(verbatim: CaptureSessionFormat.duration(viewModel.session.duration(relativeTo: context.date)))
++            }
++        } else {
++            Text(verbatim: CaptureSessionFormat.duration(viewModel.session.duration))
++        }
++    }
++
++    // MARK: - Statistics
++
++    private var statisticsSection: some View {
++        Section("Statistics") {
++            LabeledContent("Requests", value: "\(requestCount)")
++
++            LabeledContent("Traffic", value: CaptureSessionFormat.bytes(trafficBytes))
++
++            LabeledContent("PCAP File") {
++                Text(verbatim: CaptureSessionFormat.bytes(viewModel.pcapBytes) + " · " + viewModel.pcapFileName)
++                    .lineLimit(1)
++                    .minimumScaleFactor(0.8)
++            }
++        }
++    }
++
++    private var requestCount: Int {
++        viewModel.requests.isEmpty ? viewModel.session.requestCount : viewModel.requests.count
++    }
++
++    private var trafficBytes: Int64 {
++        guard !viewModel.requests.isEmpty else {
++            return viewModel.session.totalDataTransferred
++        }
++        return viewModel.requests.reduce(Int64(0)) { partial, request in
++            partial + Int64(request.responseSize ?? request.requestSize ?? 0)
++        }
++    }
++
++    // MARK: - Requests
++
++    private var requestsSection: some View {
++        Section {
++            requestsContent
++        } header: {
++            HStack {
++                Text("Requests")
++                Spacer()
++                Text("\(requestCount)")
++                    .foregroundStyle(.secondary)
++            }
++        }
++    }
++
++    @ViewBuilder
++    private var requestsContent: some View {
++        if viewModel.loadState == .loading, viewModel.requests.isEmpty {
++            HStack {
++                Spacer()
++                ProgressView()
++                Spacer()
++            }
++            .listRowBackground(Color.clear)
++            .accessibilityLabel("Loading requests")
++
++        } else if let message = viewModel.loadState.errorMessage, viewModel.requests.isEmpty {
++            TraceContentUnavailableView(
++                "Couldn't Load Requests",
++                systemImage: "exclamationmark.triangle",
++                description: Text(message),
++                actionTitle: "Try Again",
++                action: {
++                    Task { await viewModel.reload(showSpinner: true) }
++                }
++            )
++            .frame(maxWidth: .infinity)
++            .listRowBackground(Color.clear)
++
++        } else if viewModel.requests.isEmpty {
++            TraceContentUnavailableView(
++                "No Requests",
++                systemImage: "list.bullet",
++                description: Text("This session recorded no requests.")
++            )
++            .frame(maxWidth: .infinity)
++            .listRowBackground(Color.clear)
++
++        } else {
++            ForEach(viewModel.requests) { request in
++                NavigationLink {
++                    DetailView(request: request)
++                } label: {
++                    RequestListRow(
++                        request: request,
++                        isFavorited: favorites.isFavorited(requestId: request.id)
++                    )
++                }
++            }
++        }
++    }
++}
++
++// MARK: - Previews
++
++#Preview("Session Detail") {
++    NavigationStack {
++        SessionDetailView(
++            session: CaptureSession(
++                name: nil,
++                startTime: Date().addingTimeInterval(-740),
++                endTime: Date().addingTimeInterval(-90),
++                requestCount: 12,
++                totalDataTransferred: 482_000
++            )
++        )
++    }
++}
+diff --git a/Trace/Views/Sessions/SessionListView.swift b/Trace/Views/Sessions/SessionListView.swift
+new file mode 100644
+index 0000000..d6ddd77
+--- /dev/null
++++ b/Trace/Views/Sessions/SessionListView.swift
+@@ -0,0 +1,221 @@
++//
++//  SessionListView.swift
++//  Trace
++//
++//  First-level list of capture session records. Each row is one capture
++//  session; tapping it opens the requests that belong to that session.
++//
++
++import SwiftUI
++import TraceCore
++import TraceUI
++
++struct SessionListView: View {
++    @StateObject private var viewModel = SessionListViewModel()
++    @Environment(\.scenePhase) private var scenePhase
++
++    @State private var pendingDeletion: CaptureSessionRowModel?
++    @State private var infoAlert: SessionInfoAlert?
++
++    /// Keeps the row of a running session (request count, duration) fresh.
++    private let autoRefreshTimer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
++
++    var body: some View {
++        sessionList
++            .navigationTitle("Capture Sessions")
++            .navigationBarTitleDisplayMode(.large)
++            .task {
++                await viewModel.loadIfNeeded()
++            }
++            .onChangeCompat(of: scenePhase) { phase in
++                guard phase == .active else { return }
++                Task { await viewModel.reload(showSpinner: false) }
++            }
++            .onReceive(autoRefreshTimer) { _ in
++                guard viewModel.hasActiveSession else { return }
++                Task { await viewModel.reload(showSpinner: false) }
++            }
++            .confirmationDialog(
++                "Delete Capture Session?",
++                isPresented: Binding(
++                    get: { pendingDeletion != nil },
++                    set: { isPresented in
++                        if !isPresented { pendingDeletion = nil }
++                    }
++                ),
++                titleVisibility: .visible,
++                presenting: pendingDeletion
++            ) { row in
++                Button("Delete Session", role: .destructive) {
++                    let target = row
++                    pendingDeletion = nil
++                    Task { await delete(target) }
++                }
++                Button("Cancel", role: .cancel) {
++                    pendingDeletion = nil
++                }
++            } message: { row in
++                Text("This deletes \(row.requestCount) requests, the session record and its pcap file. This cannot be undone.")
++            }
++            .alert(
++                infoAlert?.title ?? "",
++                isPresented: Binding(
++                    get: { infoAlert != nil },
++                    set: { isPresented in
++                        if !isPresented { infoAlert = nil }
++                    }
++                ),
++                presenting: infoAlert
++            ) { _ in
++                Button("OK", role: .cancel) {
++                    infoAlert = nil
++                }
++            } message: { alert in
++                Text(alert.message)
++            }
++    }
++
++    // MARK: - List
++
++    private var sessionList: some View {
++        List {
++            if let message = viewModel.loadState.errorMessage, !viewModel.rows.isEmpty {
++                Section {
++                    errorBanner(message)
++                }
++            }
++
++            Section {
++                ForEach(viewModel.rows) { row in
++                    NavigationLink {
++                        SessionDetailView(session: row.session)
++                    } label: {
++                        SessionRowView(row: row)
++                    }
++                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
++                        Button(role: .destructive) {
++                            requestDeletion(of: row)
++                        } label: {
++                            Label("Delete", systemImage: "trash")
++                        }
++                    }
++                    .contextMenu {
++                        Button(role: .destructive) {
++                            requestDeletion(of: row)
++                        } label: {
++                            Label("Delete Session", systemImage: "trash")
++                        }
++                    }
++                }
++            } footer: {
++                if !viewModel.rows.isEmpty {
++                    Text("Swipe a session to delete its requests, its record and its pcap file.")
++                }
++            }
++        }
++        .listStyle(.insetGrouped)
++        .refreshable {
++            await viewModel.reload(showSpinner: false)
++        }
++        .overlay {
++            if viewModel.rows.isEmpty {
++                emptyState
++            }
++        }
++    }
++
++    private func errorBanner(_ message: String) -> some View {
++        HStack(alignment: .top, spacing: DesignSystem.Spacing.sm) {
++            Image(systemName: "exclamationmark.triangle.fill")
++                .foregroundStyle(DesignSystem.Colors.warning)
++            VStack(alignment: .leading, spacing: DesignSystem.Spacing.xxs) {
++                Text("Couldn't refresh sessions")
++                    .font(.footnote.weight(.semibold))
++                Text(message)
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++            }
++        }
++        .accessibilityElement(children: .combine)
++    }
++
++    // MARK: - Empty / loading / error
++
++    @ViewBuilder
++    private var emptyState: some View {
++        switch viewModel.loadState {
++        case .idle, .loading:
++            VStack(spacing: DesignSystem.Spacing.md) {
++                ProgressView()
++                Text("Loading Sessions…")
++                    .font(.subheadline)
++                    .foregroundStyle(.secondary)
++            }
++            .padding()
++            .accessibilityElement(children: .combine)
++            .accessibilityLabel("Loading sessions")
++
++        case let .failed(message):
++            TraceContentUnavailableView(
++                "Couldn't Load Sessions",
++                systemImage: "exclamationmark.triangle",
++                description: Text(message),
++                actionTitle: "Try Again",
++                action: {
++                    Task { await viewModel.reload(showSpinner: true) }
++                }
++            )
++            .padding()
++
++        case .loaded:
++            TraceContentUnavailableView(
++                "No Capture Sessions",
++                systemImage: "record.circle",
++                description: Text("Every capture session lands here with its requests, traffic and pcap file. Start capturing from the Network tab to record one.")
++            )
++            .padding()
++        }
++    }
++
++    // MARK: - Deletion
++
++    private func requestDeletion(of row: CaptureSessionRowModel) {
++        guard !row.session.isActive else {
++            infoAlert = SessionInfoAlert(
++                title: String(localized: "Session Still Recording"),
++                message: String(localized: "Stop capturing before deleting this session.")
++            )
++            return
++        }
++        DesignSystem.Haptics.light()
++        pendingDeletion = row
++    }
++
++    private func delete(_ row: CaptureSessionRowModel) async {
++        if let message = await viewModel.delete(row) {
++            DesignSystem.Haptics.error()
++            infoAlert = SessionInfoAlert(
++                title: String(localized: "Delete Failed"),
++                message: message
++            )
++        } else {
++            DesignSystem.Haptics.success()
++        }
++    }
++}
++
++// MARK: - Alert payload
++
++struct SessionInfoAlert: Identifiable {
++    let id = UUID()
++    let title: String
++    let message: String
++}
++
++// MARK: - Previews
++
++#Preview("Sessions Empty") {
++    NavigationStack {
++        SessionListView()
++    }
++}
+diff --git a/Trace/Views/Sessions/SessionRowView.swift b/Trace/Views/Sessions/SessionRowView.swift
+new file mode 100644
+index 0000000..5d4bdce
+--- /dev/null
++++ b/Trace/Views/Sessions/SessionRowView.swift
+@@ -0,0 +1,217 @@
++//
++//  SessionRowView.swift
++//  Trace
++//
++//  One row of the capture session list, plus the shared status badge.
++//
++
++import SwiftUI
++import TraceCore
++import TraceUI
++
++// MARK: - Status badge
++
++/// Colour-coded pill describing the state of a capture session.
++struct SessionStatusBadge: View {
++    let status: CaptureSessionStatus
++
++    var body: some View {
++        HStack(spacing: DesignSystem.Spacing.xxs + 1) {
++            Image(systemName: iconName)
++                .font(.system(size: 9, weight: .bold))
++            Text(status.title)
++                .font(.caption2.weight(.semibold))
++        }
++        .foregroundStyle(tint)
++        .padding(.horizontal, DesignSystem.Spacing.smPlus)
++        .padding(.vertical, 3)
++        .background(Capsule(style: .continuous).fill(tint.opacity(0.15)))
++        .accessibilityElement(children: .ignore)
++        .accessibilityLabel(Text(status.title))
++    }
++
++    private var tint: Color {
++        switch status {
++        case .active:
++            DesignSystem.Colors.danger
++        case .finished:
++            DesignSystem.Colors.success
++        case .interrupted:
++            DesignSystem.Colors.warning
++        }
++    }
++
++    private var iconName: String {
++        switch status {
++        case .active:
++            "record.circle.fill"
++        case .finished:
++            "checkmark.circle.fill"
++        case .interrupted:
++            "exclamationmark.triangle.fill"
++        }
++    }
++}
++
++// MARK: - Row
++
++/// A capture session as shown in the sessions list.
++///
++/// Shows the start time (relative and absolute), the duration, the request
++/// count, the transferred traffic and the size of the session's pcap file.
++struct SessionRowView: View {
++    let row: CaptureSessionRowModel
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs + 1) {
++            headerLine
++            timestampLine
++            metricsLine
++        }
++        .padding(.vertical, DesignSystem.Spacing.xxs)
++        .accessibilityElement(children: .ignore)
++        .accessibilityLabel(Text(accessibilityDescription))
++    }
++
++    // MARK: Lines
++
++    private var headerLine: some View {
++        HStack(spacing: DesignSystem.Spacing.smPlus) {
++            SessionStatusBadge(status: row.status)
++
++            Text(row.displayTitle)
++                .font(.subheadline.weight(.semibold))
++                .lineLimit(1)
++
++            Spacer(minLength: DesignSystem.Spacing.xs)
++
++            Text(CaptureSessionFormat.relativeDate(row.session.startTime))
++                .font(.caption)
++                .foregroundStyle(.secondary)
++                .lineLimit(1)
++        }
++    }
++
++    private var timestampLine: some View {
++        HStack(spacing: DesignSystem.Spacing.xs) {
++            Text(CaptureSessionFormat.absoluteDate(row.session.startTime))
++                .font(.caption2)
++                .foregroundStyle(.secondary)
++                .lineLimit(1)
++                .minimumScaleFactor(0.8)
++
++            Spacer(minLength: DesignSystem.Spacing.xs)
++
++            Label {
++                Text(verbatim: CaptureSessionFormat.bytes(row.pcapBytes))
++            } icon: {
++                Image(systemName: "doc.text")
++            }
++            .font(.caption2)
++            .foregroundStyle(.secondary)
++            .lineLimit(1)
++        }
++    }
++
++    private var metricsLine: some View {
++        HStack(spacing: DesignSystem.Spacing.md) {
++            durationMetric
++
++            Label {
++                Text("\(row.requestCount) requests")
++            } icon: {
++                Image(systemName: "list.number")
++            }
++
++            Label {
++                Text(verbatim: CaptureSessionFormat.bytes(row.totalBytes))
++            } icon: {
++                Image(systemName: "arrow.up.arrow.down")
++            }
++        }
++        .font(.caption2)
++        .foregroundStyle(.secondary)
++        .lineLimit(1)
++        .minimumScaleFactor(0.85)
++    }
++
++    /// Recording sessions tick once a second; finished ones are static.
++    @ViewBuilder
++    private var durationMetric: some View {
++        if row.status == .active {
++            TimelineView(.periodic(from: .now, by: 1)) { context in
++                Label {
++                    Text(verbatim: CaptureSessionFormat.duration(row.session.duration(relativeTo: context.date)))
++                } icon: {
++                    Image(systemName: "clock")
++                }
++            }
++        } else {
++            Label {
++                Text(verbatim: CaptureSessionFormat.duration(row.session.duration))
++            } icon: {
++                Image(systemName: "clock")
++            }
++        }
++    }
++
++    private var accessibilityDescription: String {
++        [
++            row.status.title,
++            row.displayTitle,
++            "started \(CaptureSessionFormat.absoluteDate(row.session.startTime)) (\(CaptureSessionFormat.relativeDate(row.session.startTime)))",
++            "duration \(CaptureSessionFormat.duration(row.session.duration))",
++            "\(row.requestCount) requests",
++            "traffic \(CaptureSessionFormat.bytes(row.totalBytes))",
++            "pcap \(CaptureSessionFormat.bytes(row.pcapBytes))",
++        ].joined(separator: ", ")
++    }
++}
++
++// MARK: - Previews
++
++#if DEBUG
++extension CaptureSessionRowModel {
++    static func preview(
++        status: CaptureSessionStatus,
++        startTime: Date = Date().addingTimeInterval(-740),
++        endTime: Date? = Date().addingTimeInterval(-90),
++        endReason: SessionEndReason? = .userStopped
++    ) -> CaptureSessionRowModel {
++        let session = CaptureSession(
++            name: nil,
++            startTime: startTime,
++            endTime: status == .active ? nil : endTime,
++            requestCount: 128,
++            totalDataTransferred: 4_820_000
++        )
++        var configured = session
++        configured.endReason = status == .interrupted ? .interrupted : endReason
++        return CaptureSessionRowModel(
++            session: configured,
++            requestCount: 128,
++            totalBytes: 4_820_000,
++            pcapBytes: 2_310_000,
++            status: status
++        )
++    }
++}
++#endif
++
++#Preview("Session Rows") {
++    List {
++        SessionRowView(row: .preview(status: .active, endTime: nil))
++        SessionRowView(row: .preview(status: .finished))
++        SessionRowView(row: .preview(status: .interrupted))
++    }
++    .listStyle(.insetGrouped)
++}
++
++#Preview("Status Badges") {
++    HStack(spacing: DesignSystem.Spacing.sm) {
++        SessionStatusBadge(status: .active)
++        SessionStatusBadge(status: .finished)
++        SessionStatusBadge(status: .interrupted)
++    }
++    .padding()
++}
+diff --git a/TraceCore/Models/CaptureSession.swift b/TraceCore/Models/CaptureSession.swift
+index 44fba25..c8c49ea 100644
+--- a/TraceCore/Models/CaptureSession.swift
++++ b/TraceCore/Models/CaptureSession.swift
+@@ -7,6 +7,16 @@
+ 
+ import Foundation
+ 
++/// 会话结束原因。
++public enum SessionEndReason: String, Codable, Sendable {
++    /// 用户点停止。
++    case userStopped
++    /// App 正常退出时仍在抓包。
++    case appTerminated
++    /// 上次异常退出，启动时由 `markInterruptedSessions(at:)` 补记。
++    case interrupted
++}
++
+ public struct CaptureSession: Codable, Identifiable, Equatable, Sendable {
+     public let id: UUID
+     public var name: String?
+@@ -14,11 +24,24 @@ public struct CaptureSession: Codable, Identifiable, Equatable, Sendable {
+     public var endTime: Date?
+     public var requestCount: Int
+     public var totalDataTransferred: Int64
++    /// pcap 文件名，相对会话目录（见 `SessionDirectory.directory(for:createdAt:)`）。
++    /// 旧数据没有这个字段，解码时按 `CaptureSession.defaultPCAPFileName` 补齐。
++    public var pcapFileName: String?
++    /// 结束原因；进行中的会话为 `nil`。
++    public var endReason: SessionEndReason?
++
++    /// 新建会话与解码旧数据时使用的默认 pcap 文件名。
++    public static let defaultPCAPFileName = "http.pcap"
+ 
+     public var isActive: Bool {
+         endTime == nil
+     }
+ 
++    /// 是否为上次异常退出后补记的中断会话。
++    public var isInterrupted: Bool {
++        endReason == .interrupted
++    }
++
+     public var duration: TimeInterval {
+         let end = endTime ?? Date()
+         return max(0, end.timeIntervalSince(startTime))
+@@ -85,12 +108,41 @@ public struct CaptureSession: Codable, Identifiable, Equatable, Sendable {
+         durationString(relativeTo: Date())
+     }
+ 
+-    public init(id: UUID = UUID(), name: String? = nil, startTime: Date = Date(), endTime: Date? = nil, requestCount: Int = 0, totalDataTransferred: Int64 = 0) {
++    // swiftlint:disable:next function_parameter_count
++    public init(id: UUID = UUID(), name: String? = nil, startTime: Date = Date(), endTime: Date? = nil, requestCount: Int = 0, totalDataTransferred: Int64 = 0, pcapFileName: String? = CaptureSession.defaultPCAPFileName, endReason: SessionEndReason? = nil) {
+         self.id = id
+         self.name = name
+         self.startTime = startTime
+         self.endTime = endTime
+         self.requestCount = requestCount
+         self.totalDataTransferred = totalDataTransferred
++        self.pcapFileName = pcapFileName
++        self.endReason = endReason
++    }
++
++    // MARK: - Codable
++
++    private enum CodingKeys: String, CodingKey {
++        case id
++        case name
++        case startTime
++        case endTime
++        case requestCount
++        case totalDataTransferred
++        case pcapFileName
++        case endReason
++    }
++
++    /// 逐字段解码：新增字段全部用 `decodeIfPresent` + 默认值，保证旧 payload 仍可读。
++    public init(from decoder: Decoder) throws {
++        let container = try decoder.container(keyedBy: CodingKeys.self)
++        id = try container.decode(UUID.self, forKey: .id)
++        startTime = try container.decode(Date.self, forKey: .startTime)
++        name = try container.decodeIfPresent(String.self, forKey: .name)
++        endTime = try container.decodeIfPresent(Date.self, forKey: .endTime)
++        requestCount = try container.decodeIfPresent(Int.self, forKey: .requestCount) ?? 0
++        totalDataTransferred = try container.decodeIfPresent(Int64.self, forKey: .totalDataTransferred) ?? 0
++        pcapFileName = try container.decodeIfPresent(String.self, forKey: .pcapFileName) ?? Self.defaultPCAPFileName
++        endReason = try container.decodeIfPresent(SessionEndReason.self, forKey: .endReason)
+     }
+ }
+diff --git a/TraceCore/Storage/AppGroupStorage+Sessions.swift b/TraceCore/Storage/AppGroupStorage+Sessions.swift
+index eb80dca..798e15d 100644
+--- a/TraceCore/Storage/AppGroupStorage+Sessions.swift
++++ b/TraceCore/Storage/AppGroupStorage+Sessions.swift
+@@ -7,6 +7,7 @@
+ 
+ import Foundation
+ import GRDB
++import OSLog
+ 
+ public extension AppGroupStorage {
+     func saveSessionsImpl(_ sessions: [CaptureSession]) async throws {
+@@ -35,6 +36,11 @@ public extension AppGroupStorage {
+         } catch {
+             throw mapDatabaseError(error)
+         }
++
++        // 每份会话在会话目录里留一份 meta.json（best-effort，写失败只记日志）。
++        for session in sessions {
++            writeCaptureSessionMetaBestEffort(session)
++        }
+     }
+ 
+     func loadSessionsImpl() async throws -> [CaptureSession] {
+@@ -62,6 +68,7 @@ public extension AppGroupStorage {
+         if !didWrite {
+             throw StorageError.databaseUnavailable
+         }
++        writeCaptureSessionMetaBestEffort(session)
+         CoreLog.storage.debug("event=storage.session_save outcome=success session_id=\(session.id.uuidString, privacy: .public)")
+     }
+ 
+@@ -95,6 +102,9 @@ public extension AppGroupStorage {
+     }
+ 
+     func deleteSession(_ sessionID: UUID) throws {
++        // 目录名带会话开始时间，删库前先取出来；取不到时用当前时间占位，
++        // SessionDirectory.delete 会退回按 uuid 前缀扫描，仍然能删到目录。
++        let startedAt = (try? session(id: sessionID))?.startTime ?? Date()
+         let didWrite = executeDBWrite { db in
+             try db.execute(
+                 sql: "DELETE FROM capture_sessions WHERE id = ?",
+@@ -104,6 +114,7 @@ public extension AppGroupStorage {
+         if !didWrite {
+             throw StorageError.databaseUnavailable
+         }
++        deleteSessionDirectoryBestEffort(sessionID, createdAt: startedAt)
+         CoreLog.storage.debug("event=storage.session_delete outcome=success session_id=\(sessionID.uuidString, privacy: .public)")
+     }
+ 
+@@ -111,3 +122,205 @@ public extension AppGroupStorage {
+         try saveSession(session)
+     }
+ }
++
++// MARK: - 抓包会话：目录、统计与清理
++
++public extension AppGroupStorage {
++    /// 把所有还没结束（`endTime == nil`）的会话补记成「异常中断」。
++    ///
++    /// 幂等：已经带 `endTime` 的会话不会被改动，重复调用只会返回空数组。
++    /// 补记过的会话会顺带刷新 `meta.json`。
++    ///
++    /// - Parameter date: 补记的结束时间（通常是 App 启动时间）。
++    /// - Returns: 本次被标记的会话 id。
++    @discardableResult
++    func markInterruptedSessions(at date: Date) throws -> [UUID] {
++        let marked: [CaptureSession]
++        do {
++            marked = try withDatabase { pool in
++                try pool.write { db -> [CaptureSession] in
++                    let rows = try Row.fetchAll(
++                        db,
++                        sql: """
++                        SELECT payload
++                        FROM capture_sessions
++                        ORDER BY start_time ASC, id ASC
++                        """
++                    )
++                    let decoder = makeDecoder()
++                    let encoder = makeEncoder()
++                    let now = Date().timeIntervalSince1970
++                    var updated: [CaptureSession] = []
++                    updated.reserveCapacity(rows.count)
++                    for row in rows {
++                        let payload: Data = row["payload"]
++                        guard var session = try? decoder.decode(CaptureSession.self, from: payload) else {
++                            continue
++                        }
++                        // 已经结束的会话不是「上次异常退出」，保持原样（幂等的关键）。
++                        guard session.endTime == nil else { continue }
++                        // 在 `date` 之后才开始的会话属于本次运行，不能被补记成中断。
++                        guard session.startTime < date else { continue }
++                        session.endTime = date
++                        session.endReason = .interrupted
++                        guard let encoded = try? encoder.encode(session) else { continue }
++                        try db.execute(
++                            sql: "UPDATE capture_sessions SET payload = ?, updated_at = ? WHERE id = ?",
++                            arguments: [encoded, now, session.id.uuidString]
++                        )
++                        updated.append(session)
++                    }
++                    return updated
++                }
++            }
++        } catch {
++            throw mapDatabaseError(error)
++        }
++
++        for session in marked {
++            writeCaptureSessionMetaBestEffort(session)
++        }
++        if !marked.isEmpty {
++            CoreLog.storage.info("event=storage.session_mark_interrupted outcome=success count=\(marked.count, privacy: .public)")
++        }
++        return marked.map(\.id)
++    }
++
++    /// 按 id 读单个会话；不存在时返回 `nil`。
++    func session(id: UUID) throws -> CaptureSession? {
++        do {
++            return try withDatabase { pool -> CaptureSession? in
++                try pool.read { db -> CaptureSession? in
++                    guard let row = try Row.fetchOne(
++                        db,
++                        sql: "SELECT payload FROM capture_sessions WHERE id = ?",
++                        arguments: [id.uuidString]
++                    ) else {
++                        return nil
++                    }
++                    let payload: Data = row["payload"]
++                    return try? makeDecoder().decode(CaptureSession.self, from: payload)
++                }
++            }
++        } catch {
++            throw mapDatabaseError(error)
++        }
++    }
++
++    /// 更新会话的统计与结束信息，`endTime` / `endReason` 按传入值原样写入（传 `nil` 即清空）。
++    ///
++    /// 会话不存在时抛 `StorageError.fileNotFound`（会话可能在停止回调之前已被删除）。
++    func updateSessionStats(
++        id: UUID,
++        requestCount: Int,
++        totalBytes: Int64,
++        endTime: Date?,
++        endReason: SessionEndReason?
++    ) throws {
++        guard var session = try session(id: id) else {
++            throw StorageError.fileNotFound
++        }
++        session.requestCount = max(0, requestCount)
++        session.totalDataTransferred = max(0, totalBytes)
++        session.endTime = endTime
++        session.endReason = endReason
++        try saveSession(session)
++        CoreLog.storage.info(
++            "event=storage.session_stats_update outcome=success session_id=\(id.uuidString, privacy: .public) requests=\(session.requestCount, privacy: .public) bytes=\(session.totalDataTransferred, privacy: .public) ended=\(endTime != nil, privacy: .public)"
++        )
++    }
++
++    /// 删会话行 + 会话目录（`meta.json`、pcap 一起删）。
++    ///
++    /// 只负责会话本身：`network_requests` 里的请求由请求侧删除（见 `deleteCapturedRequests(forSession:)`
++    /// 或 `AppGroupCaptureStore.deleteSessionAndFiles(_:)`）。
++    /// 会话行删除成功后目录删除失败会抛错，调用方据此可以提示「文件残留」。
++    func deleteSessionAndFiles(_ sessionID: UUID) throws {
++        let startedAt = (try? session(id: sessionID))?.startTime ?? Date()
++        try deleteSession(sessionID)
++        // deleteSession 已经 best-effort 删过一次，这里再删一次把失败暴露给调用方（重复删除是幂等的）。
++        try SessionDirectory.delete(for: sessionID, createdAt: startedAt)
++        CoreLog.storage.info("event=storage.session_delete_with_files outcome=success session_id=\(sessionID.uuidString, privacy: .public)")
++    }
++
++    /// 删会话行 + 会话目录（便捷重载）。
++    func deleteSessionAndFiles(_ session: CaptureSession) throws {
++        try deleteSessionAndFiles(session.id)
++    }
++
++    /// 删掉所有会话行与所有会话目录（用于「清空抓包记录」）。
++    ///
++    /// 注意：不动 `network_requests`，调用方需要先清请求。
++    func deleteAllSessionsAndFiles() throws {
++        let sessions = try loadAllSessions()
++        let didWrite = executeDBWrite { db in
++            try db.execute(sql: "DELETE FROM capture_sessions")
++        }
++        if !didWrite {
++            throw StorageError.databaseUnavailable
++        }
++        for session in sessions {
++            deleteSessionDirectoryBestEffort(session.id, createdAt: session.startTime)
++        }
++        // 库里已经没有会话，剩下的会话目录一律按孤儿清理。
++        for directory in SessionDirectory.orphanDirectories(existing: []) {
++            try? FileManager.default.removeItem(at: directory)
++        }
++        CoreLog.storage.info("event=storage.session_delete_all_with_files outcome=success count=\(sessions.count, privacy: .public)")
++    }
++
++    /// 删除某个会话的全部请求（含请求/响应 body 文件），其他会话的 body 文件不受影响。
++    ///
++    /// - Returns: 删除的请求条数。
++    @discardableResult
++    func deleteCapturedRequests(forSession sessionID: UUID) throws -> Int {
++        do {
++            return try withDatabase { pool -> Int in
++                try pool.write { db -> Int in
++                    let rows = try Row.fetchAll(
++                        db,
++                        sql: "SELECT payload FROM network_requests WHERE session_id = ?",
++                        arguments: [sessionID.uuidString]
++                    )
++                    let decoder = makeDecoder()
++                    for row in rows {
++                        let payload: Data = row["payload"]
++                        guard let request = try? decoder.decode(NetworkRequest.self, from: payload) else { continue }
++                        request.requestBody.deleteFile()
++                        request.responseBody.deleteFile()
++                    }
++                    try db.execute(
++                        sql: "DELETE FROM network_requests WHERE session_id = ?",
++                        arguments: [sessionID.uuidString]
++                    )
++                    return rows.count
++                }
++            }
++        } catch {
++            throw mapDatabaseError(error)
++        }
++    }
++}
++
++// MARK: - 会话目录 best-effort 辅助
++
++/// 写 `meta.json`，失败只记日志：会话的权威数据在 GRDB，meta 只是给用户/排障看的一份快照。
++private func writeCaptureSessionMetaBestEffort(_ session: CaptureSession) {
++    do {
++        try SessionDirectory.writeMeta(session, createdAt: session.startTime)
++    } catch {
++        CoreLog.storage.error(
++            "event=storage.session_meta_write outcome=failure session_id=\(session.id.uuidString, privacy: .public) error=\(String(describing: error), privacy: .public)"
++        )
++    }
++}
++
++private func deleteSessionDirectoryBestEffort(_ sessionID: UUID, createdAt: Date) {
++    do {
++        try SessionDirectory.delete(for: sessionID, createdAt: createdAt)
++    } catch {
++        CoreLog.storage.error(
++            "event=storage.session_directory_delete outcome=failure session_id=\(sessionID.uuidString, privacy: .public) error=\(String(describing: error), privacy: .public)"
++        )
++    }
++}
+diff --git a/TraceCore/Storage/SessionDirectory.swift b/TraceCore/Storage/SessionDirectory.swift
+new file mode 100644
+index 0000000..055a74f
+--- /dev/null
++++ b/TraceCore/Storage/SessionDirectory.swift
+@@ -0,0 +1,234 @@
++//
++//  SessionDirectory.swift
++//  TraceCore
++//
++//  Created by Justin on 2026/11/26.
++//
++
++import Foundation
++import OSLog
++
++/// 抓包会话在 App Group 容器里的落盘目录。
++///
++/// 布局：
++/// ```
++/// <App Group 容器>/Sessions/<yyyyMMdd-HHmmss>-<uuid 前 8 位>/
++///     ├─ http.pcap
++///     └─ meta.json      // 整份 CaptureSession 的 JSON
++/// ```
++///
++/// 目录名里的时间戳固定用 UTC + `en_US_POSIX` 格式化：同一个会话在任何时区、任何地区设置下
++/// 都能算回同一条路径，否则「创建时在 A 时区、删除时在 B 时区」会算出两个目录。
++public struct SessionDirectory {
++    /// 容器下的会话根目录名。
++    public static let rootDirectoryName = "Sessions"
++    /// 元数据文件名。
++    public static let metaFileName = "meta.json"
++
++    private static let idPrefixLength = 8
++    /// 目录名长度：`yyyyMMdd-HHmmss`（15）+ `-`（1）+ uuid 前缀（8）。
++    private static let directoryNameLength = 24
++
++    // MARK: - 路径
++
++    /// 会话根目录：`<App Group 容器>/Sessions`。
++    ///
++    /// App Group 不可用（模拟器/测试/配置错误）时退回临时目录，任何情况下都返回一个可用路径。
++    public static func root() -> URL {
++        if let container = AppGroupStorage.shared.containerURL {
++            return container.appendingPathComponent(rootDirectoryName, isDirectory: true)
++        }
++        return FileManager.default.temporaryDirectory
++            .appendingPathComponent("TraceSessions", isDirectory: true)
++    }
++
++    /// 指定会话的目录：`root()/<yyyyMMdd-HHmmss>-<uuid 前 8 位>`。
++    public static func directory(for id: UUID, createdAt: Date) -> URL {
++        let name = "\(TimestampFormatter.shared.string(from: createdAt))-\(idPrefix(of: id))"
++        return root().appendingPathComponent(name, isDirectory: true)
++    }
++
++    /// 指定会话的目录（便捷重载，`createdAt` 取 `session.startTime`）。
++    public static func directory(for session: CaptureSession) -> URL {
++        directory(for: session.id, createdAt: session.startTime)
++    }
++
++    /// 创建会话目录（含中间目录），返回该目录。已存在时直接返回。
++    @discardableResult
++    public static func create(for id: UUID, createdAt: Date) throws -> URL {
++        let directory = directory(for: id, createdAt: createdAt)
++        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
++        return directory
++    }
++
++    /// 会话目录内某个文件的路径（不保证已存在）。
++    public static func url(for id: UUID, createdAt: Date, fileName: String) -> URL {
++        directory(for: id, createdAt: createdAt).appendingPathComponent(fileName)
++    }
++
++    /// 会话默认 pcap 的路径：`<会话目录>/http.pcap`。
++    public static func pcapURL(for id: UUID, createdAt: Date) -> URL {
++        url(for: id, createdAt: createdAt, fileName: CaptureSession.defaultPCAPFileName)
++    }
++
++    /// 会话 pcap 的路径，遵循 `session.pcapFileName`（缺省 `http.pcap`）。
++    public static func pcapURL(for session: CaptureSession) -> URL {
++        let fileName = session.pcapFileName ?? CaptureSession.defaultPCAPFileName
++        return url(for: session.id, createdAt: session.startTime, fileName: fileName)
++    }
++
++    /// 会话 meta.json 的路径。
++    public static func metaURL(for id: UUID, createdAt: Date) -> URL {
++        url(for: id, createdAt: createdAt, fileName: metaFileName)
++    }
++
++    // MARK: - 元数据
++
++    /// 把整份 `CaptureSession` 写成 `meta.json`（原子写）。
++    ///
++    /// 目录不存在时会先创建，调用方不必预先 `create`。
++    public static func writeMeta(_ session: CaptureSession, createdAt: Date) throws {
++        let directory = try create(for: session.id, createdAt: createdAt)
++        let data: Data
++        do {
++            data = try JSONCoding.makeEncoder().encode(session)
++        } catch {
++            throw StorageError.encodingFailed
++        }
++        try data.write(to: directory.appendingPathComponent(metaFileName), options: .atomic)
++    }
++
++    /// 读回 `meta.json`；文件缺失或内容损坏时返回 `nil`。
++    public static func readMeta(for id: UUID, createdAt: Date) -> CaptureSession? {
++        guard let data = try? Data(contentsOf: metaURL(for: id, createdAt: createdAt)) else {
++            return nil
++        }
++        return try? JSONCoding.makeDecoder().decode(CaptureSession.self, from: data)
++    }
++
++    // MARK: - 体积
++
++    /// 会话目录内所有文件的总字节数（含 meta.json）；目录不存在时返回 0。
++    public static func totalSize(for id: UUID, createdAt: Date) -> Int64 {
++        size(of: directory(for: id, createdAt: createdAt))
++    }
++
++    /// 单个 pcap 文件的字节数；文件不存在时返回 0。
++    public static func pcapSize(for id: UUID, createdAt: Date) -> Int64 {
++        let attributes = try? FileManager.default.attributesOfItem(atPath: pcapURL(for: id, createdAt: createdAt).path)
++        return (attributes?[.size] as? NSNumber)?.int64Value ?? 0
++    }
++
++    // MARK: - 删除
++
++    /// 删除会话目录。目录不存在时静默返回，可重复调用。
++    ///
++    /// 先按当前命名规则精确删除；找不到时再按 uuid 前缀扫一遍，容忍历史/未来命名差异造成的目录名漂移。
++    public static func delete(for id: UUID, createdAt: Date) throws {
++        let fileManager = FileManager.default
++        let directory = directory(for: id, createdAt: createdAt)
++        if fileManager.fileExists(atPath: directory.path) {
++            try fileManager.removeItem(at: directory)
++            return
++        }
++        let matches = sessionDirectories().filter { candidate in
++            idPrefix(fromDirectoryName: candidate.lastPathComponent) == idPrefix(of: id)
++        }
++        for candidate in matches {
++            try fileManager.removeItem(at: candidate)
++        }
++    }
++
++    /// 兜底清理：容器里存在、但库里已经没有对应会话的目录。
++    ///
++    /// 目录名只带 uuid 的前 8 位，因此按前缀比对（同前缀碰撞概率可忽略）。
++    /// 名字不符合 `<时间戳>-<uuid 前 8 位>` 的目录不会被返回，避免误删别的东西。
++    public static func orphanDirectories(existing: Set<UUID>) -> [URL] {
++        let knownPrefixes = Set(existing.map { idPrefix(of: $0) })
++        return sessionDirectories().filter { directory in
++            guard let prefix = idPrefix(fromDirectoryName: directory.lastPathComponent) else {
++                return false
++            }
++            return !knownPrefixes.contains(prefix)
++        }
++    }
++
++    // MARK: - 内部实现
++
++    private static func size(of directory: URL) -> Int64 {
++        let fileManager = FileManager.default
++        guard fileManager.fileExists(atPath: directory.path) else {
++            return 0
++        }
++        let keys: Set<URLResourceKey> = [.isRegularFileKey, .fileSizeKey]
++        guard let enumerator = fileManager.enumerator(
++            at: directory,
++            includingPropertiesForKeys: Array(keys),
++            options: [.skipsHiddenFiles]
++        ) else {
++            return 0
++        }
++        var total: Int64 = 0
++        for case let fileURL as URL in enumerator {
++            guard let values = try? fileURL.resourceValues(forKeys: keys), values.isRegularFile == true else {
++                continue
++            }
++            total += Int64(values.fileSize ?? 0)
++        }
++        return total
++    }
++
++    /// `root()` 下的所有子目录；根目录不存在时返回空数组。
++    private static func sessionDirectories() -> [URL] {
++        let fileManager = FileManager.default
++        guard let entries = try? fileManager.contentsOfDirectory(
++            at: root(),
++            includingPropertiesForKeys: [.isDirectoryKey],
++            options: [.skipsHiddenFiles]
++        ) else {
++            return []
++        }
++        return entries.filter { entry in
++            (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
++        }
++    }
++
++    private static func idPrefix(of id: UUID) -> String {
++        String(id.uuidString.prefix(idPrefixLength)).lowercased()
++    }
++
++    /// 从目录名 `<yyyyMMdd-HHmmss>-<uuid 前 8 位>` 取出 uuid 前缀；格式不符返回 `nil`。
++    private static func idPrefix(fromDirectoryName name: String) -> String? {
++        guard name.count == directoryNameLength, let separator = name.lastIndex(of: "-") else {
++            return nil
++        }
++        let prefix = name[name.index(after: separator)...]
++        guard prefix.count == idPrefixLength, prefix.allSatisfy({ $0.isHexDigit }) else {
++            return nil
++        }
++        return prefix.lowercased()
++    }
++
++    /// `DateFormatter` 不是 Sendable，用锁包一层（同 `JSONCoding.DateParser` 的做法），
++    /// 既让 `static let` 在 Swift 6 语言模式下合法，也保证多线程格式化安全。
++    private final class TimestampFormatter: @unchecked Sendable {
++        static let shared = TimestampFormatter()
++
++        private let lock = NSLock()
++        private let formatter: DateFormatter
++
++        init() {
++            let formatter = DateFormatter()
++            formatter.locale = Locale(identifier: "en_US_POSIX")
++            formatter.timeZone = TimeZone(secondsFromGMT: 0)
++            formatter.dateFormat = "yyyyMMdd-HHmmss"
++            self.formatter = formatter
++        }
++
++        func string(from date: Date) -> String {
++            lock.lock()
++            defer { lock.unlock() }
++            return formatter.string(from: date)
++        }
++    }
++}
+diff --git a/TraceProxy/Core/PCAPWriter.swift b/TraceProxy/Core/PCAPWriter.swift
+index 0472ce0..9cb14cc 100644
+--- a/TraceProxy/Core/PCAPWriter.swift
++++ b/TraceProxy/Core/PCAPWriter.swift
+@@ -15,6 +15,8 @@ public protocol PCAPWriting: AnyObject, Sendable {
+     func currentFileSize() -> UInt64
+     func close()
+     var supportsRolling: Bool { get }
++    /// Whether `close()` already ran. Lets owners reuse a writer only while it is still open.
++    var isClosed: Bool { get }
+ }
+ 
+ public extension PCAPWriting {
+@@ -23,6 +25,10 @@ public extension PCAPWriting {
+             writePacket(packet)
+         }
+     }
++
++    var isClosed: Bool {
++        false
++    }
+ }
+ 
+ /// Defines errors thrown when creating a PCAP writer.
+@@ -31,40 +37,84 @@ public enum PCAPWriterError: Error {
+     case cannotOpenFile
+ }
+ 
+-/// Writes an append-only PCAP file stored in the app group container.
++/// How an existing PCAP file at the target URL is treated when a writer opens it.
++public enum PCAPFileMode: Sendable, Equatable {
++    /// Discard whatever the file holds and start a fresh capture.
++    ///
++    /// Used when a writer opens the unique file of a capture session for the first time, so a
++    /// stale file can never leak into a new record.
++    case newSession
++
++    /// Keep the records already on disk and continue after them.
++    ///
++    /// Only valid when the URL belongs to the capture session being written: each session owns its
++    /// own directory and file name, so "continue" can never concatenate a previous session's history.
++    case continueSession
++}
++
++/// Writes an append-only PCAP file, either in the app group container or at an explicit URL.
+ /// - Important: Writes are serialized on an internal queue to keep packet records contiguous.
+ public final class PCAPWriter: PCAPWriting, @unchecked Sendable {
+     private let queue = DispatchQueue(label: "pcap.writer.queue", qos: .utility)
+     private let queueKey = DispatchSpecificKey<Void>()
+     private let handle: FileHandle
+     private let fileURL: URL
+-    private var isClosed = false
++    private let stateLock = NSLock()
++    private var closedState = false
+ 
+     /// Creates or opens a PCAP file and writes the global header if the file is empty.
+     /// - Parameters:
+     ///   - appGroupID: App group identifier where the PCAP file is stored.
+     ///   - fileName: File name relative to the app group container.
+-    public init(appGroupID: String, fileName: String) throws {
++    ///   - mode: Whether an existing file is kept (legacy behaviour) or replaced.
++    public convenience init(appGroupID: String, fileName: String, mode: PCAPFileMode = .continueSession) throws {
+         guard let dir = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID) else {
+             throw PCAPWriterError.appGroupMissing
+         }
+         let url = dir.appendingPathComponent(fileName)
+-        self.fileURL = url
++        try self.init(fileURL: url, mode: mode)
++    }
++
++    /// Creates or opens a PCAP file at an explicit URL (for example `SessionDirectory.pcapURL`).
++    /// - Parameters:
++    ///   - fileURL: Target file. Missing parent directories are created.
++    ///   - mode: `.newSession` truncates the file, `.continueSession` appends to it.
++    public init(fileURL: URL, mode: PCAPFileMode = .newSession) throws {
++        self.fileURL = fileURL
+         queue.setSpecific(key: queueKey, value: ())
+ 
+-        if !FileManager.default.fileExists(atPath: url.path) {
+-            FileManager.default.createFile(atPath: url.path, contents: nil)
++        let parent = fileURL.deletingLastPathComponent()
++        if !FileManager.default.fileExists(atPath: parent.path) {
++            try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
++        }
++
++        switch mode {
++        case .newSession:
++            if FileManager.default.fileExists(atPath: fileURL.path) {
++                try? FileManager.default.removeItem(at: fileURL)
++            }
++        case .continueSession:
++            break
++        }
++
++        if !FileManager.default.fileExists(atPath: fileURL.path) {
++            FileManager.default.createFile(atPath: fileURL.path, contents: nil)
+         }
+-        guard let h = try? FileHandle(forWritingTo: url) else {
++        guard let h = try? FileHandle(forWritingTo: fileURL) else {
+             throw PCAPWriterError.cannotOpenFile
+         }
+         self.handle = h
+ 
+-        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue ?? 0
++        let size = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?.intValue ?? 0
+         if size == 0 {
+             try writeGlobalHeader()
+-        } else {
++        } else if mode == .continueSession {
++            // Same session, same file: keep the records already written.
+             try handle.seekToEnd()
++        } else {
++            // Defensive: a truncating open must start with a header.
++            try handle.truncate(atOffset: 0)
++            try writeGlobalHeader()
+         }
+     }
+ 
+@@ -113,9 +163,23 @@ public final class PCAPWriter: PCAPWriting, @unchecked Sendable {
+         false
+     }
+ 
++    public var isClosed: Bool {
++        stateLock.lock()
++        defer { stateLock.unlock() }
++        return closedState
++    }
++
++    /// The file this writer owns and appends to.
++    public var url: URL {
++        fileURL
++    }
++
+     private func closeLocked() {
+-        guard !isClosed else { return }
+-        isClosed = true
++        stateLock.lock()
++        let alreadyClosed = closedState
++        closedState = true
++        stateLock.unlock()
++        guard !alreadyClosed else { return }
+         try? handle.close()
+     }
+ 
+diff --git a/TraceProxy/Core/RollingPCAPWriter.swift b/TraceProxy/Core/RollingPCAPWriter.swift
+index 772a642..dfdd64f 100644
+--- a/TraceProxy/Core/RollingPCAPWriter.swift
++++ b/TraceProxy/Core/RollingPCAPWriter.swift
+@@ -6,30 +6,69 @@
+ //
+ 
+ import Foundation
++import TraceCore
+ 
+-/// Writes packet captures to a rolling set of PCAP files in the app group container.
++/// Writes packet captures to a rolling set of PCAP files, either in the app group container or at an explicit URL.
+ public final class RollingPCAPWriter: PCAPWriting, @unchecked Sendable {
+     private let queue = DispatchQueue(label: "pcap.writer.rolling.queue", qos: .utility)
+-    private let appGroupID: String
+     private let fileName: String
+     private let maxFileSize: UInt64
+     private let maxFiles: Int
++    private let mode: PCAPFileMode
++    private let stateLock = NSLock()
+     private var handle: FileHandle?
+     private var fileURL: URL?
+     private var currentSize: UInt64 = 0
++    private var closedState = false
+ 
+-    /// Creates a rolling PCAP writer.
++    /// Creates a rolling PCAP writer in the app group container.
+     /// - Parameters:
+     ///   - appGroupID: App group identifier where the PCAP files are stored.
+     ///   - fileName: Base PCAP file name (active writer).
+     ///   - maxFileSize: Max size per PCAP file in bytes before rotation.
+     ///   - maxFiles: Number of rotated files to keep (including the active file).
+-    public init(appGroupID: String, fileName: String, maxFileSize: UInt64, maxFiles: Int) throws {
+-        self.appGroupID = appGroupID
+-        self.fileName = fileName
++    ///   - mode: Whether an existing file is kept (legacy behaviour) or replaced.
++    public convenience init(
++        appGroupID: String,
++        fileName: String,
++        maxFileSize: UInt64,
++        maxFiles: Int,
++        mode: PCAPFileMode = .continueSession
++    ) throws {
++        guard let container = FileManager.default.containerURL(
++            forSecurityApplicationGroupIdentifier: appGroupID
++        ) else {
++            throw PCAPWriterError.appGroupMissing
++        }
++        try self.init(
++            fileURL: container.appendingPathComponent(fileName),
++            maxFileSize: maxFileSize,
++            maxFiles: maxFiles,
++            mode: mode
++        )
++    }
++
++    /// Creates a rolling PCAP writer at an explicit URL (for example a capture session directory).
++    /// - Parameters:
++    ///   - fileURL: Active PCAP file. Rotated files land next to it. Missing parent directories are created.
++    ///   - maxFileSize: Max size per PCAP file in bytes before rotation.
++    ///   - maxFiles: Number of rotated files to keep (including the active file).
++    ///   - mode: `.newSession` truncates the active file, `.continueSession` appends to it.
++    public init(
++        fileURL: URL,
++        maxFileSize: UInt64,
++        maxFiles: Int,
++        mode: PCAPFileMode = .newSession
++    ) throws {
++        self.fileName = fileURL.lastPathComponent
+         self.maxFileSize = maxFileSize
+         self.maxFiles = max(1, maxFiles)
+-        try openWriter()
++        self.mode = mode
++        let parent = fileURL.deletingLastPathComponent()
++        if !FileManager.default.fileExists(atPath: parent.path) {
++            try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
++        }
++        try openWriter(at: fileURL)
+     }
+ 
+     deinit {
+@@ -42,7 +81,7 @@ public final class RollingPCAPWriter: PCAPWriting, @unchecked Sendable {
+ 
+     public func writePackets(_ packets: [Data]) {
+         queue.async { [weak self] in
+-            guard let self, !packets.isEmpty else { return }
++            guard let self, !self.isClosed, !packets.isEmpty else { return }
+             for packet in packets {
+                 let recordSize = UInt64(16 + packet.count)
+                 if self.maxFileSize > 0, self.currentSize + recordSize > self.maxFileSize {
+@@ -65,6 +104,9 @@ public final class RollingPCAPWriter: PCAPWriting, @unchecked Sendable {
+             handle = nil
+             fileURL = nil
+             currentSize = 0
++            stateLock.lock()
++            closedState = true
++            stateLock.unlock()
+         }
+     }
+ 
+@@ -72,14 +114,16 @@ public final class RollingPCAPWriter: PCAPWriting, @unchecked Sendable {
+         true
+     }
+ 
+-    private func openWriter() throws {
+-        guard let container = FileManager.default.containerURL(
+-            forSecurityApplicationGroupIdentifier: appGroupID
+-        ) else {
+-            throw PCAPWriterError.appGroupMissing
+-        }
++    public var isClosed: Bool {
++        stateLock.lock()
++        defer { stateLock.unlock() }
++        return closedState
++    }
+ 
+-        let url = container.appendingPathComponent(fileName)
++    private func openWriter(at url: URL) throws {
++        if mode == .newSession, FileManager.default.fileExists(atPath: url.path) {
++            try? FileManager.default.removeItem(at: url)
++        }
+         fileURL = url
+ 
+         if !FileManager.default.fileExists(atPath: url.path) {
+@@ -97,9 +141,13 @@ public final class RollingPCAPWriter: PCAPWriting, @unchecked Sendable {
+             try writeGlobalHeader()
+             currentSize = UInt64(MemoryLayout<PCAPGlobalHeader>.size)
+         } else {
++            // Only reached for `.continueSession`, where the URL belongs to the capture being written.
+             try handle.seekToEnd()
+             currentSize = size
+         }
++        stateLock.lock()
++        closedState = false
++        stateLock.unlock()
+     }
+ 
+     private func rotateFiles() {
+@@ -111,7 +159,7 @@ public final class RollingPCAPWriter: PCAPWriting, @unchecked Sendable {
+         let maxRotations = max(0, maxFiles - 1)
+         if maxRotations == 0 {
+             try? FileManager.default.removeItem(at: currentURL)
+-            try? openWriter()
++            try? openWriter(at: currentURL)
+             return
+         }
+         let oldest = container.appendingPathComponent(rotateName(maxRotations))
+@@ -134,7 +182,7 @@ public final class RollingPCAPWriter: PCAPWriting, @unchecked Sendable {
+         }
+         try? FileManager.default.moveItem(at: currentURL, to: firstRotation)
+ 
+-        try? openWriter()
++        try? openWriter(at: currentURL)
+         ProxyLog.metrics.info(
+             "event=pcap.rollover outcome=success file=\(firstRotation.lastPathComponent, privacy: .public)"
+         )
+diff --git a/TraceVPN/Providers/CaptureSessionCoordinator.swift b/TraceVPN/Providers/CaptureSessionCoordinator.swift
+new file mode 100644
+index 0000000..c3e6e01
+--- /dev/null
++++ b/TraceVPN/Providers/CaptureSessionCoordinator.swift
+@@ -0,0 +1,272 @@
++//
++//  CaptureSessionCoordinator.swift
++//  TraceVPN
++//
++//  Created by Justin on 2026/03/18.
++//
++
++import Foundation
++import OSLog
++import TraceCore
++import TraceProxy
++
++/// Owns the capture-session identity inside the VPN extension.
++///
++/// Discussion: A capture session belongs to one run of the tunnel. The app creates the session in
++/// `CaptureViewModel.startNewSession()` immediately before it asks `VPNManager` to start the tunnel,
++/// and this coordinator adopts that row so every PCAP file lands in
++/// `SessionDirectory.directory(for:createdAt:)`. The extension also covers the runs the app never
++/// sees (widget / Quick Action / system start): when no open session exists it creates one.
++///
++/// Ownership rules:
++/// - One coordinator per `PacketTunnelProvider`, so one session per tunnel run.
++/// - PCAP files are opened per session directory. A writer that already wrote to a file of the
++///   current session may continue it; a new session always starts from an empty file.
++/// - Finalising is idempotent: if the app already wrote `endTime` / `endReason`, the extension only
++///   refreshes the statistics.
++final class CaptureSessionCoordinator: @unchecked Sendable {
++    /// Identifies the session whose directory receives this run's PCAP files.
++    struct SessionRef: Equatable, Sendable {
++        let id: UUID
++        let createdAt: Date
++    }
++
++    /// The session's primary PCAP (HTTP-level capture), matching `CaptureSession.pcapFileName`.
++    static let primaryPCAPFileName = CaptureSession.defaultPCAPFileName
++    /// Raw packet capture used when the tunnel routes packets itself.
++    static let packetPCAPFileName = "packets.pcap"
++
++    private let lock = NSLock()
++    private var session: SessionRef?
++    private var writers: [String: PCAPWriting] = [:]
++    private let storage: AppGroupStorage
++
++    init(storage: AppGroupStorage = .shared) {
++        self.storage = storage
++    }
++
++    /// The session this tunnel run writes to, if `begin()` already resolved one.
++    var currentSession: SessionRef? {
++        lock.lock()
++        defer { lock.unlock() }
++        return session
++    }
++
++    // MARK: - Lifecycle
++
++    /// Resolves the session for this tunnel run: adopts the session the app just created, or creates one.
++    /// - Parameter date: Reference time, injectable for tests.
++    /// - Returns: The session reference, or `nil` when the session directory could not be prepared.
++    @discardableResult
++    func begin(at date: Date = Date()) -> SessionRef? {
++        lock.lock()
++        if let existing = session {
++            lock.unlock()
++            return existing
++        }
++        lock.unlock()
++
++        let resolved: SessionRef?
++        if let adopted = adoptPendingSession() {
++            resolved = adopted
++            VPNLog.tunnel.info(
++                "event=vpn.capture_session outcome=adopted session_id=\(adopted.id.uuidString, privacy: .public)"
++            )
++        } else {
++            resolved = createSession(now: date)
++        }
++
++        guard let resolved else { return nil }
++        lock.lock()
++        session = resolved
++        lock.unlock()
++        return resolved
++    }
++
++    /// The PCAP writer for `fileName` inside the current session, opened on first use and reused afterwards.
++    /// - Parameter fileName: File name relative to the session directory.
++    /// - Returns: `nil` when no session is active or the file cannot be opened.
++    func writer(fileName: String) -> PCAPWriting? {
++        guard let ref = currentSession else {
++            VPNLog.tunnel.error("event=vpn.pcap_writer_start outcome=skipped reason=no_capture_session")
++            return nil
++        }
++        let key = "\(ref.id.uuidString)/\(fileName)"
++
++        lock.lock()
++        defer { lock.unlock() }
++        if let existing = writers[key] {
++            guard existing.isClosed else { return existing }
++            writers[key] = nil
++        }
++
++        let url: URL
++        if fileName == Self.primaryPCAPFileName {
++            url = SessionDirectory.pcapURL(for: ref.id, createdAt: ref.createdAt)
++        } else {
++            url = SessionDirectory.url(for: ref.id, createdAt: ref.createdAt, fileName: fileName)
++        }
++        // A file that already holds this session's records is continued; anything else starts empty.
++        let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?
++            .uint64Value ?? 0
++        let mode: PCAPFileMode = fileSize > 0 ? .continueSession : .newSession
++        do {
++            let writer = try PCAPWriter(fileURL: url, mode: mode)
++            writers[key] = writer
++            VPNLog.tunnel.info(
++                "event=vpn.pcap_writer_enabled outcome=success session_id=\(ref.id.uuidString, privacy: .public) file=\(fileName, privacy: .public) mode=\(String(describing: mode), privacy: .public)"
++            )
++            return writer
++        } catch {
++            VPNLog.tunnel.error(
++                "event=vpn.pcap_writer_start outcome=failure session_id=\(ref.id.uuidString, privacy: .public) file=\(fileName, privacy: .public) error=\(String(describing: error), privacy: .public)"
++            )
++            return nil
++        }
++    }
++
++    /// Closes every PCAP writer this coordinator handed out.
++    func closeWriters() {
++        lock.lock()
++        let openWriters = writers
++        writers.removeAll()
++        lock.unlock()
++        for writer in openWriters.values {
++            writer.close()
++        }
++    }
++
++    /// Ends the session for this tunnel run and persists `endTime`, `endReason` and the traffic totals.
++    ///
++    /// - Important: Never overwrites an `endTime` / `endReason` the app already wrote (the user
++    ///   pressing Stop wins); only the statistics are refreshed.
++    @discardableResult
++    func finalize(endReason: SessionEndReason, at date: Date = Date()) -> CaptureSession? {
++        guard let ref = currentSession else {
++            closeWriters()
++            return nil
++        }
++
++        // Flush packet buffers before the file sizes are reported anywhere.
++        closeWriters()
++
++        let stored = loadSession(id: ref.id)
++        var updated = stored ?? CaptureSession(id: ref.id, startTime: ref.createdAt)
++        let stats = requestStats(for: ref)
++        let alreadyEnded = updated.endTime != nil
++
++        updated.requestCount = stats.requestCount
++        updated.totalDataTransferred = stats.totalBytes
++        if updated.endTime == nil {
++            updated.endTime = date
++            updated.endReason = endReason
++        }
++
++        do {
++            try storage.updateSessionStats(
++                id: ref.id,
++                requestCount: updated.requestCount,
++                totalBytes: updated.totalDataTransferred,
++                endTime: updated.endTime,
++                endReason: updated.endReason
++            )
++            // Point the record at the file that actually holds this session's packets.
++            let resolvedPCAPName = resolvePCAPFileName(for: ref)
++            if updated.pcapFileName != resolvedPCAPName {
++                updated.pcapFileName = resolvedPCAPName
++                try? storage.saveSession(updated)
++            }
++            try? SessionDirectory.writeMeta(updated, createdAt: ref.createdAt)
++            VPNLog.tunnel.info(
++                "event=vpn.capture_session outcome=ended session_id=\(ref.id.uuidString, privacy: .public) reason=\((updated.endReason ?? endReason).rawValue, privacy: .public) request_count=\(updated.requestCount) bytes=\(updated.totalDataTransferred) already_ended=\(alreadyEnded)"
++            )
++        } catch {
++            VPNLog.tunnel.error(
++                "event=vpn.capture_session outcome=finalize_failure session_id=\(ref.id.uuidString, privacy: .public) error=\(String(describing: error), privacy: .public)"
++            )
++        }
++
++        lock.lock()
++        session = nil
++        lock.unlock()
++        return updated
++    }
++
++    // MARK: - Helpers
++
++    /// Takes over the session the app created right before starting the tunnel, if there is one.
++    ///
++    /// The session a run belongs to is "the newest record without an end time". The app applies
++    /// exactly the same rule, so both sides agree without a hand-shake, and a tunnel restart
++    /// during a capture keeps writing to the same session instead of opening a second one.
++    private func adoptPendingSession() -> SessionRef? {
++        guard let sessions = try? storage.loadAllSessions() else { return nil }
++        // `loadAllSessions()` is ordered by start time, newest first.
++        guard let candidate = sessions.first(where: \.isActive) else { return nil }
++
++        // The app prepares the session directory; create it defensively for records that predate it.
++        let directory = SessionDirectory.directory(for: candidate.id, createdAt: candidate.startTime)
++        if !FileManager.default.fileExists(atPath: directory.path) {
++            _ = try? SessionDirectory.create(for: candidate.id, createdAt: candidate.startTime)
++            try? SessionDirectory.writeMeta(candidate, createdAt: candidate.startTime)
++        }
++        return SessionRef(id: candidate.id, createdAt: candidate.startTime)
++    }
++
++    /// Creates the session for runs the app did not announce (widget, Quick Action, system start).
++    private func createSession(now: Date) -> SessionRef? {
++        let newSession = CaptureSession(startTime: now)
++        do {
++            _ = try SessionDirectory.create(for: newSession.id, createdAt: newSession.startTime)
++            try storage.saveSession(newSession)
++            try? SessionDirectory.writeMeta(newSession, createdAt: newSession.startTime)
++            VPNLog.tunnel.info(
++                "event=vpn.capture_session outcome=created session_id=\(newSession.id.uuidString, privacy: .public) reason=no_pending_session"
++            )
++            return SessionRef(id: newSession.id, createdAt: newSession.startTime)
++        } catch {
++            VPNLog.tunnel.error(
++                "event=vpn.capture_session outcome=create_failure error=\(String(describing: error), privacy: .public)"
++            )
++            return nil
++        }
++    }
++
++    private func loadSession(id: UUID) -> CaptureSession? {
++        if let session = try? storage.session(id: id) {
++            return session
++        }
++        return (try? storage.loadAllSessions())?.first { $0.id == id }
++    }
++
++    /// Picks the file that holds this session's packets, preferring the HTTP-level capture.
++    private func resolvePCAPFileName(for ref: SessionRef) -> String {
++        let candidates = [Self.primaryPCAPFileName, Self.packetPCAPFileName]
++        for name in candidates {
++            let url = SessionDirectory.url(for: ref.id, createdAt: ref.createdAt, fileName: name)
++            let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?
++                .uint64Value ?? 0
++            if size > 0 {
++                return name
++            }
++        }
++        return Self.primaryPCAPFileName
++    }
++
++    /// Totals for the session, derived from the stored requests of that session.
++    ///
++    /// Only requests recorded since the session started are read, which keeps the work small
++    /// inside the memory-constrained extension.
++    private func requestStats(for ref: SessionRef) -> (requestCount: Int, totalBytes: Int64) {
++        guard let requests = try? storage.loadRequests(newerThan: ref.createdAt) else {
++            return (0, 0)
++        }
++        var count = 0
++        var bytes: Int64 = 0
++        for request in requests where request.sessionId == ref.id {
++            count += 1
++            bytes += Int64(request.responseSize ?? 0)
++        }
++        return (count, bytes)
++    }
++}
+diff --git a/TraceVPN/Providers/PacketTunnelProvider+Messaging.swift b/TraceVPN/Providers/PacketTunnelProvider+Messaging.swift
+index 6f6a038..32556a0 100644
+--- a/TraceVPN/Providers/PacketTunnelProvider+Messaging.swift
++++ b/TraceVPN/Providers/PacketTunnelProvider+Messaging.swift
+@@ -383,36 +383,24 @@ extension PacketTunnelProvider {
+ 
+     func createPCAPWriterIfNeeded(enabled: Bool) async -> PCAPWriting? {
+         guard enabled else { return nil }
+-        do {
+-            let writer = try PCAPWriter(
+-                appGroupID: AppGroupConfiguration.appGroupIdentifier,
+-                fileName: "capture_http2_proxy.pcap"
+-            )
+-            VPNLog.tunnel.info("event=vpn.pcap_writer_enabled outcome=success")
+-            return writer
+-        } catch {
+-            VPNLog.tunnel.error(
+-                "event=vpn.pcap_writer_start outcome=failure error=\(String(describing: error), privacy: .public)"
+-            )
++        guard let writer = captureSessionCoordinator.writer(
++            fileName: CaptureSessionCoordinator.primaryPCAPFileName
++        ) else {
++            VPNLog.tunnel.error("event=vpn.pcap_writer_start outcome=failure reason=no_capture_session")
+             return nil
+         }
++        return writer
+     }
+ 
+     func createPacketCaptureWriterIfNeeded(enabled: Bool) -> PCAPWriting? {
+         guard enabled else { return nil }
+-        do {
+-            let writer = try PCAPWriter(
+-                appGroupID: AppGroupConfiguration.appGroupIdentifier,
+-                fileName: "capture_raw_packets.pcap"
+-            )
+-            VPNLog.tunnel.info("event=vpn.packet_capture_writer_enabled outcome=success")
+-            return writer
+-        } catch {
+-            VPNLog.tunnel.error(
+-                "event=vpn.packet_capture_writer_start outcome=failure error=\(String(describing: error), privacy: .public)"
+-            )
++        guard let writer = captureSessionCoordinator.writer(
++            fileName: CaptureSessionCoordinator.packetPCAPFileName
++        ) else {
++            VPNLog.tunnel.error("event=vpn.packet_capture_writer_start outcome=failure reason=no_capture_session")
+             return nil
+         }
++        return writer
+     }
+ 
+     func initializeEventLog(mode: CaptureMode) async {
+diff --git a/TraceVPN/Providers/PacketTunnelProvider.swift b/TraceVPN/Providers/PacketTunnelProvider.swift
+index 0eb8a2b..85ee2d3 100644
+--- a/TraceVPN/Providers/PacketTunnelProvider.swift
++++ b/TraceVPN/Providers/PacketTunnelProvider.swift
+@@ -108,6 +108,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
+     /// Encapsulates mutable runtime state (proxy server, raw capture, throttling).
+     let runtimeState = PacketTunnelRuntimeState()
+     let captureRuntimeController = CaptureRuntimeController()
++
++    /// Owns the capture session and the per-session PCAP files of this tunnel run.
++    let captureSessionCoordinator = CaptureSessionCoordinator()
+     let completionQueue = DispatchQueue(label: "com.trace.vpn.completion")
+     let eventLogQueue = DispatchQueue(label: "com.trace.vpn.eventlog")
+     let addressResolutionQueue = DispatchQueue(label: "com.trace.vpn.address_resolution", qos: .utility)
+@@ -239,6 +242,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
+         let captureConfig = runtimeConfiguration.capture
+         currentCaptureMode = runtimeConfiguration.captureMode
+ 
++        // Rule: a capture session only exists while the tunnel actually runs. The app creates the
++        // session right before it starts the tunnel; adopt it here so every PCAP file of this run
++        // lands in that session's directory. Runs the app never saw (widget, Quick Action, system
++        // start) get a session created on their behalf.
++        let captureSession = captureSessionCoordinator.begin()
++        if let captureSession {
++            VPNLog.tunnel.info(
++                "event=vpn.capture_session outcome=ready session_id=\(captureSession.id.uuidString, privacy: .public)"
++            )
++        } else {
++            VPNLog.tunnel.error("event=vpn.capture_session outcome=unavailable")
++        }
++
+         await HardeningConfig.shared.logCurrentConfig()
+ 
+         await syncCaptureSettings(using: runtimeConfiguration)
+@@ -412,6 +428,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
+                 )
+                 await self.runtimeState.stopPacketFlow()
+                 await self.runtimeState.stopProxyServer()
++                self.captureSessionCoordinator.finalize(
++                    endReason: Self.sessionEndReason(for: reason)
++                )
+                 await self.runtimeState.closeEventLog()
+                 self.eventLogQueue.sync {
+                     self.eventLogWriter = nil
+@@ -433,6 +452,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
+         VPNLog.tunnel.info("event=vpn.tunnel_deinit uptime_seconds=\(Int(uptime)) reason=deallocated")
+     }
+ 
++    /// Maps the system stop reason onto the reason recorded on the capture session.
++    ///
++    /// Only a stop the user asked for counts as `userStopped`; everything else (provider failure,
++    /// system shutdown, app gone) is recorded as `appTerminated`. `interrupted` is never set here:
++    /// it is written by `markInterruptedSessions` on the next app launch.
++    private static func sessionEndReason(for reason: NEProviderStopReason) -> SessionEndReason {
++        switch reason {
++        case .userInitiated:
++            return .userStopped
++        default:
++            return .appTerminated
++        }
++    }
++
+     /// Called when the system is about to terminate the extension.
+     override func cancelTunnelWithError(_ error: Error?) {
+         let uptime = Date().timeIntervalSince(extensionStartTime)
+@@ -455,6 +488,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
+                     msg: "error=\(String(describing: error)) uptime_seconds=\(Int(uptime)) connections=\(connectionCount) phys=\(mem?.physFootprintBytes ?? 0) resident=\(mem?.residentBytes ?? 0)"
+                 )
+                 await runtimeState.stopPacketFlow()
++                captureSessionCoordinator.finalize(endReason: .appTerminated)
+                 eventLogQueue.sync {
+                     eventLogWriter?.close()
+                     eventLogWriter = nil
+@@ -478,6 +512,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
+                     msg: "uptime_seconds=\(Int(uptime)) connections=\(connectionCount) phys=\(mem?.physFootprintBytes ?? 0) resident=\(mem?.residentBytes ?? 0)"
+                 )
+                 await runtimeState.stopPacketFlow()
++                captureSessionCoordinator.finalize(endReason: .appTerminated)
+                 eventLogQueue.sync {
+                     eventLogWriter?.close()
+                     eventLogWriter = nil
