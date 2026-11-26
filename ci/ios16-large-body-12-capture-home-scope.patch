@@ -1,0 +1,356 @@
+diff --git a/Trace/ViewModels/CaptureViewModel.swift b/Trace/ViewModels/CaptureViewModel.swift
+index 763dc0c..5831418 100644
+--- a/Trace/ViewModels/CaptureViewModel.swift
++++ b/Trace/ViewModels/CaptureViewModel.swift
+@@ -688,23 +688,26 @@ final class CaptureViewModel: ObservableObject {
+             )
+ 
+             do {
+-                let sessionForAttribution = await MainActor.run { self.currentSession }
++                guard let sessionForAttribution = self.displayedSession else {
++                    self.requests = []
++                    self.requestIDSet = []
++                    self.lastRequestFullReloadTime = nil
++                    self.requestIncrementalLoadsSinceFullReload = 0
++                    return
++                }
++                let scope = CaptureHomeScope(
++                    sessionID: sessionForAttribution.id,
++                    startTime: sessionForAttribution.startTime,
++                    endTime: sessionForAttribution.endTime
++                )
+ 
+                 if shouldRunFullReload {
+-                    let visibleSessionID = await MainActor.run { self.displayedSessionID }
+-                    var loadedRequests: [NetworkRequest]
+-                    if let visibleSessionID {
+-                        let storage = self.storage
+-                        loadedRequests = try await Task.detached(priority: .userInitiated) {
+-                            try storage.loadRequestsForSession(visibleSessionID)
+-                        }.value
+-                    } else {
+-                        loadedRequests = []
+-                    }
++                    // New captures initially have no session ID. Read the time window first,
++                    // then attribute only unassigned requests belonging to this run.
++                    var loadedRequests = try await self.storage.loadRequestsAsync(newerThan: scope.startTime)
++                    guard !Task.isCancelled, self.displayedSession?.id == scope.sessionID else { return }
++                    loadedRequests = loadedRequests.filter { scope.contains(timestamp: $0.timestamp, sessionID: $0.sessionId) }
+                     loadedRequests = self.assignCurrentSession(to: loadedRequests, session: sessionForAttribution)
+-                    if let visibleSessionID {
+-                        loadedRequests = loadedRequests.filter { $0.sessionId == visibleSessionID }
+-                    }
+                     loadedRequests = self.optimizeRequestsForList(loadedRequests)
+                     loadedRequests.sort { $0.timestamp > $1.timestamp }
+ 
+@@ -714,7 +717,7 @@ final class CaptureViewModel: ObservableObject {
+                     self.lastRequestFullReloadTime = Date()
+                     self.requestIncrementalLoadsSinceFullReload = 0
+                     CoreLog.storage.info(
+-                        "event=storage.requests_load outcome=success count=\(self.requests.count) mode=full"
++                        "event=storage.requests_load outcome=success count=\(self.requests.count) mode=full scope=current_capture"
+                     )
+                     if let firstRequest = self.requests.first {
+                         CoreLog.storage.debug(
+@@ -747,11 +750,9 @@ final class CaptureViewModel: ObservableObject {
+                     newerThan: newestKnownTimestamp,
+                     excludingIDs: self.requestIDSet
+                 )
++                guard !Task.isCancelled, self.displayedSession?.id == scope.sessionID else { return }
++                loadedRequests = loadedRequests.filter { scope.contains(timestamp: $0.timestamp, sessionID: $0.sessionId) }
+                 loadedRequests = self.assignCurrentSession(to: loadedRequests, session: sessionForAttribution)
+-                let visibleSessionID = await MainActor.run { self.displayedSessionID }
+-                if let visibleSessionID {
+-                    loadedRequests = loadedRequests.filter { $0.sessionId == visibleSessionID }
+-                }
+                 loadedRequests = self.optimizeRequestsForList(loadedRequests)
+ 
+                 guard !Task.isCancelled else { return }
+@@ -809,8 +810,9 @@ final class CaptureViewModel: ObservableObject {
+         var updatedRequests = loadedRequests
+         requestsToStore.reserveCapacity(updatedRequests.count)
+ 
++        let scope = CaptureHomeScope(sessionID: session.id, startTime: session.startTime, endTime: session.endTime)
+         for index in updatedRequests.indices
+-        where updatedRequests[index].sessionId == nil && updatedRequests[index].timestamp >= session.startTime {
++        where updatedRequests[index].sessionId == nil && scope.contains(timestamp: updatedRequests[index].timestamp) {
+             updatedRequests[index].sessionId = session.id
+             requestsToStore.append(updatedRequests[index])
+         }
+@@ -885,35 +887,30 @@ final class CaptureViewModel: ObservableObject {
+             )
+ 
+             do {
+-                if shouldRunFullReload {
+-                    let loaded = try await self.storage.loadAllTransportRequestsAsync()
+-
+-                    guard !Task.isCancelled else { return }
+-                    self.transportRequests = self.enrichTransportRequests(loaded)
+-                    self.transportRequestIDSet = Set(loaded.map(\.id))
+-                    self.lastTransportFullReloadTime = Date()
++                guard let session = self.displayedSession else {
++                    self.transportRequests = []
++                    self.transportRequestIDSet = []
++                    self.lastTransportFullReloadTime = nil
+                     self.transportIncrementalLoadsSinceFullReload = 0
+                     return
+                 }
+-
+-                guard let newestKnownTimestamp = self.transportRequests.first?.timestamp else {
+-                    let loaded = try await self.storage.loadAllTransportRequestsAsync()
+-                    guard !Task.isCancelled else { return }
+-                    self.transportRequests = self.enrichTransportRequests(loaded)
+-                    self.transportRequestIDSet = Set(loaded.map(\.id))
++                let scope = CaptureHomeScope(sessionID: session.id, startTime: session.startTime, endTime: session.endTime)
++                let isFullReload = shouldRunFullReload || self.transportRequests.isEmpty
++                let since = isFullReload ? scope.startTime : (self.transportRequests.first?.timestamp ?? scope.startTime)
++                let excludedIDs: Set<UUID> = isFullReload ? [] : self.transportRequestIDSet
++                let loaded = try await self.storage.loadTransportRequestsAsync(newerThan: since, excludingIDs: excludedIDs)
++
++                guard !Task.isCancelled, self.displayedSession?.id == scope.sessionID else { return }
++                let visible = loaded.filter { scope.contains(timestamp: $0.timestamp) }
++                if isFullReload {
++                    self.transportRequests = self.enrichTransportRequests(visible)
++                    self.transportRequestIDSet = Set(visible.map(\.id))
+                     self.lastTransportFullReloadTime = Date()
+                     self.transportIncrementalLoadsSinceFullReload = 0
+-                    return
++                } else {
++                    self.mergeTransportRequests(visible)
++                    self.transportIncrementalLoadsSinceFullReload += 1
+                 }
+-
+-                let loaded = try await self.storage.loadTransportRequestsAsync(
+-                    newerThan: newestKnownTimestamp,
+-                    excludingIDs: self.transportRequestIDSet
+-                )
+-
+-                guard !Task.isCancelled else { return }
+-                self.mergeTransportRequests(loaded)
+-                self.transportIncrementalLoadsSinceFullReload += 1
+             } catch {
+                 guard !Task.isCancelled else { return }
+                 CoreLog.storage.error(
+@@ -960,10 +957,17 @@ final class CaptureViewModel: ObservableObject {
+             guard let self else { return }
+ 
+             do {
++                guard let session = self.displayedSession else {
++                    self.transportProtocolHintsByFlowKey = [:]
++                    return
++                }
++                let scope = CaptureHomeScope(sessionID: session.id, startTime: session.startTime, endTime: session.endTime)
+                 let flows = try await self.storage.loadAllUDPFlowMetadataAsync()
+-                guard !Task.isCancelled else { return }
++                guard !Task.isCancelled, self.displayedSession?.id == scope.sessionID else { return }
+ 
+-                self.transportProtocolHintsByFlowKey = Self.buildTransportProtocolHints(from: flows)
++                self.transportProtocolHintsByFlowKey = Self.buildTransportProtocolHints(
++                    from: flows.filter { scope.contains(timestamp: $0.startTime) }
++                )
+                 self.applyTransportProtocolHints()
+             } catch {
+                 guard !Task.isCancelled else { return }
+@@ -1659,11 +1663,30 @@ final class CaptureViewModel: ObservableObject {
+     /// 首页列表只展示一条会话：正在抓的那条，或最近一次记录。
+     ///
+     /// 历史抓包仍然留在库里，从「抓包记录」里按会话查看，不再混进首页。
+-    private var displayedSessionID: UUID? {
++    private var displayedSession: CaptureSession? {
+         if let current = currentSession, current.isActive {
+-            return current.id
++            return current
+         }
+-        return sessions.max { $0.startTime < $1.startTime }?.id
++        return sessions.max { $0.startTime < $1.startTime }
++    }
++
++    /// Reset presentation state only. Never delete stored requests or capture files.
++    private func resetHomeForDisplayedSession() {
++        activeLoadTask?.cancel()
++        activeTransportLoadTask?.cancel()
++        activeUDPFlowHintLoadTask?.cancel()
++        requests = []
++        requestIDSet = []
++        lastRequestFullReloadTime = nil
++        requestIncrementalLoadsSinceFullReload = 0
++        transportRequests = []
++        transportRequestIDSet = []
++        lastTransportFullReloadTime = nil
++        transportIncrementalLoadsSinceFullReload = 0
++        transportProtocolHintsByFlowKey = [:]
++        loadRequests(forceFullReload: true)
++        loadTransportRequests(forceFullReload: true)
++        loadTransportProtocolHints()
+     }
+ 
+     private func loadSessions() {
+@@ -1723,6 +1746,7 @@ final class CaptureViewModel: ObservableObject {
+                 "event=storage.session_recovery outcome=success count=\(recovered.count)"
+             )
+             loadSessions()
++            resetHomeForDisplayedSession()
+         } catch {
+             CoreLog.storage.error(
+                 "event=storage.session_recovery outcome=failure error=\(error.localizedDescription, privacy: .public)"
+@@ -1740,6 +1764,7 @@ final class CaptureViewModel: ObservableObject {
+             sessions = loaded
+             guard let active = loaded.first(where: { $0.isActive }) else { return }
+             currentSession = active
++            resetHomeForDisplayedSession()
+             CoreLog.storage.info(
+                 "event=storage.session_adopt outcome=success session_id=\(active.id.uuidString, privacy: .public)"
+             )
+@@ -1770,12 +1795,8 @@ final class CaptureViewModel: ObservableObject {
+ 
+             currentSession = newSession
+             sessions.insert(newSession, at: 0)
+-            // 首页只显示这一次抓包：开新会话时立刻清空上一轮的列表。
+-            requests = []
+-            requestIDSet = []
+-            lastRequestFullReloadTime = nil
+-            requestIncrementalLoadsSinceFullReload = 0
+-            loadRequests(forceFullReload: true)
++            // 开新会话时同时重置 HTTP 与连接列表，历史数据只在抓包记录中查看。
++            resetHomeForDisplayedSession()
+             CoreLog.storage.info(
+                 "event=storage.session_start outcome=success session_id=\(newSession.id.uuidString, privacy: .public)"
+             )
+@@ -1796,6 +1817,7 @@ final class CaptureViewModel: ObservableObject {
+         sessions.removeAll { $0.id == session.id }
+         // Deletes the row and the session directory (see AppGroupStorage.deleteSession).
+         try? storage.deleteSession(session.id)
++        resetHomeForDisplayedSession()
+         CoreLog.storage.info(
+             "event=storage.session_abort outcome=success session_id=\(session.id.uuidString, privacy: .public)"
+         )
+@@ -1822,6 +1844,12 @@ final class CaptureViewModel: ObservableObject {
+             session.endTime = Date()
+             session.endReason = reason
+         }
++        defer {
++            // Cancel pending pre-stop loads and apply the closed capture's upper bound.
++            loadRequests(forceFullReload: true)
++            loadTransportRequests(forceFullReload: true)
++            loadTransportProtocolHints()
++        }
+ 
+         do {
+             try storage.updateSessionStats(
+diff --git a/TraceCore/Models/CaptureHomeScope.swift b/TraceCore/Models/CaptureHomeScope.swift
+new file mode 100644
+index 0000000..fdb48e8
+--- /dev/null
++++ b/TraceCore/Models/CaptureHomeScope.swift
+@@ -0,0 +1,28 @@
++import Foundation
++
++/// The single capture run visible on the home screen. History remains in storage.
++public struct CaptureHomeScope: Equatable, Sendable {
++    public let sessionID: UUID
++    public let startTime: Date
++    public let endTime: Date?
++
++    public init(sessionID: UUID, startTime: Date, endTime: Date?) {
++        self.sessionID = sessionID
++        self.startTime = startTime
++        self.endTime = endTime
++    }
++
++    /// Transport records have no session ID, so use the capture's time window.
++    public func contains(timestamp: Date) -> Bool {
++        guard timestamp >= startTime else { return false }
++        if let endTime { return timestamp <= endTime }
++        return true
++    }
++
++    /// An explicit session ID wins; unassigned requests may only enter this run
++    /// when their timestamp falls inside its bounds. Never claim another run.
++    public func contains(timestamp: Date, sessionID: UUID?) -> Bool {
++        if let sessionID { return sessionID == self.sessionID }
++        return contains(timestamp: timestamp)
++    }
++}
+diff --git a/TraceLogicTests/TraceCaptureHomeScopeRegressionTests.swift b/TraceLogicTests/TraceCaptureHomeScopeRegressionTests.swift
+new file mode 100644
+index 0000000..6385ce6
+--- /dev/null
++++ b/TraceLogicTests/TraceCaptureHomeScopeRegressionTests.swift
+@@ -0,0 +1,62 @@
++import Foundation
++import XCTest
++#if canImport(TraceCriticalFixes)
++@testable import TraceCriticalFixes
++#else
++@testable import TraceCore
++#endif
++
++final class TraceCaptureHomeScopeRegressionTests: XCTestCase {
++    private let currentID = UUID()
++    private let previousID = UUID()
++    private let start = Date(timeIntervalSince1970: 1_000)
++
++    private func scope(ended: Bool = false) -> CaptureHomeScope {
++        CaptureHomeScope(sessionID: currentID, startTime: start,
++                         endTime: ended ? start.addingTimeInterval(60) : nil)
++    }
++
++    func testFirstUnassignedRequestIsVisible() {
++        XCTAssertTrue(scope().contains(timestamp: start.addingTimeInterval(1), sessionID: nil))
++    }
++
++    func testUnassignedHistoryDoesNotEnterNewCapture() {
++        XCTAssertFalse(scope().contains(timestamp: start.addingTimeInterval(-1), sessionID: nil))
++    }
++
++    func testAnotherSessionsRequestNeverEntersCurrentCapture() {
++        XCTAssertFalse(scope().contains(timestamp: start.addingTimeInterval(1), sessionID: previousID))
++    }
++
++    func testExplicitCurrentSessionRemainsVisible() {
++        XCTAssertTrue(scope().contains(timestamp: start.addingTimeInterval(1), sessionID: currentID))
++    }
++
++    func testClosedCaptureDoesNotClaimLaterUnassignedRequests() {
++        XCTAssertFalse(scope(ended: true).contains(timestamp: start.addingTimeInterval(61), sessionID: nil))
++    }
++
++    func testClosedCaptureStillShowsItsUnassignedRequests() {
++        XCTAssertTrue(scope(ended: true).contains(timestamp: start.addingTimeInterval(20), sessionID: nil))
++    }
++
++    func testTransportHistoryIsExcluded() {
++        XCTAssertFalse(scope().contains(timestamp: start.addingTimeInterval(-1)))
++    }
++
++    func testTransportAfterStopIsExcluded() {
++        XCTAssertFalse(scope(ended: true).contains(timestamp: start.addingTimeInterval(61)))
++    }
++
++    func testCaptureBoundariesAreIncluded() {
++        XCTAssertTrue(scope(ended: true).contains(timestamp: start))
++        XCTAssertTrue(scope(ended: true).contains(timestamp: start.addingTimeInterval(60)))
++    }
++
++    func testNewCaptureCannotReplayPreviousCapture() {
++        let next = CaptureHomeScope(sessionID: UUID(), startTime: start.addingTimeInterval(100), endTime: nil)
++        XCTAssertFalse(next.contains(timestamp: start.addingTimeInterval(20), sessionID: nil))
++        XCTAssertFalse(next.contains(timestamp: start.addingTimeInterval(120), sessionID: currentID))
++        XCTAssertTrue(next.contains(timestamp: start.addingTimeInterval(120), sessionID: nil))
++    }
++}
+diff --git a/ci/run-critical-network-regressions.py b/ci/run-critical-network-regressions.py
+index dd8a090..8471b8f 100644
+--- a/ci/run-critical-network-regressions.py
++++ b/ci/run-critical-network-regressions.py
+@@ -23,8 +23,10 @@ files = [
+     ('TraceUI/Body/BodyViewerPolicy.swift', sources),
+     ('TraceCore/Utilities/JSONCoding.swift', sources),
+     ('TraceCore/Models/SSECompletionPolicy.swift', sources),
++    ('TraceCore/Models/CaptureHomeScope.swift', sources),
+     ('TraceLogicTests/TraceCriticalNetworkingRegressionTests.swift', tests),
+     ('TraceLogicTests/TraceLargeBodyRegressionTests.swift', tests),
++    ('TraceLogicTests/TraceCaptureHomeScopeRegressionTests.swift', tests),
+ ]
+ for name, directory in files:
+     source = root / name
