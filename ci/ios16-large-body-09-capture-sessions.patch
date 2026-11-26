@@ -707,7 +707,7 @@ index cd905cd..64a737f 100644
 +}
 diff --git a/Trace/ViewModels/SessionListViewModel.swift b/Trace/ViewModels/SessionListViewModel.swift
 new file mode 100644
-index 0000000..8ed6503
+index 0000000..48e6eb0
 --- /dev/null
 +++ b/Trace/ViewModels/SessionListViewModel.swift
 @@ -0,0 +1,503 @@
@@ -1208,7 +1208,7 @@ index 0000000..8ed6503
 +            hasLoadedOnce = true
 +        } catch {
 +            CoreLog.storage.error(
-+                "event=sessions_detail_load outcome=failure session_id=\(session.id.uuidString, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
++                "event=sessions_detail_load outcome=failure session_id=\(self.session.id.uuidString, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
 +            )
 +            loadState = .failed(error.localizedDescription)
 +        }
@@ -1236,10 +1236,10 @@ index 1806142..4552c95 100644
                          RewriteRulesView()
 diff --git a/Trace/Views/Sessions/SessionDetailView.swift b/Trace/Views/Sessions/SessionDetailView.swift
 new file mode 100644
-index 0000000..8afefb3
+index 0000000..00120cc
 --- /dev/null
 +++ b/Trace/Views/Sessions/SessionDetailView.swift
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,206 @@
 +//
 +//  SessionDetailView.swift
 +//  Trace
@@ -1248,6 +1248,7 @@ index 0000000..8afefb3
 +//  by the requests that were recorded during that session.
 +//
 +
++import Combine
 +import SwiftUI
 +import TraceCore
 +import TraceFeatures
@@ -1447,10 +1448,10 @@ index 0000000..8afefb3
 +}
 diff --git a/Trace/Views/Sessions/SessionListView.swift b/Trace/Views/Sessions/SessionListView.swift
 new file mode 100644
-index 0000000..d6ddd77
+index 0000000..e1c44c1
 --- /dev/null
 +++ b/Trace/Views/Sessions/SessionListView.swift
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,222 @@
 +//
 +//  SessionListView.swift
 +//  Trace
@@ -1459,6 +1460,7 @@ index 0000000..d6ddd77
 +//  session; tapping it opens the requests that belong to that session.
 +//
 +
++import Combine
 +import SwiftUI
 +import TraceCore
 +import TraceUI
@@ -1674,10 +1676,10 @@ index 0000000..d6ddd77
 +}
 diff --git a/Trace/Views/Sessions/SessionRowView.swift b/Trace/Views/Sessions/SessionRowView.swift
 new file mode 100644
-index 0000000..5d4bdce
+index 0000000..b00e167
 --- /dev/null
 +++ b/Trace/Views/Sessions/SessionRowView.swift
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,219 @@
 +//
 +//  SessionRowView.swift
 +//  Trace
@@ -1878,6 +1880,7 @@ index 0000000..5d4bdce
 +}
 +#endif
 +
++#if DEBUG
 +#Preview("Session Rows") {
 +    List {
 +        SessionRowView(row: .preview(status: .active, endTime: nil))
@@ -1895,8 +1898,9 @@ index 0000000..5d4bdce
 +    }
 +    .padding()
 +}
++#endif
 diff --git a/TraceCore/Models/CaptureSession.swift b/TraceCore/Models/CaptureSession.swift
-index 44fba25..c8c49ea 100644
+index 44fba25..61e501e 100644
 --- a/TraceCore/Models/CaptureSession.swift
 +++ b/TraceCore/Models/CaptureSession.swift
 @@ -7,6 +7,16 @@
@@ -1916,7 +1920,7 @@ index 44fba25..c8c49ea 100644
  public struct CaptureSession: Codable, Identifiable, Equatable, Sendable {
      public let id: UUID
      public var name: String?
-@@ -14,11 +24,24 @@ public struct CaptureSession: Codable, Identifiable, Equatable, Sendable {
+@@ -14,16 +24,35 @@ public struct CaptureSession: Codable, Identifiable, Equatable, Sendable {
      public var endTime: Date?
      public var requestCount: Int
      public var totalDataTransferred: Int64
@@ -1941,7 +1945,18 @@ index 44fba25..c8c49ea 100644
      public var duration: TimeInterval {
          let end = endTime ?? Date()
          return max(0, end.timeIntervalSince(startTime))
-@@ -85,12 +108,41 @@ public struct CaptureSession: Codable, Identifiable, Equatable, Sendable {
+     }
+ 
++    /// 进行中的会话按给定时间点算时长，用于 TimelineView 每秒刷新。
++    public func duration(relativeTo date: Date) -> TimeInterval {
++        let end = endTime ?? date
++        return max(0, end.timeIntervalSince(startTime))
++    }
++
+     private static func makeDisplayDateFormatter() -> DateFormatter {
+         let formatter = DateFormatter()
+         formatter.dateStyle = .short
+@@ -85,12 +114,41 @@ public struct CaptureSession: Codable, Identifiable, Equatable, Sendable {
          durationString(relativeTo: Date())
      }
  
