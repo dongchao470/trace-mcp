@@ -1,0 +1,19 @@
+--- a/ci/run-critical-network-regressions.py
++++ b/ci/run-critical-network-regressions.py
+@@ -21,11 +21,16 @@
+     ('TraceProxy/MITM/NIOMITMRequestBodyPolicy.swift', sources),
+     ('TraceUI/Body/BodyTextPagination.swift', sources),
+     ('TraceUI/Body/BodyViewerPolicy.swift', sources),
++    ('TraceUI/Body/BodyJSONDocument.swift', sources),
++    ('TraceUI/Body/BodyContentSniffer.swift', sources),
++    ('TraceUI/Body/BodyHexPagination.swift', sources),
++    ('TraceCore/MCP/TraceMCPListenerLifecycle.swift', sources),
+     ('TraceCore/Utilities/JSONCoding.swift', sources),
+     ('TraceCore/Models/SSECompletionPolicy.swift', sources),
+     ('TraceCore/Models/CaptureHomeScope.swift', sources),
+     ('TraceLogicTests/TraceCriticalNetworkingRegressionTests.swift', tests),
+     ('TraceLogicTests/TraceLargeBodyRegressionTests.swift', tests),
++    ('TraceLogicTests/TraceBodyViewerRegressionTests.swift', tests),
+     ('TraceLogicTests/TraceCaptureHomeScopeRegressionTests.swift', tests),
+ ]
+ for name, directory in files:

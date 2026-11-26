@@ -1,0 +1,2 @@
+/* Immediate read-only status during a provider transition. */
+"The network service is still applying a change. Check the recording state again shortly; do not repeat the original action." = "网络服务正在完成切换。请稍后再次核对抓包状态，不要重复刚才的启停操作。";

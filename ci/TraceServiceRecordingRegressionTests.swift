@@ -222,6 +222,7 @@ private final class MemoryVPN: VPNManaging {
     var failStop = false
     var missingReply = false
     var missingQueryReply = false
+    var queryTransitioning = false
     var oppositeReply = false
     var actualRecording = false
     var recording: () -> Bool = { false }
@@ -246,6 +247,9 @@ private final class MemoryVPN: VPNManaging {
         if command == "getRecordingState" {
             queries += 1
             if missingQueryReply { return nil }
+            if queryTransitioning {
+                return try JSONSerialization.data(withJSONObject: ["transitioning": true, "recording": actualRecording])
+            }
         } else {
             XCTAssertEqual(command, "setRecordingState")
             messages += 1
@@ -476,6 +480,29 @@ final class NetworkServiceControlRegressionTests: XCTestCase {
             XCTAssertTrue(vpn.isConnected)
             XCTAssertEqual(service.recordingState, .unknown)
         }
+    }
+
+    func testTransitionReplyDoesNotConfirmIntermediateStateOrRepeatChanges() async throws {
+        let (service, vpn, _, sessions) = make()
+        vpn.isConnected = true
+        vpn.actualRecording = true
+        vpn.queryTransitioning = true
+        do {
+            try await service.refreshRecordingState()
+            XCTFail("Intermediate state was confirmed")
+        } catch NetworkCaptureService.ServiceError.transitionInProgress {
+            XCTAssertEqual(service.recordingState, .unknown)
+        } catch { XCTFail("Expected transition status, got \(error)") }
+        XCTAssertEqual(vpn.messages, 0)
+        XCTAssertEqual(vpn.queries, 1)
+        XCTAssertEqual(sessions.began, 0)
+        XCTAssertEqual(sessions.ended, 0)
+        vpn.queryTransitioning = false
+        try await service.refreshRecordingState()
+        XCTAssertEqual(service.recordingState, .recording)
+        XCTAssertEqual(vpn.messages, 0)
+        XCTAssertEqual(vpn.queries, 2)
+        XCTAssertEqual(vpn.starts, 0)
     }
 
     func testConcurrentOppositeOperationFailsBusyRatherThanSilentlySucceeding() async throws {

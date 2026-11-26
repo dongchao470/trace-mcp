@@ -65,7 +65,8 @@ enum FeatureLog {
 }
 '''
 (sources / 'TestOnlyAdapters.swift').write_text(adapters)
-shutil.copy2(root / 'ci/TraceServiceRecordingRegressionTests.swift', tests)
+for name in ['TraceServiceRecordingRegressionTests.swift', 'TraceRecordingQueryRegressionTests.swift']:
+    shutil.copy2(root / 'ci' / name, tests)
 (out / 'Package.swift').write_text('''// swift-tools-version: 6.0
 import PackageDescription
 let package = Package(name: "TraceServiceFixes", platforms: [.macOS(.v13)], targets: [

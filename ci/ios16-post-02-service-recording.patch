@@ -59,9 +59,86 @@
      }
  
      private func viewLastSession(viewModel: CaptureViewModel) {
+--- /dev/null
++++ b/Trace/Services/AppMCPServiceCoordinator.swift
+@@ -0,0 +1,74 @@
++import Combine
++import Foundation
++import NetworkExtension
++import TraceCore
++import TraceFeatures
++
++/// Owns only the app listener. Never starts a VPN or changes the recording preference.
++@MainActor
++final class AppMCPServiceCoordinator: ObservableObject {
++    static let shared = AppMCPServiceCoordinator()
++    @Published private(set) var isForeground = false
++    @Published private(set) var isChecking = false
++    @Published private(set) var lastError: String?
++    private var observer: AnyCancellable?
++    private var reconciliation: Task<Void, Never>?
++    private var generation = 0
++
++    private init() {
++        observer = NotificationCenter.default.publisher(for: .NEVPNStatusDidChange)
++            .receive(on: DispatchQueue.main)
++            .sink { [weak self] _ in self?.refresh() }
++    }
++
++    func setForeground(_ foreground: Bool) {
++        isForeground = foreground
++        refresh()
++    }
++
++    func refresh(notifyExtension: Bool = false) {
++        generation += 1
++        let request = generation
++        reconciliation?.cancel()
++        lastError = nil
++        guard isForeground else {
++            isChecking = false
++            TraceMCPServer.shared.stop()
++            return
++        }
++        let preferences = TraceMCPPreferences.load()
++        if !preferences.enabled { TraceMCPServer.shared.stop() }
++        // Unknown/connecting/reasserting must not be mistaken for a stopped extension.
++        if !VPNManager.shared.isDefinitelyStopped { TraceMCPServer.shared.stop() }
++        isChecking = true
++        reconciliation = Task { [weak self] in
++            guard let self else { return }
++            do {
++                try await VPNManager.shared.prepareForControl()
++                guard !Task.isCancelled, request == self.generation, self.isForeground else { return }
++                if VPNManager.shared.isConnected, notifyExtension {
++                    let data = try await VPNManager.shared.sendMessage(["command": "refreshMCP"])
++                    guard !Task.isCancelled, request == self.generation else { return }
++                    guard let data,
++                          let reply = try JSONSerialization.jsonObject(with: data) as? [String: Any],
++                          reply["enabled"] as? Bool == preferences.enabled,
++                          reply["port"] as? Int == Int(preferences.port) else {
++                        throw NSError(domain: "TraceMCP", code: 1, userInfo: [NSLocalizedDescriptionKey:
++                            "MCP 设置已保存，但尚未确认扩展应用；请核对状态，不要重复启停网络服务。"])
++                    }
++                }
++                self.isChecking = false
++                if VPNManager.shared.isDefinitelyStopped, preferences.enabled {
++                    TraceMCPBootstrap.startRetryingIfEnabled(host: "app")
++                } else {
++                    TraceMCPServer.shared.stop()
++                }
++            } catch {
++                guard !Task.isCancelled, request == self.generation else { return }
++                self.isChecking = false
++                self.lastError = error.localizedDescription
++                TraceMCPServer.shared.stop()
++            }
++        }
++    }
++}
 --- a/Trace/Services/NetworkCaptureService.swift
 +++ b/Trace/Services/NetworkCaptureService.swift
-@@ -12,92 +12,220 @@
+@@ -12,92 +12,227 @@
  import TraceCore
  import TraceFeatures
  
@@ -102,11 +179,13 @@
 +    enum RecordingState: Equatable { case paused, recording, unknown }
 +
 +    enum ServiceError: LocalizedError {
-+        case recordingStateUnconfirmed, busy, sessionUnavailable
++        case recordingStateUnconfirmed, transitionInProgress, busy, sessionUnavailable
 +        var errorDescription: String? {
 +            switch self {
 +            case .recordingStateUnconfirmed:
 +                return NSLocalizedString("The network service did not confirm the recording state. Check the service before trying again.", comment: "Unconfirmed recording state")
++            case .transitionInProgress:
++                return NSLocalizedString("The network service is still applying a change. Check the recording state again shortly; do not repeat the original action.", comment: "Provider transition in progress")
 +            case .busy:
 +                return NSLocalizedString("A network service change is already in progress. Wait for it to finish.", comment: "Busy service")
 +            case .sessionUnavailable:
@@ -300,8 +379,13 @@
 +
 +    private func decodeRecordingState(_ data: Data?) throws -> Bool {
 +        guard let data,
-+              let response = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-+              let recording = response["recording"] as? Bool else {
++              let response = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
++            throw ServiceError.recordingStateUnconfirmed
++        }
++        if response["transitioning"] as? Bool == true {
++            throw ServiceError.transitionInProgress
++        }
++        guard let recording = response["recording"] as? Bool else {
 +            throw ServiceError.recordingStateUnconfirmed
 +        }
 +        return recording
@@ -334,27 +418,6 @@
          }
      }
  }
---- a/Trace/TraceApp.swift
-+++ b/Trace/TraceApp.swift
-@@ -45,6 +45,9 @@
-                     VPNManager.shared.initializeIfNeeded()
-                     updateQuickActions()
-                 }
-+                .onReceive(viewModel.$isCapturing.removeDuplicates()) { _ in
-+                    if OnboardingState.hasCompleted { updateQuickActions() }
-+                }
-         }
-         .onChangeCompat(of: scenePhase) { newPhase in
-             viewModel.setSceneActive(newPhase == .active)
-@@ -86,7 +89,7 @@
- 
-         var shortcutItems: [UIApplicationShortcutItem] = []
- 
--        if vpnManager.isConnected {
-+        if vpnManager.isConnected && AppGroupStorage.shared.loadConfiguration().isRecordingEnabled {
-             shortcutItems.append(
-                 UIApplicationShortcutItem(
-                     type: TraceQuickActionType.stopCapture,
 --- a/Trace/ViewModels/CaptureViewModel.swift
 +++ b/Trace/ViewModels/CaptureViewModel.swift
 @@ -99,6 +99,9 @@
@@ -674,6 +737,160 @@
                  Button {
                      onShowFavorites()
                  } label: {
+--- a/Trace/Views/Settings/MCPView.swift
++++ b/Trace/Views/Settings/MCPView.swift
+@@ -9,6 +9,7 @@
+ import Foundation
+ import SwiftUI
+ import TraceCore
++import TraceFeatures
+ import UIKit
+ 
+ struct MCPView: View {
+@@ -16,8 +17,10 @@
+     @State private var portText: String
+     @State private var snapshot: TraceMCPRuntimeSnapshot
+     @State private var copied = false
+-
+-    private let host = "app"
++    @State private var selfTestResult: String?
++    @State private var isTesting = false
++    @ObservedObject private var lifecycle = AppMCPServiceCoordinator.shared
++
+     private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+ 
+     init() {
+@@ -37,7 +40,7 @@
+         .navigationTitle("MCP Server")
+         .navigationBarTitleDisplayMode(.inline)
+         .onAppear {
+-            TraceMCPBootstrap.startIfEnabled(host: host)
++            lifecycle.refresh()
+             refresh()
+         }
+         .onReceive(timer) { _ in
+@@ -95,20 +98,29 @@
+         } header: {
+             Text("Service")
+         } footer: {
+-            Text("Trace only answers 127.0.0.1 requests. The app serves the endpoint while it stays active; keep the VPN tunnel running so background requests are answered by the extension.")
++            Text("Trace 在前台时，MCP 无需 VPN。切到 SiriAI 等其他 App 后，如需继续连接，请保持网络服务开启；可停止抓包，不会继续录制。仅开启 MCP 开关不能让普通 iOS App 在后台常驻。")
+         }
+     }
+ 
+     private var selfTestSection: some View {
+         Section {
+             Button {
+-                TraceMCPServer.shared.runSelfCheck()
+-                refresh()
++                Task { await testEndpoint() }
+             } label: {
+                 Label("Test Loopback Connection", systemImage: "bolt.horizontal")
+             }
+-
+-            if let result = snapshot.selfCheck {
++            .disabled(isTesting)
++
++            if !VPNManager.shared.isConnected {
++                Button("检查并恢复前台 MCP") { lifecycle.refresh() }
++                    .disabled(lifecycle.isChecking)
++            }
++
++            if let error = lifecycle.lastError {
++                Text(error).font(.footnote).foregroundStyle(.red)
++            }
++
++            if let result = selfTestResult ?? snapshot.selfCheck {
+                 Text(result)
+                     .font(.footnote)
+                     .textSelection(.enabled)
+@@ -150,6 +162,8 @@
+         guard preferences.enabled else {
+             return String(localized: "Disabled")
+         }
++        if lifecycle.isChecking { return "正在核对网络服务…" }
++        if VPNManager.shared.isConnected, !snapshot.listening { return "等待扩展监听确认" }
+         return snapshot.listening ? String(localized: "Listening") : String(localized: "Stopped")
+     }
+ 
+@@ -161,7 +175,9 @@
+     }
+ 
+     private func toggle(_ enabled: Bool) {
+-        preferences = TraceMCPBootstrap.setEnabled(enabled, host: host)
++        preferences.enabled = enabled
++        preferences.save()
++        lifecycle.refresh(notifyExtension: true)
+         refresh()
+     }
+ 
+@@ -171,7 +187,9 @@
+             portText = String(preferences.port)
+             return
+         }
+-        preferences = TraceMCPBootstrap.setPort(port, host: host)
++        preferences.port = port
++        preferences.save()
++        lifecycle.refresh(notifyExtension: true)
+         portText = String(preferences.port)
+         refresh()
+     }
+@@ -186,9 +204,37 @@
+ 
+     private func refresh() {
+         var current = TraceMCPServer.shared.runtimeSnapshot
+-        if current.selfCheck == nil, let stored = TraceMCPStatusStore.loadLastSnapshot() {
++        // A persisted successful self-test is not evidence that the old listener is alive.
++        if VPNManager.shared.isConnected,
++           let url = TraceMCPStatusStore.hostFileURL("extension"),
++           let data = try? Data(contentsOf: url),
++           let stored = try? JSONDecoder().decode(TraceMCPRuntimeSnapshot.self, from: data),
++           stored.host == "extension", stored.port == preferences.port,
++           let updated = ISO8601DateFormatter().date(from: stored.updatedAt),
++           (0 ... 12).contains(Date().timeIntervalSince(updated)) {
+             current = stored
+         }
+         snapshot = current
+     }
++
++    @MainActor
++    private func testEndpoint() async {
++        guard !isTesting, let url = URL(string: "http://127.0.0.1:\(preferences.port)/health") else { return }
++        isTesting = true
++        defer { isTesting = false }
++        let configuration = URLSessionConfiguration.ephemeral
++        configuration.timeoutIntervalForRequest = 5
++        configuration.timeoutIntervalForResource = 8
++        configuration.waitsForConnectivity = false
++        let session = URLSession(configuration: configuration)
++        defer { session.invalidateAndCancel() }
++        do {
++            let (_, response) = try await session.data(from: url)
++            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
++            selfTestResult = "本地端点自测：HTTP \(code)"
++        } catch {
++            selfTestResult = "本地端点未连通：\(error.localizedDescription)"
++        }
++        refresh()
++    }
+ }
+--- a/Trace/Views/Settings/SettingsTabView.swift
++++ b/Trace/Views/Settings/SettingsTabView.swift
+@@ -49,14 +49,6 @@
+                         MITMSecurityView()
+                     } label: {
+                         Label("Interception Rules", systemImage: "shield")
+-                    }
+-                }
+-
+-                Section("Integrations") {
+-                    NavigationLink {
+-                        MCPView()
+-                    } label: {
+-                        Label("MCP Server", systemImage: "bolt.horizontal.circle")
+                     }
+                 }
+ 
 --- a/TraceCore/Config/CaptureConfiguration.swift
 +++ b/TraceCore/Config/CaptureConfiguration.swift
 @@ -52,6 +52,8 @@
@@ -785,16 +1002,25 @@
 +}
 --- /dev/null
 +++ b/TraceCore/Config/RecordingTransitionQueue.swift
-@@ -0,0 +1,18 @@
+@@ -0,0 +1,27 @@
 +import Foundation
 +
 +/// Actor isolation alone permits re-entry at await points. Chain whole transitions instead.
 +public actor RecordingTransitionQueue {
 +    private var tail: Task<Void, Never>?
++    private var pendingOperations = 0
 +
 +    public init() {}
 +
++    /// Reads are immediate, but must never acknowledge an in-flight intermediate state.
++    public func readIfIdle<T: Sendable>(_ read: @Sendable () -> T) -> T? {
++        guard pendingOperations == 0 else { return nil }
++        return read()
++    }
++
 +    public func perform(_ operation: @escaping @Sendable () async -> Void) async {
++        pendingOperations += 1
++        defer { pendingOperations -= 1 }
 +        let predecessor = tail
 +        let next = Task {
 +            await predecessor?.value
@@ -941,6 +1167,169 @@
 +        continuation = nil
 +        lock.unlock()
 +        pending?.resume(with: result)
++    }
++}
+--- /dev/null
++++ b/TraceLogicTests/TraceBodyViewerRegressionTests.swift
+@@ -0,0 +1,160 @@
++import Foundation
++import XCTest
++@testable import TraceCriticalFixes
++
++final class TraceBodyViewerRegressionTests: XCTestCase {
++    private func canonical(_ text: String) throws -> Data {
++        let object = try JSONSerialization.jsonObject(with: Data(text.utf8), options: [.fragmentsAllowed])
++        return try JSONSerialization.data(withJSONObject: object, options: [.fragmentsAllowed, .sortedKeys])
++    }
++
++    func testScalarFragmentsAndEmptyContainersRoundTrip() throws {
++        for text in ["0", "1", "true", "false", "null", "1.25e-12", "\"中文😀\"", "{}", "[]"] {
++            let document = try BodyJSONDocument.parse(text)
++            XCTAssertEqual(try canonical(document.formattedPages().joined()), try canonical(text))
++            XCTAssertFalse(try document.visibleRows().isEmpty)
++        }
++    }
++
++    func testZeroAndOneRemainNumbersNotBooleans() throws {
++        let nodes = try BodyJSONDocument.parse("[0,1,true,false]").nodes
++        XCTAssertEqual(nodes.map(\.value), [nil, "0", "1", "true", "false"])
++        if case .number = nodes[1].kind {} else { XCTFail("0 became Boolean") }
++        if case .number = nodes[2].kind {} else { XCTFail("1 became Boolean") }
++        if case .boolean = nodes[3].kind {} else { XCTFail("true lost its type") }
++    }
++
++    func testEscapingAndUnicodeSurviveSmallPageBoundaries() throws {
++        let value = "中文😀\"\\\n\t\r\u{0000}\u{0008}\u{000C}" + String(repeating: "e\u{0301}", count: 80)
++        let data = try JSONSerialization.data(withJSONObject: ["键😀": value])
++        let source = String(decoding: data, as: UTF8.self)
++        let pages = try BodyJSONDocument.parse(source).formattedPages(pageBytes: 19)
++        XCTAssertGreaterThan(pages.count, 1)
++        XCTAssertTrue(pages.allSatisfy { !$0.isEmpty && $0.utf8.count <= 19 })
++        XCTAssertEqual(try canonical(pages.joined()), try canonical(source))
++    }
++
++    func testLargeJSONNeverFallsBackOrLosesTail() throws {
++        let source = "{\"body\":\"" + String(repeating: "中😀abc", count: 70000) + "TAIL\"}"
++        XCTAssertGreaterThan(source.utf8.count, 512 * 1024)
++        let document = try BodyJSONDocument.parse(source)
++        let pages = try document.formattedPages()
++        XCTAssertGreaterThan(pages.count, 64)
++        XCTAssertTrue(pages.allSatisfy { $0.utf8.count <= 8192 })
++        XCTAssertTrue(pages.last?.contains("TAIL") == true)
++        XCTAssertEqual(try canonical(pages.joined()), try canonical(source))
++    }
++
++    func testTreeExpandsMoreThanOneThousandNodesWithStableIDs() throws {
++        let source = "[" + (0..<1600).map { "{\"n\":\($0)}" }.joined(separator: ",") + "]"
++        let document = try BodyJSONDocument.parse(source)
++        let initial = try document.visibleRows()
++        XCTAssertEqual(initial.count, 1601)
++        let all = try document.visibleRows(expansion: .all)
++        XCTAssertEqual(all.count, 3201)
++        XCTAssertEqual(all.map(\.id), Array(document.nodes.indices))
++        XCTAssertEqual(try document.visibleRows(expansion: .collapsed).map(\.id), [0])
++        XCTAssertEqual(try document.visibleRows(expansion: .all).map(\.id), all.map(\.id))
++    }
++
++    func testExpandedTreeCanCollapseAndRestoreOneSubtree() throws {
++        let document = try BodyJSONDocument.parse("{\"a\":[1,2],\"b\":3}")
++        var expansion = BodyJSONExpansion.all
++        let all = try document.visibleRows(expansion: expansion)
++        let branch = try XCTUnwrap(document.nodes.first { $0.key == "a" })
++        expansion.toggle(branch.id)
++        XCTAssertEqual(try document.visibleRows(expansion: expansion).count, all.count - 2)
++        expansion.toggle(branch.id)
++        XCTAssertEqual(try document.visibleRows(expansion: expansion).map(\.id), all.map(\.id))
++    }
++
++    func testLongKeysAndValuesKeepFullDataWithBoundedPreviews() throws {
++        let key = String(repeating: "键😀", count: 500)
++        let value = String(repeating: "值\u{0301}", count: 4000)
++        let source = String(decoding: try JSONSerialization.data(withJSONObject: [key: value]), as: UTF8.self)
++        let document = try BodyJSONDocument.parse(source)
++        let node = try XCTUnwrap(document.nodes.first { $0.key == key })
++        XCTAssertEqual(node.value, value)
++        XCTAssertTrue(node.isKeyTruncated)
++        XCTAssertTrue(node.isValueTruncated)
++        XCTAssertLessThan(node.valuePreview.unicodeScalars.count, 130)
++        XCTAssertEqual(try canonical(document.formattedPages().joined()), try canonical(source))
++    }
++
++    func testMalformedJSONReportsErrorRatherThanRawSuccess() {
++        for source in ["{", "[1,", "{\"x\":undefined}"] {
++            XCTAssertThrowsError(try BodyJSONDocument.parse(source))
++        }
++    }
++
++    func testPageSizeIsClampedWithoutSplittingUTF8() throws {
++        let document = try BodyJSONDocument.parse("\"😀😀😀\"")
++        let tiny = try document.formattedPages(pageBytes: 0)
++        XCTAssertTrue(tiny.allSatisfy { $0.utf8.count <= 4 })
++        XCTAssertEqual(try canonical(tiny.joined()), try canonical("\"😀😀😀\""))
++    }
++
++    func testCancelledParseAndFormatFailBeforeWork() async throws {
++        let document = try BodyJSONDocument.parse("{\"x\":1}")
++        let cancelled = Task {
++            withUnsafeCurrentTask { $0?.cancel() }
++            XCTAssertThrowsError(try BodyJSONDocument.parse("[1,2,3]"))
++            XCTAssertThrowsError(try document.formattedPages())
++            XCTAssertThrowsError(try document.visibleRows())
++        }
++        await cancelled.value
++    }
++
++    func testHexIncludesBytesBeyondOldSixtyFourKiBLimit() {
++        var data = Data(repeating: 0, count: 64 * 1024)
++        data.append(contentsOf: [0xDE, 0xAD, 0xBE, 0xEF])
++        XCTAssertEqual(BodyHexPagination.pageCount(data), 65)
++        XCTAssertEqual(BodyHexPagination.page(data, index: 64), "DE AD BE EF")
++        XCTAssertEqual(BodyHexPagination.page(data, index: 65), "")
++        XCTAssertEqual(BodyHexPagination.page(data, index: -1), "")
++    }
++
++    func testHexEmptyExactAndSliceBoundaries() {
++        XCTAssertEqual(BodyHexPagination.pageCount(Data()), 1)
++        XCTAssertEqual(BodyHexPagination.page(Data(), index: 0), "")
++        let exact = Data(repeating: 255, count: 1024)
++        XCTAssertEqual(BodyHexPagination.pageCount(exact), 1)
++        XCTAssertEqual(BodyHexPagination.page(exact, index: 0).split(whereSeparator: \.isWhitespace).count, 1024)
++        let original = Data([0, 0xAB, 0xCD, 255])
++        XCTAssertEqual(BodyHexPagination.page(original[1..<3], index: 0), "AB CD")
++    }
++
++    func testBoundedContentSniffingDoesNotValidateWholeBody() {
++        XCTAssertEqual(BodyContentSniffer.hint(" \n{invalid so far"), .json)
++        XCTAssertEqual(BodyContentSniffer.hint("<!DOCTYPE html><html>"), .html)
++        XCTAssertEqual(BodyContentSniffer.hint("<svg xmlns=\"x\">"), .svg)
++        XCTAssertEqual(BodyContentSniffer.hint("<?xml version=\"1.0\"?>"), .xml)
++        XCTAssertNil(BodyContentSniffer.hint(String(repeating: " ", count: 4096) + "{}"))
++        XCTAssertNil(BodyContentSniffer.hint("plain text"))
++    }
++
++    func testStoppedListenerRejectsOldRetry() {
++        let lifecycle = TraceMCPListenerLifecycle()
++        let old = lifecycle.advance()
++        lifecycle.advance()
++        var ran = false
++        XCTAssertFalse(lifecycle.ifCurrent(old) { ran = true })
++        XCTAssertFalse(ran)
++    }
++
++    func testCurrentListenerAllowsRetry() {
++        let lifecycle = TraceMCPListenerLifecycle()
++        let generation = lifecycle.advance()
++        var ran = false
++        XCTAssertTrue(lifecycle.ifCurrent(generation) { ran = true })
++        XCTAssertTrue(ran)
++    }
++
++    func testGuardedRetryCanAdvanceRecursivelyWithoutDeadlock() {
++        let lifecycle = TraceMCPListenerLifecycle()
++        let old = lifecycle.advance()
++        lifecycle.ifCurrent(old) { lifecycle.withLock { lifecycle.advance() } }
++        XCTAssertNotEqual(lifecycle.generation, old)
++        XCTAssertFalse(lifecycle.ifCurrent(old) { XCTFail("Old port revived") })
 +    }
 +}
 --- a/TraceProxy/MITM/MITMProxyServer.swift
@@ -1359,6 +1748,1840 @@
 +        return try JSONSerialization.data(withJSONObject: ["recording": actualRecording])
 +    }
  }
+--- /dev/null
++++ b/TraceUI/Body/BodyContentSniffer.swift
+@@ -0,0 +1,18 @@
++import Foundation
++
++/// A bounded hint, not validation. Invalid JSON errors are produced by the background parser.
++enum BodyContentSniffer {
++    enum Hint: Equatable { case json, html, xml, svg }
++    static let prefixBytes = 4096
++
++    static func hint(_ content: String) -> Hint? {
++        let prefix = String(decoding: content.utf8.prefix(prefixBytes), as: UTF8.self)
++            .trimmingCharacters(in: .whitespacesAndNewlines)
++        if prefix.hasPrefix("{") || prefix.hasPrefix("[") { return .json }
++        let lower = prefix.lowercased()
++        if lower.contains("<svg") { return .svg }
++        if lower.contains("<!doctype html") || lower.contains("<html") { return .html }
++        if lower.hasPrefix("<?xml") || (lower.hasPrefix("<") && lower.contains("</")) { return .xml }
++        return nil
++    }
++}
+--- /dev/null
++++ b/TraceUI/Body/BodyHexPagination.swift
+@@ -0,0 +1,33 @@
++import Foundation
++
++/// Hex is generated for a window of source bytes, without a 64KB truncation or a giant string.
++public enum BodyHexPagination {
++    public static let pageBytes = 1024
++    private static let digits = Array("0123456789ABCDEF".utf8)
++
++    public static func pageCount(_ data: Data) -> Int {
++        max(1, data.count / pageBytes + (data.count % pageBytes == 0 ? 0 : 1))
++    }
++
++    public static func page(_ data: Data, index: Int) -> String {
++        guard index >= 0, index < pageCount(data), !Task.isCancelled else { return "" }
++        let offset = index * pageBytes
++        let count = min(pageBytes, data.count - offset)
++        guard count > 0 else { return "" }
++        var output: [UInt8] = []
++        output.reserveCapacity(count * 4)
++        let start = data.index(data.startIndex, offsetBy: offset)
++        for (position, byte) in data[start ..< data.index(start, offsetBy: count)].enumerated() {
++            if position > 0 {
++                if position % 16 == 0 { output.append(10) }
++                else {
++                    output.append(32)
++                    if position % 8 == 0 { output.append(32) }
++                }
++            }
++            output.append(digits[Int(byte >> 4)])
++            output.append(digits[Int(byte & 15)])
++        }
++        return String(decoding: output, as: UTF8.self)
++    }
++}
+--- a/TraceUI/Body/BodyInspectorView.swift
++++ b/TraceUI/Body/BodyInspectorView.swift
+@@ -24,6 +24,7 @@
+ 
+     @State private var viewMode: ViewMode = .auto
+     @State private var jsonMode: JSONViewerView.ViewMode = .tree
++    @StateObject private var jsonDocument = BodyJSONModel()
+     @State private var previewImageItem: PreviewImageItem?
+     @State private var showingFullViewer = false
+ 
+@@ -134,6 +135,11 @@
+         .fullScreenCover(isPresented: $showingFullViewer) {
+             fullViewerSheet
+         }
++        .task(id: content) {
++            guard !Task.isCancelled else { return }
++            if detectedIsJSON { jsonDocument.load(content) }
++            else { jsonDocument.clear() }
++        }
+     }
+ 
+     private var metadataRow: some View {
+@@ -292,7 +298,7 @@
+     private var autoContentView: some View {
+         switch effectiveDetectedContentType {
+         case .json:
+-            JSONViewerView(jsonString: content, mode: $jsonMode)
++            JSONViewerView(jsonString: content, model: jsonDocument, mode: $jsonMode)
+                 .frame(minHeight: 200)
+ 
+         case .html:
+@@ -405,15 +411,32 @@
+     }
+ 
+     private var hexView: some View {
+-        PagedBodyTextView(content: hexRepresentation)
++        PagedHexBodyView(content: content, rawData: rawData)
+     }
+ 
+     private var fullViewerSheet: some View {
+         NavigationStack {
+             Group {
++                switch viewMode {
++                case .text:
++                    ScrollView(.vertical) { textView.padding() }
++                case .hex:
++                    ScrollView(.vertical) { hexView.padding() }
++                case .auto:
++                    fullScreenAutoContent
++                }
++            }
++            .navigationTitle(effectiveDetectedContentType?.displayName ?? "Body")
++            .navigationBarTitleDisplayMode(.inline)
++            .toolbar { fullScreenToolbar }
++        }
++    }
++
++    @ViewBuilder
++    private var fullScreenAutoContent: some View {
+                 switch effectiveDetectedContentType {
+                 case .json:
+-                    JSONViewerView(jsonString: content, mode: $jsonMode)
++                    JSONViewerView(jsonString: content, model: jsonDocument, mode: $jsonMode)
+                 case .html:
+                     HTMLViewerView(htmlString: content)
+                 case .xml:
+@@ -436,10 +459,10 @@
+                             .frame(maxWidth: .infinity, alignment: .leading)
+                     }
+                 }
+-            }
+-            .navigationTitle(effectiveDetectedContentType?.displayName ?? "Body")
+-            .navigationBarTitleDisplayMode(.inline)
+-            .toolbar {
++    }
++
++    @ToolbarContentBuilder
++    private var fullScreenToolbar: some ToolbarContent {
+                 ToolbarItem(placement: .principal) {
+                     modeMenu
+                 }
+@@ -466,8 +489,6 @@
+                         }
+                     }
+                 }
+-            }
+-        }
+     }
+ 
+     @ViewBuilder
+@@ -583,31 +604,14 @@
+     }
+ 
+     private func detectFromContent() -> DetectedContentType? {
+-        // Content sniffing runs during view construction; never parse a large JSON here.
+-        guard viewerByteCount <= BodyViewerPolicy.automaticStructuredRenderBytes else { return .plainText }
+-        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+-
+-        if (trimmed.hasPrefix("{") && trimmed.hasSuffix("}")) ||
+-            (trimmed.hasPrefix("[") && trimmed.hasSuffix("]")) {
+-            if let data = content.data(using: .utf8),
+-               (try? JSONSerialization.jsonObject(with: data)) != nil {
+-                return .json
+-            }
+-        }
+-
+-        if trimmed.lowercased().contains("<!doctype html") || trimmed.lowercased().contains("<html") {
+-            return .html
+-        }
+-
+-        if trimmed.hasPrefix("<?xml") || (trimmed.hasPrefix("<") && trimmed.contains("</")) {
+-            return .xml
+-        }
+-
+-        if svgData != nil {
+-            return .image
+-        }
+-
+-        return nil
++        // Sniff a fixed-size prefix only. Actual JSON validation belongs to the async document.
++        switch BodyContentSniffer.hint(content) {
++        case .json: return .json
++        case .html: return .html
++        case .xml: return .xml
++        case .svg: return .image
++        case .none: return nil
++        }
+     }
+ 
+     private var effectiveDetectedContentType: DetectedContentType? {
+@@ -624,7 +628,9 @@
+     }
+ 
+     private var shouldUseLightweightRenderer: Bool {
+-        BodyViewerPolicy.shouldPreferLightweightRenderer(
++        // JSON has its own windowed renderer; never silently replace Format/Tree with raw text.
++        guard detectedContentType != .json else { return false }
++        return BodyViewerPolicy.shouldPreferLightweightRenderer(
+             contentType: contentType,
+             byteCount: viewerByteCount
+         )
+@@ -632,32 +638,6 @@
+ 
+     private var viewerByteCount: Int {
+         max(rawData?.count ?? 0, content.utf8.count)
+-    }
+-
+-    private var hexRepresentation: String {
+-        let data: Data? = rawData ?? content.data(using: .utf8)
+-        guard let data else { return "" }
+-
+-        let maxHexBytes = 64 * 1024
+-        let displayData = data.prefix(maxHexBytes)
+-        let wasTruncated = data.count > maxHexBytes
+-
+-        var hex = ""
+-        for (index, byte) in displayData.enumerated() {
+-            if index > 0 && index % 16 == 0 {
+-                hex += "\n"
+-            } else if index > 0 && index % 8 == 0 {
+-                hex += "  "
+-            } else if index > 0 {
+-                hex += " "
+-            }
+-            hex += String(format: "%02X", byte)
+-        }
+-
+-        if wasTruncated {
+-            hex += "\n\n… (truncated, showing first \(DesignSystem.formattedBytes(maxHexBytes)))"
+-        }
+-        return hex
+     }
+ 
+     private var imageFromContent: UIImage? {
+--- /dev/null
++++ b/TraceUI/Body/BodyJSONDocument.swift
+@@ -0,0 +1,325 @@
++import Foundation
++import CoreFoundation
++
++/// Stable preorder IDs belong to one immutable document; no `Any` crosses a task boundary.
++struct BodyJSONNode: Identifiable, Sendable {
++    enum Kind: Sendable {
++        case object, array, string, number, boolean, null
++    }
++
++    let id: Int
++    let depth: Int
++    let key: String?
++    let arrayIndex: Int?
++    let kind: Kind
++    /// Decoded strings, or JSON tokens for number/bool/null. Containers have no scalar value.
++    let value: String?
++    let childCount: Int
++    /// Exclusive preorder boundary, allowing collapsed subtrees to be skipped in O(1).
++    let subtreeEndIndex: Int
++    let keyPreview: String?
++    let valuePreview: String
++    let isKeyTruncated: Bool
++    let isValueTruncated: Bool
++
++    var isContainer: Bool {
++        switch kind {
++        case .object, .array: return true
++        default: return false
++        }
++    }
++    var canExpand: Bool { isContainer && childCount > 0 }
++}
++
++struct BodyJSONRow: Identifiable, Sendable {
++    let id: Int
++    let depth: Int
++    let isExpanded: Bool
++}
++
++/// `all` uses exceptions, not a huge set of eagerly expanded IDs.
++struct BodyJSONExpansion: Sendable {
++    private let expandsByDefault: Bool
++    private var exceptions: Set<Int>
++
++    init(expandedIDs: Set<Int>) {
++        expandsByDefault = false
++        exceptions = expandedIDs
++    }
++
++    private init(expandsByDefault: Bool) {
++        self.expandsByDefault = expandsByDefault
++        exceptions = []
++    }
++
++    static var root: Self { Self(expandedIDs: [0]) }
++    static var all: Self { Self(expandsByDefault: true) }
++    static var collapsed: Self { Self(expandedIDs: []) }
++
++    func contains(_ id: Int) -> Bool {
++        if expandsByDefault { return !exceptions.contains(id) }
++        return exceptions.contains(id)
++    }
++
++    mutating func toggle(_ id: Int) {
++        if exceptions.contains(id) { exceptions.remove(id) }
++        else { exceptions.insert(id) }
++    }
++}
++
++struct BodyJSONDocument: Sendable {
++    static let maximumPageBytes = 8 * 1024
++    let nodes: [BodyJSONNode]
++    let sourceByteCount: Int
++    var rootID: Int { 0 }
++
++    /// Exactly one JSONSerialization parse, including top-level scalar fragments.
++    static func parse(_ source: String) throws -> Self {
++        try Task<Never, Never>.checkCancellation()
++        let data = Data(source.utf8)
++        try Task<Never, Never>.checkCancellation()
++        let object = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
++        // Foundation's synchronous parser cannot be interrupted, so check again before traversal.
++        try Task<Never, Never>.checkCancellation()
++        var builder = BodyJSONDocumentBuilder()
++        try builder.append(object, key: nil, arrayIndex: nil, depth: 0)
++        try Task<Never, Never>.checkCancellation()
++        return Self(nodes: builder.nodes, sourceByteCount: data.count)
++    }
++
++    func visibleRows(expandedIDs: Set<Int>) throws -> [BodyJSONRow] {
++        try visibleRows(expansion: BodyJSONExpansion(expandedIDs: expandedIDs))
++    }
++
++    /// Work is proportional to visible rows; no recursive view hierarchy or child-count cap.
++    func visibleRows(expansion: BodyJSONExpansion = .root) throws -> [BodyJSONRow] {
++        try Task<Never, Never>.checkCancellation()
++        var result: [BodyJSONRow] = []
++        var index = 0
++        while index < nodes.count {
++            if result.count & 127 == 0 { try Task<Never, Never>.checkCancellation() }
++            let node = nodes[index]
++            let expanded = node.canExpand && expansion.contains(node.id)
++            result.append(BodyJSONRow(id: node.id, depth: node.depth, isExpanded: expanded))
++            if expanded { index += 1 }
++            else { index = node.subtreeEndIndex }
++        }
++        try Task<Never, Never>.checkCancellation()
++        return result
++    }
++
++    /// Formats the parsed nodes directly, never reparsing or constructing one giant pretty string.
++    /// Joining the pages yields valid pretty JSON; each page is at most 8192 UTF-8 bytes.
++    func formattedPages(pageBytes: Int = maximumPageBytes) throws -> [String] {
++        try Task<Never, Never>.checkCancellation()
++        var writer = BodyJSONPageWriter(pageBytes: pageBytes)
++        if !nodes.isEmpty { try writeNode(0, to: &writer) }
++        try Task<Never, Never>.checkCancellation()
++        return writer.finish()
++    }
++
++    private func writeNode(_ index: Int, to writer: inout BodyJSONPageWriter) throws {
++        try Task<Never, Never>.checkCancellation()
++        let node = nodes[index]
++        if let key = node.key {
++            try writer.appendQuoted(key)
++            try writer.append(": ")
++        }
++        switch node.kind {
++        case .object, .array:
++            let isObject: Bool
++            switch node.kind {
++            case .object: isObject = true
++            default: isObject = false
++            }
++            try writer.append(isObject ? "{" : "[")
++            if node.childCount > 0 {
++                try writer.append("\n")
++                var child = index + 1
++                while child < node.subtreeEndIndex {
++                    try writer.indent(nodes[child].depth)
++                    try writeNode(child, to: &writer)
++                    child = nodes[child].subtreeEndIndex
++                    if child < node.subtreeEndIndex { try writer.append(",") }
++                    try writer.append("\n")
++                }
++                try writer.indent(node.depth)
++            }
++            try writer.append(isObject ? "}" : "]")
++        case .string:
++            guard let value = node.value else { throw BodyJSONDocumentError.unsupportedValue }
++            try writer.appendQuoted(value)
++        case .number, .boolean, .null:
++            guard let value = node.value else { throw BodyJSONDocumentError.unsupportedValue }
++            try writer.append(value)
++        }
++    }
++}
++
++private enum BodyJSONDocumentError: LocalizedError {
++    case unsupportedValue
++    var errorDescription: String? { "JSON 中包含无法显示的值。" }
++}
++
++private struct BodyJSONDocumentBuilder {
++    var nodes: [BodyJSONNode] = []
++
++    mutating func append(_ object: Any, key: String?, arrayIndex: Int?, depth: Int) throws {
++        try Task<Never, Never>.checkCancellation()
++        let id = nodes.count
++        let keySummary = key.map { BodyJSONPreview.quoted($0) }
++        let kind: BodyJSONNode.Kind
++        let value: String?
++        let childCount: Int
++        let dictionary = object as? [String: Any]
++        let array = object as? [Any]
++        if let dictionary = dictionary {
++            kind = .object
++            value = nil
++            childCount = dictionary.count
++        } else if let array = array {
++            kind = .array
++            value = nil
++            childCount = array.count
++        } else if let number = object as? NSNumber {
++            // Swift's `as? Bool` also accepts NSNumber(0/1); test CF identity instead.
++            if CFGetTypeID(number) == CFBooleanGetTypeID() {
++                kind = .boolean
++                value = number.boolValue ? "true" : "false"
++            } else {
++                kind = .number
++                value = number.stringValue
++            }
++            childCount = 0
++        } else if let string = object as? String {
++            kind = .string
++            value = string
++            childCount = 0
++        } else if object is NSNull {
++            kind = .null
++            value = "null"
++            childCount = 0
++        } else {
++            throw BodyJSONDocumentError.unsupportedValue
++        }
++
++        let summary: (text: String, truncated: Bool)
++        switch kind {
++        case .object: summary = ("{ \(childCount) 个成员 }", false)
++        case .array: summary = ("[ \(childCount) 项 ]", false)
++        case .string:
++            guard let value = value else { throw BodyJSONDocumentError.unsupportedValue }
++            summary = BodyJSONPreview.quoted(value)
++        case .number, .boolean, .null:
++            guard let value = value else { throw BodyJSONDocumentError.unsupportedValue }
++            summary = (value, false)
++        }
++        func node(endingAt end: Int) -> BodyJSONNode {
++            BodyJSONNode(id: id, depth: depth, key: key, arrayIndex: arrayIndex,
++                         kind: kind, value: value, childCount: childCount, subtreeEndIndex: end,
++                         keyPreview: keySummary?.text, valuePreview: summary.text,
++                         isKeyTruncated: keySummary?.truncated ?? false,
++                         isValueTruncated: summary.truncated)
++        }
++        nodes.append(node(endingAt: id + 1))
++        if let dictionary = dictionary {
++            // Sorting makes IDs and formatted output deterministic for the same input value.
++            let keys = dictionary.keys.sorted()
++            try Task<Never, Never>.checkCancellation()
++            for childKey in keys {
++                try Task<Never, Never>.checkCancellation()
++                guard let child = dictionary[childKey] else {
++                    throw BodyJSONDocumentError.unsupportedValue
++                }
++                try append(child, key: childKey, arrayIndex: nil, depth: depth + 1)
++            }
++        } else if let array = array {
++            for (offset, child) in array.enumerated() {
++                try append(child, key: nil, arrayIndex: offset, depth: depth + 1)
++            }
++        }
++        nodes[id] = node(endingAt: nodes.count)
++    }
++}
++
++private enum BodyJSONPreview {
++    /// Scalar-based: even one enormous combining-character cluster stays a bounded preview.
++    static func quoted(_ value: String) -> (text: String, truncated: Bool) {
++        var text = "\""
++        var count = 0
++        var truncated = false
++        for scalar in value.unicodeScalars {
++            if count == 120 { truncated = true; break }
++            text += BodyJSONEscaping.token(for: scalar)
++            count += 1
++        }
++        if truncated { text += "…" }
++        text += "\""
++        return (text, truncated)
++    }
++}
++
++private enum BodyJSONEscaping {
++    static func token(for scalar: Unicode.Scalar) -> String {
++        switch scalar.value {
++        case 0x22: return "\\\""
++        case 0x5C: return "\\\\"
++        case 0x08: return "\\b"
++        case 0x0C: return "\\f"
++        case 0x0A: return "\\n"
++        case 0x0D: return "\\r"
++        case 0x09: return "\\t"
++        case 0...0x1F: return String(format: "\\u%04X", scalar.value)
++        default: return String(scalar)
++        }
++    }
++}
++
++private struct BodyJSONPageWriter {
++    private let limit: Int
++    private var pages: [String] = []
++    private var buffer = ""
++    private var bufferBytes = 0
++    private var work = 0
++
++    init(pageBytes: Int) {
++        limit = min(BodyJSONDocument.maximumPageBytes, max(4, pageBytes))
++    }
++
++    mutating func append(_ text: String) throws {
++        for scalar in text.unicodeScalars {
++            work &+= 1
++            if work & 1023 == 0 { try Task<Never, Never>.checkCancellation() }
++            let value = scalar.value
++            let bytes: Int
++            if value <= 0x7F { bytes = 1 }
++            else if value <= 0x7FF { bytes = 2 }
++            else if value <= 0xFFFF { bytes = 3 }
++            else { bytes = 4 }
++            if bufferBytes + bytes > limit {
++                pages.append(buffer)
++                buffer = ""
++                bufferBytes = 0
++            }
++            buffer.unicodeScalars.append(scalar)
++            bufferBytes += bytes
++        }
++    }
++
++    mutating func appendQuoted(_ value: String) throws {
++        try append("\"")
++        for scalar in value.unicodeScalars {
++            try append(BodyJSONEscaping.token(for: scalar))
++        }
++        try append("\"")
++    }
++
++    mutating func indent(_ depth: Int) throws {
++        for _ in 0..<(depth * 2) { try append(" ") }
++    }
++
++    mutating func finish() -> [String] {
++        if !buffer.isEmpty || pages.isEmpty { pages.append(buffer) }
++        return pages
++    }
++}
+--- /dev/null
++++ b/TraceUI/Body/BodyJSONModel.swift
+@@ -0,0 +1,212 @@
++import Foundation
++import Combine
++
++/// A single-input, owner-scoped cache shared by inline and fullscreen viewers.
++/// View disappearance or mode changes do not cancel shared work; a new input or deinit does.
++@MainActor
++final class BodyJSONModel: ObservableObject {
++    @Published private(set) var generation: UInt64 = 0
++    @Published private(set) var document: BodyJSONDocument?
++    @Published private(set) var rows: [BodyJSONRow] = []
++    @Published private(set) var formattedPages: [String]?
++    @Published private(set) var parseError: String?
++    @Published private(set) var formattingError: String?
++    @Published private(set) var projectionError: String?
++    @Published private(set) var isParsing = false
++    @Published private(set) var isFormatting = false
++    @Published private(set) var isProjecting = false
++
++    private var source: String?
++    private var expansion = BodyJSONExpansion.root
++    private var projectionGeneration: UInt64 = 0
++    private var wantsFormatting = false
++    private var parseTask: Task<BodyJSONPreparedDocument, Error>?
++    private var formattingTask: Task<[String], Error>?
++    private var projectionTask: Task<[BodyJSONRow], Error>?
++    private var parseDelivery: Task<Void, Never>?
++    private var formattingDelivery: Task<Void, Never>?
++    private var projectionDelivery: Task<Void, Never>?
++
++    /// Default values require no actor access, so SwiftUI can own this with @StateObject.
++    nonisolated init() {}
++
++    deinit {
++        parseTask?.cancel()
++        formattingTask?.cancel()
++        projectionTask?.cancel()
++        parseDelivery?.cancel()
++        formattingDelivery?.cancel()
++        projectionDelivery?.cancel()
++    }
++
++    func matches(_ input: String) -> Bool { source == input }
++
++    func clear() {
++        guard source != nil else { return }
++        cancelTasks()
++        generation &+= 1
++        projectionGeneration &+= 1
++        source = nil
++        document = nil
++        rows = []
++        formattedPages = nil
++        parseError = nil
++        formattingError = nil
++        projectionError = nil
++        wantsFormatting = false
++        isParsing = false
++        isFormatting = false
++        isProjecting = false
++    }
++
++    /// Repeated requests for the same String share the existing task/result, even in raw mode.
++    /// This starts work but does not await it, so delivery never retains this owner across an await.
++    func load(_ input: String) {
++        guard source != input else { return }
++        cancelTasks()
++        generation &+= 1
++        projectionGeneration &+= 1
++        let token = generation
++        source = input
++        expansion = .root
++        wantsFormatting = false
++        document = nil
++        rows = []
++        formattedPages = nil
++        parseError = nil
++        formattingError = nil
++        projectionError = nil
++        isParsing = true
++        isFormatting = false
++        isProjecting = false
++
++        let worker = Task.detached(priority: .userInitiated) {
++            let document = try BodyJSONDocument.parse(input)
++            let rows = try document.visibleRows()
++            return BodyJSONPreparedDocument(document: document, rows: rows)
++        }
++        parseTask = worker
++        parseDelivery = Task { [weak self] in
++            let result = await worker.result
++            guard !Task.isCancelled else { return }
++            self?.acceptParse(result, generation: token)
++        }
++    }
++
++    /// Lazy, once-per-document formatting. Leaving formatted mode does not restart/cancel it.
++    func prepareFormattedPages() {
++        wantsFormatting = true
++        guard let document = document, formattedPages == nil,
++              formattingTask == nil, formattingError == nil else { return }
++        isFormatting = true
++        let token = generation
++        let worker = Task.detached(priority: .userInitiated) {
++            try document.formattedPages()
++        }
++        formattingTask = worker
++        formattingDelivery = Task { [weak self] in
++            let result = await worker.result
++            guard !Task.isCancelled else { return }
++            self?.acceptFormatting(result, generation: token)
++        }
++    }
++
++    func toggle(_ nodeID: Int) {
++        guard let document = document, document.nodes.indices.contains(nodeID),
++              document.nodes[nodeID].canExpand else { return }
++        expansion.toggle(nodeID)
++        projectRows()
++    }
++
++    func expandAll() {
++        guard document != nil else { return }
++        expansion = .all
++        projectRows()
++    }
++
++    func collapseAll() {
++        guard document != nil else { return }
++        expansion = .collapsed
++        projectRows()
++    }
++
++    private func acceptParse(_ result: Result<BodyJSONPreparedDocument, Error>, generation token: UInt64) {
++        guard generation == token else { return }
++        parseTask = nil
++        parseDelivery = nil
++        isParsing = false
++        switch result {
++        case .success(let prepared):
++            document = prepared.document
++            rows = prepared.rows
++            if wantsFormatting { prepareFormattedPages() }
++        case .failure(let error):
++            parseError = error.localizedDescription
++        }
++    }
++
++    private func acceptFormatting(_ result: Result<[String], Error>, generation token: UInt64) {
++        guard generation == token else { return }
++        formattingTask = nil
++        formattingDelivery = nil
++        isFormatting = false
++        switch result {
++        case .success(let pages): formattedPages = pages
++        case .failure(let error): formattingError = error.localizedDescription
++        }
++    }
++
++    private func projectRows() {
++        guard let document = document else { return }
++        projectionTask?.cancel()
++        projectionDelivery?.cancel()
++        projectionGeneration &+= 1
++        let projectionToken = projectionGeneration
++        let documentToken = generation
++        let expansion = expansion
++        isProjecting = true
++        projectionError = nil
++        let worker = Task.detached(priority: .userInitiated) {
++            try document.visibleRows(expansion: expansion)
++        }
++        projectionTask = worker
++        projectionDelivery = Task { [weak self] in
++            let result = await worker.result
++            guard !Task.isCancelled else { return }
++            self?.acceptProjection(result, generation: documentToken, projection: projectionToken)
++        }
++    }
++
++    private func acceptProjection(_ result: Result<[BodyJSONRow], Error>,
++                                  generation token: UInt64, projection: UInt64) {
++        guard generation == token, projectionGeneration == projection else { return }
++        projectionTask = nil
++        projectionDelivery = nil
++        isProjecting = false
++        switch result {
++        case .success(let projected): rows = projected
++        case .failure(let error): projectionError = error.localizedDescription
++        }
++    }
++
++    private func cancelTasks() {
++        parseTask?.cancel()
++        formattingTask?.cancel()
++        projectionTask?.cancel()
++        parseDelivery?.cancel()
++        formattingDelivery?.cancel()
++        projectionDelivery?.cancel()
++        parseTask = nil
++        formattingTask = nil
++        projectionTask = nil
++        parseDelivery = nil
++        formattingDelivery = nil
++        projectionDelivery = nil
++    }
++
++}
++
++private struct BodyJSONPreparedDocument: Sendable {
++    let document: BodyJSONDocument
++    let rows: [BodyJSONRow]
++}
+--- /dev/null
++++ b/TraceUI/Body/BodyPageTextView.swift
+@@ -0,0 +1,68 @@
++import Foundation
++import SwiftUI
++
++/// Only one display page is laid out or highlighted, never an entire document.
++struct BodyPageTextView: View {
++    let text: String
++    let syntaxHighlightJSON: Bool
++    @State private var highlighted: AttributedString?
++    @State private var highlightedSource: String?
++
++    var body: some View {
++        Group {
++            if highlightedSource == text, let highlighted {
++                Text(highlighted)
++            } else {
++                Text(text)
++            }
++        }
++        .font(.system(.footnote, design: .monospaced))
++        .textSelection(.enabled)
++        .frame(maxWidth: .infinity, alignment: .leading)
++        .fixedSize(horizontal: false, vertical: true)
++        .task(id: text) {
++            highlighted = nil
++            highlightedSource = nil
++            guard syntaxHighlightJSON else { return }
++            let source = text
++            let work = Task.detached(priority: .userInitiated) {
++                Self.highlight(source)
++            }
++            let result = await withTaskCancellationHandler(operation: {
++                await work.value
++            }, onCancel: { work.cancel() })
++            guard !Task.isCancelled else { return }
++            highlighted = result
++            highlightedSource = source
++        }
++    }
++
++    private nonisolated static func highlight(_ source: String) -> AttributedString {
++        var result = AttributedString(source)
++        // The bound is independent of total body size, including cached formatted pages.
++        guard source.utf8.count <= BodyTextPagination.defaultPageBytes + 3,
++              let regex = try? NSRegularExpression(
++                pattern: #"\"(?:\\.|[^\"\\])*\"(\s*:)?|-?\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b|\b(?:true|false|null)\b|[\[\]{}]"#)
++        else { return result }
++        let matches = regex.matches(in: source, range: NSRange(source.startIndex..., in: source))
++        for match in matches {
++            if Task.isCancelled { break }
++            guard let swiftRange = Range(match.range, in: source),
++                  let range = Range(match.range, in: result) else { continue }
++            let token = source[swiftRange]
++            let color: Color
++            if token.first == "\"" {
++                color = match.range(at: 1).location == NSNotFound
++                    ? DesignSystem.Colors.success : DesignSystem.Colors.accent
++            } else if token == "null" {
++                color = DesignSystem.Colors.muted
++            } else if token.count == 1, let first = token.first, "[]{}".contains(first) {
++                color = .secondary
++            } else {
++                color = DesignSystem.Colors.warning
++            }
++            result[range].foregroundColor = color
++        }
++        return result
++    }
++}
+--- a/TraceUI/Body/BodyTextPagination.swift
++++ b/TraceUI/Body/BodyTextPagination.swift
+@@ -5,12 +5,14 @@
+     public static let defaultPageBytes = 8 * 1024
+ 
+     public static func pages(_ text: String, pageBytes: Int = defaultPageBytes) -> [String] {
++        guard !Task.isCancelled else { return [] }
+         guard !text.isEmpty else { return [""] }
+         let bytes = Array(text.utf8)
+         let budget = max(4, pageBytes)
+         var result: [String] = []
+         var start = 0
+         while start < bytes.count {
++            guard !Task.isCancelled else { return [] }
+             var end = min(start + budget, bytes.count)
+             // Include the rest of a UTF-8 scalar rather than inserting replacement characters.
+             while end < bytes.count, bytes[end] & 0xC0 == 0x80 { end += 1 }
+--- a/TraceUI/Body/JSONViewerView.swift
++++ b/TraceUI/Body/JSONViewerView.swift
+@@ -6,40 +6,15 @@
+ //
+ 
+ import SwiftUI
+-
+-/// Presents JSON content with syntax highlighting and a tree view.
++import UIKit
++
++/// The host supplies the sole mode control. This view owns or observes one document cache.
+ public struct JSONViewerView: View {
+     public let jsonString: String
+     private let externalMode: Binding<ViewMode>?
+-
+-    public init(jsonString: String) {
+-        self.jsonString = jsonString
+-        self.externalMode = nil
+-    }
+-
+-    /// 由宿主页统一提供视图模式，页面上只出现一个控件。
+-    public init(jsonString: String, mode: Binding<ViewMode>) {
+-        self.jsonString = jsonString
+-        self.externalMode = mode
+-    }
+-
+-    private var viewMode: ViewMode { externalMode?.wrappedValue ?? internalMode }
+-
+-    private func setMode(_ mode: ViewMode) {
+-        if let externalMode {
+-            externalMode.wrappedValue = mode
+-        } else {
+-            internalMode = mode
+-        }
+-    }
+-
++    private let sharedModel: BodyJSONModel?
+     @State private var internalMode: ViewMode = .tree
+-    @State private var parsedJSON: JSONValue?
+-    @State private var parseError: String?
+-    @State private var expandedPaths: Set<String> = []
+-    @State private var isParsing = false
+-    @State private var formattedJSON: AttributedString?
+-    @State private var didTruncateExpansion = false
++    @StateObject private var ownedModel = BodyJSONModel()
+ 
+     public enum ViewMode: String, CaseIterable {
+         case formatted = "Formatted"
+@@ -47,535 +22,249 @@
+         case raw = "Raw"
+     }
+ 
++    public init(jsonString: String) {
++        self.jsonString = jsonString
++        externalMode = nil
++        sharedModel = nil
++    }
++
++    public init(jsonString: String, mode: Binding<ViewMode>) {
++        self.jsonString = jsonString
++        externalMode = mode
++        sharedModel = nil
++    }
++
++    /// Inline and fullscreen hosts must pass the same @StateObject instance here.
++    init(jsonString: String, model: BodyJSONModel, mode: Binding<ViewMode>) {
++        self.jsonString = jsonString
++        externalMode = mode
++        sharedModel = model
++    }
++
+     public var body: some View {
++        BodyJSONContentView(jsonString: jsonString, model: sharedModel ?? ownedModel,
++                            mode: externalMode?.wrappedValue ?? internalMode) {
++            if let externalMode = externalMode { externalMode.wrappedValue = .raw }
++            else { internalMode = .raw }
++        }
++    }
++}
++
++@MainActor
++private struct BodyJSONContentView: View {
++    let jsonString: String
++    @ObservedObject var model: BodyJSONModel
++    let mode: JSONViewerView.ViewMode
++    let showRaw: () -> Void
++    @State private var detail: BodyJSONDetail?
++
++    var body: some View {
+         VStack(spacing: 0) {
+             Divider()
+-
+-            if isLargePayload {
+-                Label("Large JSON detected. Parsing may take longer.", systemImage: "exclamationmark.triangle")
+-                    .font(.footnote)
+-                    .foregroundStyle(.secondary)
+-                    .padding(.horizontal)
+-                    .padding(.top, DesignSystem.Spacing.xs)
+-            }
+-
+-            if shouldBypassStructuredParsing {
+-                Label("Showing raw JSON because structured parsing is disabled for very large payloads.", systemImage: "info.circle")
+-                    .font(.footnote)
+-                    .foregroundStyle(.secondary)
+-                    .padding(.horizontal)
+-                    .padding(.top, DesignSystem.Spacing.xs)
+-            }
+-
+-            switch viewMode {
+-            case .formatted:
+-                ScrollView(.vertical) {
+-                    formattedView
+-                        .padding()
+-                }
+-            case .tree:
+-                ScrollView(.vertical) {
+-                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
+-                        treeToolbar
+-                        treeView
++            if mode == .raw {
++                ScrollView {
++                    PagedBodyTextView(content: jsonString).padding()
++                }
++            } else if !model.matches(jsonString) || model.isParsing {
++                ProgressView("正在解析 JSON…")
++                    .frame(maxWidth: .infinity, maxHeight: .infinity)
++            } else if let error = model.parseError {
++                errorView(title: "JSON 解析失败", message: error)
++            } else if mode == .formatted {
++                formattedView
++            } else {
++                treeView
++            }
++        }
++        .task(id: jsonString) {
++            guard !Task.isCancelled else { return }
++            model.load(jsonString)
++            if mode == .formatted { model.prepareFormattedPages() }
++        }
++        .onChange(of: mode) { newMode in
++            if newMode == .formatted { model.prepareFormattedPages() }
++        }
++        .onChange(of: model.generation) { _ in detail = nil }
++        .sheet(item: $detail) { item in
++            NavigationStack {
++                ScrollView {
++                    // Full decoded keys/values remain paged, including pathological long strings.
++                    PagedBodyTextView(content: item.content).padding()
++                }
++                .navigationTitle(item.title)
++                .navigationBarTitleDisplayMode(.inline)
++                .toolbar {
++                    ToolbarItem(placement: .navigationBarLeading) {
++                        Button("复制") { UIPasteboard.general.string = item.content }
+                     }
+-                    .padding()
+-                }
+-            case .raw:
+-                ScrollView(.vertical) {
+-                    rawView
+-                        .padding()
+-                }
+-            }
+-        }
+-        .task(id: jsonString) {
+-            await parseAndPrepare()
+-        }
+-    }
+-
+-    private var treeToolbar: some View {
+-        HStack(spacing: DesignSystem.Spacing.sm) {
+-            if !shouldBypassStructuredParsing {
+-                Text("已展开 \(expandedPaths.count) 个节点")
+-                    .font(.caption2)
+-                    .foregroundStyle(.secondary)
+-                Spacer()
+-                Button(expandedPaths.isEmpty || expandedPaths == ["root"] ? "展开全部" : "全部收起") {
+-                    if expandedPaths.isEmpty || expandedPaths == ["root"] {
+-                        didTruncateExpansion = expandAllNodes(maxNodes: maxExpandedNodes)
+-                    } else {
+-                        expandedPaths = ["root"]
+-                        didTruncateExpansion = false
++                    ToolbarItem(placement: .navigationBarTrailing) {
++                        Button("完成") { detail = nil }
+                     }
+                 }
+-                .font(.caption2.weight(.semibold))
+-                .buttonStyle(.borderless)
+-            }
+-        }
+-        .frame(maxWidth: .infinity, alignment: .leading)
+-    }
+-
+-    // MARK: - Formatted View
+-
++            }
++        }
++    }
++
++    @ViewBuilder
+     private var formattedView: some View {
+-        Group {
+-            if isParsing {
+-                ProgressView("Parsing…")
+-                    .frame(maxWidth: .infinity, alignment: .leading)
+-            } else if shouldBypassStructuredParsing {
+-                PagedBodyTextView(content: jsonString)
+-            } else {
+-                // Never run parsing or regex highlighting synchronously while building a view.
+-                Text(formattedJSON ?? AttributedString(jsonString))
+-                    .font(DesignSystem.Typography.monospacedFont)
+-                    .frame(maxWidth: .infinity, alignment: .leading)
+-                    .textSelection(.enabled)
+-            }
+-        }
+-    }
+-
+-    // MARK: - Tree View
++        if let error = model.formattingError {
++            errorView(title: "JSON 格式化失败", message: error)
++        } else if let pages = model.formattedPages {
++            ScrollView {
++                // The shared model caches plain pages; only the visible page is highlighted.
++                PagedBodyTextView(pages: pages, syntaxHighlightJSON: true).padding()
++            }
++        } else {
++            ProgressView("正在准备格式化分页…")
++                .frame(maxWidth: .infinity, maxHeight: .infinity)
++        }
++    }
+ 
+     private var treeView: some View {
+-        LazyVStack(alignment: .leading, spacing: 0) {
+-            if shouldBypassStructuredParsing {
+-                Text("Tree view is unavailable for very large JSON payloads.")
+-                    .foregroundStyle(.secondary)
+-                    .frame(maxWidth: .infinity, alignment: .leading)
+-            } else if didTruncateExpansion {
+-                Label("Showing a limited tree expansion for performance.", systemImage: "info.circle")
+-                    .font(.footnote)
+-                    .foregroundStyle(.secondary)
+-                    .padding(.bottom, DesignSystem.Spacing.sm)
+-            }
+-            if shouldBypassStructuredParsing {
+-                EmptyView()
+-            } else if let root = parsedJSON {
+-                jsonNode(root, key: nil, path: "root", level: 0)
+-            } else if let error = parseError {
+-                errorView(error: error)
+-            } else if isParsing {
+-                ProgressView("Parsing…")
+-                    .frame(maxWidth: .infinity, alignment: .leading)
+-            } else {
+-                Text("Parsing...")
+-                    .foregroundStyle(.secondary)
+-            }
+-        }
+-    }
+-
+-    // Rationale: Use `AnyView` to avoid recursive `some View` type inference.
+-    private func jsonNode(_ value: JSONValue, key: String?, path: String, level: Int) -> AnyView {
+-        let isExpanded = expandedPaths.contains(path)
+-        let hasChildren = value.hasChildren
+-        var longString = false
+-        if case let .string(text) = value, text.count > 50 { longString = true }
+-        let canToggle = hasChildren || longString
+-
+-        return AnyView(
+-            VStack(alignment: .leading, spacing: 0) {
+-                Button {
+-                    guard canToggle else { return }
+-                    withAnimation(DesignSystem.Accessibility.preferredAnimation) {
+-                        if isExpanded {
+-                            expandedPaths.remove(path)
+-                        } else {
+-                            expandedPaths.insert(path)
++        VStack(alignment: .leading, spacing: 8) {
++            treeToolbar
++            if let error = model.projectionError {
++                errorView(title: "JSON 树更新失败", message: error)
++            } else if let document = model.document {
++                ScrollView {
++                    LazyVStack(alignment: .leading, spacing: 4) {
++                        ForEach(model.rows) { row in
++                            let node = document.nodes[row.id]
++                            BodyJSONTreeRow(node: node, row: row,
++                                            toggle: { model.toggle(row.id) },
++                                            showKey: { present(node, key: true) },
++                                            showValue: { present(node, key: false) })
+                         }
+                     }
+-                } label: {
+-                    HStack(spacing: DesignSystem.Spacing.xs) {
+-                        if level > 0 {
+-                            Color.clear
+-                                .frame(width: CGFloat(level) * 12)
+-                        }
+-
+-                        if canToggle {
+-                            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+-                                .font(.caption2)
+-                                .foregroundStyle(.secondary)
+-                                .frame(width: 12)
+-                        } else {
+-                            Color.clear.frame(width: 12)
+-                        }
+-
+-                        if let key {
+-                            Text("\"\(key)\"")
+-                                .font(.system(.footnote, design: .monospaced))
+-                                .foregroundStyle(DesignSystem.Colors.accent)
+-                            Text(":")
+-                                .font(.system(.footnote, design: .monospaced))
+-                                .foregroundStyle(.secondary)
+-                        }
+-
+-                        valuePreview(value, expanded: isExpanded)
+-
+-                        Spacer()
+-
+-                        if hasChildren {
+-                            Text(value.countDescription)
+-                                .font(.system(.caption2, design: .monospaced))
+-                                .foregroundStyle(.tertiary)
+-                        }
+-                    }
++                    .frame(maxWidth: .infinity, alignment: .leading)
++                    .padding(.horizontal)
++                }
++                .id(model.generation)
++                // Expansion is a new flat projection, never thousands of animated insertions.
++                .transaction { $0.animation = nil }
++            }
++        }
++        .padding(.top, 8)
++    }
++
++    private var treeToolbar: some View {
++        HStack(spacing: 12) {
++            if model.isProjecting {
++                ProgressView().controlSize(.small)
++            } else {
++                Text("\(model.rows.count) 行").font(.caption).foregroundStyle(.secondary)
++            }
++            Spacer(minLength: 0)
++            Button("展开全部") { model.expandAll() }
++                .disabled(model.document?.nodes.first?.canExpand != true)
++            Button("全部收起") { model.collapseAll() }
++                .disabled(model.document?.nodes.first?.canExpand != true)
++            Button {
++                UIPasteboard.general.string = jsonString
++            } label: {
++                Image(systemName: "doc.on.doc")
++            }
++            .accessibilityLabel("复制完整 JSON 原文")
++        }
++        .font(.caption)
++        .buttonStyle(.borderless)
++        .padding(.horizontal)
++    }
++
++    private func errorView(title: String, message: String) -> some View {
++        ScrollView {
++            VStack(alignment: .leading, spacing: 12) {
++                Label(title, systemImage: "exclamationmark.triangle")
++                    .font(.headline).foregroundStyle(DesignSystem.Colors.warning)
++                Text(message).font(.caption).textSelection(.enabled)
++                Button("查看原文", action: showRaw).buttonStyle(.bordered)
++            }
++            .frame(maxWidth: .infinity, alignment: .leading)
++            .padding()
++        }
++    }
++
++    private func present(_ node: BodyJSONNode, key: Bool) {
++        let content: String?
++        if key { content = node.key }
++        else { content = node.value }
++        guard let content = content else { return }
++        detail = BodyJSONDetail(id: "\(model.generation):\(node.id):\(key)",
++                                title: key ? "完整键" : "完整值", content: content)
++    }
++}
++
++private struct BodyJSONDetail: Identifiable {
++    let id: String
++    let title: String
++    let content: String
++}
++
++private struct BodyJSONTreeRow: View {
++    let node: BodyJSONNode
++    let row: BodyJSONRow
++    let toggle: () -> Void
++    let showKey: () -> Void
++    let showValue: () -> Void
++
++    var body: some View {
++        HStack(alignment: .top, spacing: 4) {
++            if node.canExpand {
++                Button(action: toggle) {
++                    Image(systemName: row.isExpanded ? "chevron.down" : "chevron.right")
++                        .font(.caption2)
++                        .frame(width: 24, height: 44)
++                        .contentShape(Rectangle())
+                 }
+                 .buttonStyle(.plain)
+-                .contentShape(Rectangle())
+-                .frame(minHeight: DesignSystem.Accessibility.minimumTapTarget, alignment: .leading)
+-                .padding(.vertical, DesignSystem.Spacing.xxs)
+-                .background(isExpanded && hasChildren ? DesignSystem.Colors.surfaceMuted.opacity(0.3) : Color.clear)
+-                .clipShape(RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm))
+-                .accessibilityLabel(jsonNodeAccessibilityLabel(key: key, value: value, isExpanded: isExpanded, hasChildren: hasChildren))
+-                .accessibilityValue(hasChildren ? (isExpanded ? "Expanded" : "Collapsed") : "")
+-                .accessibilityHint(hasChildren ? "Double tap to \(isExpanded ? "collapse" : "expand")" : "")
+-
+-                if isExpanded && hasChildren {
+-                    childrenView(value, parentPath: path, level: level)
+-                }
+-            }
+-        )
+-    }
+-
+-    @ViewBuilder
+-    private func valuePreview(_ value: JSONValue, expanded: Bool) -> some View {
+-        switch value {
+-        case .null:
+-            Text("null")
+-                .font(.system(.footnote, design: .monospaced))
+-                .foregroundStyle(DesignSystem.Colors.muted)
+-
+-        case let .bool(b):
+-            Text(b ? "true" : "false")
+-                .font(.system(.footnote, design: .monospaced))
+-                .foregroundStyle(DesignSystem.Colors.warning)
+-
+-        case let .number(n):
+-            Text(formatNumber(n))
+-                .font(.system(.footnote, design: .monospaced))
+-                .foregroundStyle(DesignSystem.Colors.warning)
+-
+-        case let .string(s):
+-            if s.count > 50 && !expanded {
+-                Text("\"\(s.prefix(50))...\"")
+-                    .font(.system(.footnote, design: .monospaced))
+-                    .foregroundStyle(DesignSystem.Colors.success)
++                .accessibilityLabel(row.isExpanded ? "收起节点" : "展开节点")
++                .accessibilityValue(node.keyPreview ?? "JSON 节点")
+             } else {
+-                Text("\"\(s)\"")
+-                    .font(.system(.footnote, design: .monospaced))
+-                    .foregroundStyle(DesignSystem.Colors.success)
++                Color.clear.frame(width: 24, height: 1).accessibilityHidden(true)
++            }
++            VStack(alignment: .leading, spacing: 4) {
++                if let key = node.keyPreview {
++                    Text(key + ":").foregroundStyle(DesignSystem.Colors.accent)
++                        .textSelection(.enabled)
++                } else if let index = node.arrayIndex {
++                    Text("[\(index)]").foregroundStyle(.secondary)
++                } else {
++                    Text("$").foregroundStyle(.secondary)
++                }
++                Text(node.valuePreview).foregroundColor(valueColor)
+                     .textSelection(.enabled)
+-            }
+-
+-        case let .array(arr):
+-            if expanded {
+-                Text("[")
+-                    .font(.system(.footnote, design: .monospaced))
+-                    .foregroundStyle(.secondary)
+-            } else {
+-                Text("[\(arr.count) items]")
+-                    .font(.system(.footnote, design: .monospaced))
+-                    .foregroundStyle(.secondary)
+-            }
+-
+-        case let .object(obj):
+-            if expanded {
+-                Text("{")
+-                    .font(.system(.footnote, design: .monospaced))
+-                    .foregroundStyle(.secondary)
+-            } else {
+-                Text("{\(obj.count) keys}")
+-                    .font(.system(.footnote, design: .monospaced))
+-                    .foregroundStyle(.secondary)
+-            }
+-        }
+-    }
+-
+-    @ViewBuilder
+-    private func childrenView(_ value: JSONValue, parentPath: String, level: Int) -> some View {
+-        switch value {
+-        case let .array(arr):
+-            ForEach(Array(arr.enumerated()), id: \.offset) { index, item in
+-                jsonNode(item, key: "[\(index)]", path: "\(parentPath).\(index)", level: level + 1)
+-            }
+-            closingBracket("]", level: level)
+-
+-        case let .object(obj):
+-            let sortedKeys = obj.keys.sorted()
+-            ForEach(Array(sortedKeys.enumerated()), id: \.offset) { _, key in
+-                if let val = obj[key] {
+-                    jsonNode(val, key: key, path: "\(parentPath).\(key)", level: level + 1)
+-                }
+-            }
+-            closingBracket("}", level: level)
+-
+-        default:
+-            EmptyView()
+-        }
+-    }
+-
+-    private func closingBracket(_ bracket: String, level: Int) -> some View {
+-        HStack(spacing: DesignSystem.Spacing.xs) {
+-            if level > 0 {
+-                Color.clear
+-                    .frame(width: CGFloat(level) * 12)
+-            }
+-            Color.clear.frame(width: 12)
+-            Text(bracket)
+-                .font(.system(.footnote, design: .monospaced))
+-                .foregroundStyle(.secondary)
+-        }
+-        .padding(.vertical, DesignSystem.Spacing.xxs)
+-    }
+-
+-    // MARK: - Raw View
+-
+-    private var rawView: some View {
+-        PagedBodyTextView(content: jsonString)
+-    }
+-
+-    // MARK: - Error View
+-
+-    private func errorView(error: String) -> some View {
+-        VStack(spacing: DesignSystem.Spacing.md) {
+-            Image(systemName: "exclamationmark.triangle")
+-                .font(.largeTitle)
+-                .foregroundStyle(DesignSystem.Colors.warning)
+-
+-            Text("Parse Error")
+-                .font(.headline)
+-
+-            Text(error)
+-                .font(.caption)
+-                .foregroundStyle(.secondary)
+-                .multilineTextAlignment(.center)
+-        }
+-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+-    }
+-
+-    // MARK: - JSON Parsing
+-
+-    @MainActor
+-    private func parseAndPrepare() async {
+-        isParsing = true
+-        parsedJSON = nil
+-        parseError = nil
+-        formattedJSON = nil
+-        expandedPaths = ["root"]
+-        didTruncateExpansion = false
+-        if shouldBypassStructuredParsing {
+-            if viewMode == .tree {
+-                setMode(.raw)
+-            }
+-            isParsing = false
+-            return
+-        }
+-
+-        let input = jsonString
+-        let (json, error, formatted) = await Task.detached(priority: .userInitiated) { () -> (JSONValue?, String?, AttributedString?) in
+-            guard let data = input.data(using: .utf8) else {
+-                return (nil as JSONValue?, "Invalid UTF-8 string", nil as AttributedString?)
+-            }
+-
+-            do {
+-                let jsonObject = try JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed)
+-                let parsed = JSONValue.from(jsonObject)
+-                let highlighted = Self.makeAttributedJSONString(from: input)
+-                return (parsed as JSONValue?, nil as String?, highlighted as AttributedString?)
+-            } catch {
+-                return (nil as JSONValue?, error.localizedDescription, nil as AttributedString?)
+-            }
+-        }.value
+-
+-        guard !Task.isCancelled else { return }
+-        parsedJSON = json
+-        parseError = error
+-        formattedJSON = formatted
+-
+-        if json != nil {
+-            didTruncateExpansion = expandAllNodes(maxNodes: maxAutoExpandedNodes)
+-        }
+-
+-        isParsing = false
+-    }
+-
+-    private func expandAllNodes(maxNodes: Int) -> Bool {
+-        guard let root = parsedJSON else { return false }
+-        expandedPaths = ["root"]
+-        var expandedCount = 0
+-        return collectPaths(root, path: "root", expandedCount: &expandedCount, maxNodes: maxNodes)
+-    }
+-
+-    @discardableResult
+-    private func collectPaths(_ value: JSONValue, path: String, expandedCount: inout Int, maxNodes: Int) -> Bool {
+-        guard expandedCount < maxNodes else { return true }
+-
+-        switch value {
+-        case let .array(arr):
+-            expandedPaths.insert(path)
+-            expandedCount += 1
+-            for (index, item) in arr.enumerated()
+-                where collectPaths(item, path: "\(path).\(index)", expandedCount: &expandedCount, maxNodes: maxNodes) {
+-                return true
+-            }
+-        case let .object(obj):
+-            expandedPaths.insert(path)
+-            expandedCount += 1
+-            for (key, val) in obj
+-                where collectPaths(val, path: "\(path).\(key)", expandedCount: &expandedCount, maxNodes: maxNodes) {
+-                return true
+-            }
+-        default:
+-            break
+-        }
+-
+-        return false
+-    }
+-
+-    // MARK: - Syntax Highlighting
+-
+-    private func attributedJSONString() -> AttributedString {
+-        Self.makeAttributedJSONString(from: jsonString)
+-    }
+-
+-    private nonisolated static func makeAttributedJSONString(from jsonString: String) -> AttributedString {
+-        guard let data = jsonString.data(using: .utf8),
+-              let json = try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed),
+-              let formatted = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]),
+-              let formattedString = String(data: formatted, encoding: .utf8)
+-        else {
+-            return AttributedString(jsonString)
+-        }
+-
+-        var result = AttributedString(formattedString)
+-        guard formattedString.utf8.count <= BodyViewerPolicy.jsonSyntaxHighlightBytes else { return result }
+-
+-        Self.highlightPattern(&result, pattern: "\"[^\"]+\"\\s*:", color: DesignSystem.Colors.accent)
+-        Self.highlightPattern(&result, pattern: ":\\s*\"[^\"]*\"", color: DesignSystem.Colors.success)
+-        Self.highlightPattern(&result, pattern: ":\\s*-?\\d+(\\.\\d+)?([eE][+-]?\\d+)?", color: DesignSystem.Colors.warning)
+-        Self.highlightPattern(&result, pattern: ":\\s*(true|false)", color: DesignSystem.Colors.warning)
+-        Self.highlightPattern(&result, pattern: ":\\s*null", color: DesignSystem.Colors.muted)
+-        Self.highlightPattern(&result, pattern: "[\\[\\]{}]", color: .secondary)
+-
+-        return result
+-    }
+-
+-    private nonisolated static func highlightPattern(_ text: inout AttributedString, pattern: String, color: Color) {
+-        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return }
+-        let nsRange = NSRange(text.startIndex ..< text.endIndex, in: text)
+-        let matches = regex.matches(in: String(text.characters), options: [], range: nsRange)
+-
+-        for match in matches {
+-            if let range = Range(match.range, in: text) {
+-                text[range].foregroundColor = color
+-            }
+-        }
+-    }
+-
+-    // MARK: - Helpers
+-
+-    private var isLargePayload: Bool {
+-        jsonString.utf8.count > 1_000_000
+-    }
+-
+-    private var shouldBypassStructuredParsing: Bool {
+-        BodyViewerPolicy.shouldBypassJSONStructuredParsing(byteCount: jsonString.utf8.count)
+-    }
+-
+-    private var maxExpandedNodes: Int {
+-        isLargePayload ? 200 : 1000
+-    }
+-
+-    private var maxAutoExpandedNodes: Int {
+-        isLargePayload ? 100 : 300
+-    }
+-
+-    private func jsonNodeAccessibilityLabel(key: String?, value: JSONValue, isExpanded: Bool, hasChildren: Bool) -> String {
+-        let keyText = key ?? "Root"
+-        guard hasChildren else { return keyText }
+-        return "\(isExpanded ? "Collapse" : "Expand") \(keyText)"
+-    }
+-
+-    private func formatNumber(_ n: NSNumber) -> String {
+-        if n.doubleValue == n.doubleValue.rounded() && abs(n.doubleValue) < Double(Int64.max) {
+-            return String(format: "%.0f", n.doubleValue)
+-        }
+-        return n.stringValue
+-    }
+-}
+-
+-// MARK: - JSON Value Type
+-
+-enum JSONValue: @unchecked Sendable {
+-    case null
+-    case bool(Bool)
+-    case number(NSNumber)
+-    case string(String)
+-    case array([JSONValue])
+-    case object([String: JSONValue])
+-
+-    var hasChildren: Bool {
+-        switch self {
+-        case let .array(arr): !arr.isEmpty
+-        case let .object(obj): !obj.isEmpty
+-        default: false
+-        }
+-    }
+-
+-    var countDescription: String {
+-        switch self {
+-        case let .array(arr): "\(arr.count) items"
+-        case let .object(obj): "\(obj.count) keys"
+-        default: ""
+-        }
+-    }
+-
+-    static func from(_ any: Any) -> JSONValue {
+-        if any is NSNull {
+-            return .null
+-        }
+-        if let bool = any as? Bool {
+-            return .bool(bool)
+-        }
+-        if let number = any as? NSNumber {
+-            return .number(number)
+-        }
+-        if let string = any as? String {
+-            return .string(string)
+-        }
+-        if let array = any as? [Any] {
+-            return .array(array.map { from($0) })
+-        }
+-        if let dict = any as? [String: Any] {
+-            return .object(dict.mapValues { from($0) })
+-        }
+-        return .null
+-    }
+-}
+-
+-#Preview {
+-    JSONViewerView(jsonString: """
+-    {
+-        "id": 12345,
+-        "name": "John Doe",
+-        "email": "john.doe@example.com",
+-        "active": true,
+-        "balance": 1234.56,
+-        "tags": ["developer", "swift", "ios"],
+-        "metadata": null,
+-        "address": {
+-            "street": "123 Main St",
+-            "city": "San Francisco",
+-            "state": "CA",
+-            "zip": "94102",
+-            "coordinates": {
+-                "lat": 37.7749,
+-                "lng": -122.4194
+-            }
+-        },
+-        "orders": [
+-            {"id": 1, "product": "Widget", "quantity": 5},
+-            {"id": 2, "product": "Gadget", "quantity": 3}
+-        ]
+-    }
+-    """)
+-}
++                if row.depth > 8 {
++                    Text("深度 \(row.depth)").font(.caption2).foregroundStyle(.secondary)
++                }
++                if node.isKeyTruncated {
++                    Button("查看完整键", action: showKey).font(.caption)
++                }
++                if node.isValueTruncated {
++                    Button("查看完整值", action: showValue).font(.caption)
++                }
++            }
++            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
++        }
++        .font(.system(.footnote, design: .monospaced))
++        // Keep deeply nested nodes on screen; the actual depth is still available above.
++        .padding(.leading, CGFloat(min(row.depth, 8)) * 8)
++        .padding(.vertical, 2)
++        .contextMenu {
++            if let key = node.key {
++                Button("复制键") { UIPasteboard.general.string = key }
++            }
++            if let value = node.value {
++                Button("复制值") { UIPasteboard.general.string = value }
++            }
++        }
++    }
++
++    private var valueColor: Color {
++        switch node.kind {
++        case .string: return DesignSystem.Colors.success
++        case .number, .boolean: return DesignSystem.Colors.warning
++        case .null: return DesignSystem.Colors.muted
++        case .object, .array: return .secondary
++        }
++    }
++}
+--- a/TraceUI/Body/PagedBodyTextView.swift
++++ b/TraceUI/Body/PagedBodyTextView.swift
+@@ -4,10 +4,25 @@
+ /// Pages are display-only chunks: the underlying body is never modified or truncated here.
+ public struct PagedBodyTextView: View {
+     public let content: String
+-    @State private var pages: [String] = []
++    private let preparedPages: [String]?
++    private let syntaxHighlightJSON: Bool
++    @State private var generatedPages: [String] = []
+     @State private var page = 0
+ 
+-    public init(content: String) { self.content = content }
++    private var pages: [String] { preparedPages ?? generatedPages }
++
++    public init(content: String) {
++        self.content = content
++        self.preparedPages = nil
++        self.syntaxHighlightJSON = false
++    }
++
++    /// Reuses the document cache. Formatting and pagination never run in a view builder.
++    public init(pages: [String], syntaxHighlightJSON: Bool = false) {
++        self.content = ""
++        self.preparedPages = pages
++        self.syntaxHighlightJSON = syntaxHighlightJSON
++    }
+ 
+     public var body: some View {
+         VStack(alignment: .leading, spacing: 8) {
+@@ -19,11 +34,8 @@
+                     pageBar
+                 }
+ 
+-                Text(pages[min(page, pages.count - 1)])
+-                    .font(.system(.footnote, design: .monospaced))
+-                    .textSelection(.enabled)
+-                    .frame(maxWidth: .infinity, alignment: .leading)
+-                    .fixedSize(horizontal: false, vertical: true)
++                BodyPageTextView(text: pages[min(page, pages.count - 1)],
++                                 syntaxHighlightJSON: syntaxHighlightJSON)
+ 
+                 if pages.count > 1 {
+                     Text("分页只影响显示，正文本身没有被截断。")
+@@ -35,13 +47,18 @@
+             }
+         }
+         .task(id: content) {
++            guard preparedPages == nil else { return }
++            generatedPages = []
++            page = 0
+             let input = content
+-            let prepared = await Task.detached(priority: .userInitiated) {
++            let work = Task.detached(priority: .userInitiated) {
+                 BodyTextPagination.pages(input)
+-            }.value
++            }
++            let prepared = await withTaskCancellationHandler(operation: {
++                await work.value
++            }, onCancel: { work.cancel() })
+             guard !Task.isCancelled else { return }
+-            page = 0
+-            pages = prepared
++            generatedPages = prepared
+         }
+     }
+ 
+--- /dev/null
++++ b/TraceUI/Body/PagedHexBodyView.swift
+@@ -0,0 +1,87 @@
++import Foundation
++import SwiftUI
++
++struct PagedHexBodyView: View {
++    let content: String
++    let rawData: Data?
++    @State private var bytes: Data?
++
++    private struct Input: Equatable {
++        let content: String
++        let data: Data?
++    }
++
++    var body: some View {
++        Group {
++            if let bytes {
++                HexPageView(data: bytes)
++            } else {
++                ProgressView("正在准备字节视图…")
++            }
++        }
++        .task(id: Input(content: content, data: rawData)) {
++            bytes = nil
++            let source = content
++            let original = rawData
++            let work = Task.detached(priority: .userInitiated) {
++                original ?? Data(source.utf8)
++            }
++            let result = await withTaskCancellationHandler(operation: {
++                await work.value
++            }, onCancel: { work.cancel() })
++            guard !Task.isCancelled else { return }
++            bytes = result
++        }
++    }
++}
++
++private struct HexPageView: View {
++    let data: Data
++    @State private var page = 0
++    @State private var text: String?
++    private var count: Int { BodyHexPagination.pageCount(data) }
++    private struct Request: Equatable { let data: Data; let page: Int }
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: 8) {
++            if count > 1 {
++                HStack(spacing: 8) {
++                    Button { page = max(0, page - 1) } label: {
++                        Image(systemName: "chevron.left")
++                    }
++                    .disabled(page == 0)
++                    .accessibilityLabel("上一页")
++                    Text("第 \(page + 1) / \(count) 页")
++                        .font(.caption).monospacedDigit().foregroundStyle(.secondary)
++                    Button { page = min(count - 1, page + 1) } label: {
++                        Image(systemName: "chevron.right")
++                    }
++                    .disabled(page + 1 >= count)
++                    .accessibilityLabel("下一页")
++                    Spacer(minLength: 0)
++                }
++                .buttonStyle(.bordered)
++                .controlSize(.small)
++            }
++            if let text {
++                BodyPageTextView(text: text, syntaxHighlightJSON: false)
++            } else {
++                ProgressView("正在读取当前页…")
++            }
++        }
++        .onChangeCompat(of: data) { _ in page = 0 }
++        .task(id: Request(data: data, page: page)) {
++            text = nil
++            let input = data
++            let index = min(page, count - 1)
++            let work = Task.detached(priority: .userInitiated) {
++                BodyHexPagination.page(input, index: index)
++            }
++            let result = await withTaskCancellationHandler(operation: {
++                await work.value
++            }, onCancel: { work.cancel() })
++            guard !Task.isCancelled else { return }
++            text = result
++        }
++    }
++}
 --- a/TraceUI/Components/Components.swift
 +++ b/TraceUI/Components/Components.swift
 @@ -340,11 +340,15 @@
@@ -1576,13 +3799,39 @@
              if logSampler.shouldLog(event: "vpn.packet_flow_store", key: "write_failure", first: 3, every: 200) {
 --- a/TraceVPN/Providers/PacketTunnelProvider+Messaging.swift
 +++ b/TraceVPN/Providers/PacketTunnelProvider+Messaging.swift
-@@ -14,6 +14,17 @@
+@@ -12,12 +12,54 @@
+ import TraceProxy
+ import TraceSecurity
  
++private struct RecordingQuerySnapshot: Sendable {
++    let recording: Bool
++    let sessionID: String?
++}
++
  extension PacketTunnelProvider {
      func handleMessage(
-+        _ message: AppMessage,
-+        completionHandler: AppMessageCompletion
-+    ) async {
+         _ message: AppMessage,
+         completionHandler: AppMessageCompletion
+     ) async {
++        if case .getRecordingState = message.command {
++            let provider = UnsafeSendable(self)
++            let snapshot = await recordingTransitions.readIfIdle {
++                RecordingQuerySnapshot(
++                    recording: CaptureRecordingState.shared.isRecording,
++                    sessionID: provider.value.captureSessionCoordinator.currentSession?.id.uuidString
++                )
++            }
++            let response: [String: Any]
++            if let snapshot {
++                response = ["recording": snapshot.recording,
++                            "session_id": (snapshot.sessionID as Any?) ?? NSNull(),
++                            "transitioning": false]
++            } else {
++                response = ["transitioning": true]
++            }
++            completionHandler.call(try? JSONSerialization.data(withJSONObject: response))
++            return
++        }
 +        let boxedMessage = UnsafeSendable(message)
 +        await recordingTransitions.perform { [weak self] in
 +            guard let self else { completionHandler.call(nil); return }
@@ -1591,10 +3840,21 @@
 +    }
 +
 +    private func handleSerialMessage(
-         _ message: AppMessage,
-         completionHandler: AppMessageCompletion
-     ) async {
-@@ -30,6 +41,17 @@
++        _ message: AppMessage,
++        completionHandler: AppMessageCompletion
++    ) async {
+         switch message.command {
++        case .refreshMCP:
++            TraceMCPBootstrap.startRetryingIfEnabled(host: "extension")
++            let preferences = TraceMCPPreferences.load()
++            completionHandler.call(try? JSONSerialization.data(withJSONObject: [
++                "enabled": preferences.enabled, "port": Int(preferences.port)
++            ]))
++            return
+         case .getHardeningConfig:
+             await respondWithHardeningConfig(completionHandler)
+             return
+@@ -30,6 +72,17 @@
              }
          case .updateCaptureConfig:
              await refreshCaptureConfiguration()
@@ -1612,7 +3872,7 @@
          case .updateHardeningConfig:
              if let config = message.payload["hardeningConfig"] as? [String: Any] {
                  await updateHardeningConfiguration(config)
-@@ -92,6 +114,30 @@
+@@ -92,6 +145,30 @@
          let boxedConfig = UnsafeSendable(config)
          await runtimeState.updateProxyServerConfiguration(boxedConfig)
          await refreshCaptureConfiguration()
@@ -1643,7 +3903,7 @@
      }
  
      func refreshCaptureConfiguration() async {
-@@ -106,7 +152,7 @@
+@@ -106,7 +183,7 @@
              msg: runtimeConfiguration.captureLogMessage
          )
  
@@ -1652,7 +3912,7 @@
          let reconfigEventSink: @Sendable (String, String) -> Void = { [weak self] type, msg in
              guard let self else { return }
              Task {
-@@ -382,7 +428,7 @@
+@@ -382,7 +459,7 @@
      }
  
      func createPCAPWriterIfNeeded(enabled: Bool) async -> PCAPWriting? {
@@ -1661,7 +3921,7 @@
          guard let writer = captureSessionCoordinator.writer(
              fileName: CaptureSessionCoordinator.primaryPCAPFileName
          ) else {
-@@ -393,7 +439,7 @@
+@@ -393,7 +470,7 @@
      }
  
      func createPacketCaptureWriterIfNeeded(enabled: Bool) -> PCAPWriting? {
@@ -1672,16 +3932,17 @@
          ) else {
 --- a/TraceVPN/Providers/PacketTunnelProvider.swift
 +++ b/TraceVPN/Providers/PacketTunnelProvider.swift
-@@ -68,6 +68,8 @@
+@@ -68,6 +68,9 @@
      case getRootCAFingerprint
      case updateConfig
      case updateCaptureConfig
 +    case setRecordingState
 +    case getRecordingState
++    case refreshMCP
      case updateHardeningConfig
      case updateThrottlingState
      case clearRequests
-@@ -108,6 +110,7 @@
+@@ -108,6 +111,7 @@
      /// Encapsulates mutable runtime state (proxy server, raw capture, throttling).
      let runtimeState = PacketTunnelRuntimeState()
      let captureRuntimeController = CaptureRuntimeController()
@@ -1689,7 +3950,7 @@
  
      /// Owns the capture session and the per-session PCAP files of this tunnel run.
      let captureSessionCoordinator = CaptureSessionCoordinator()
-@@ -232,6 +235,7 @@
+@@ -232,6 +236,7 @@
      }
  
      private func performStart(invocationID: String) async throws {
@@ -1697,7 +3958,7 @@
          VPNLog.tunnel.debug(
              "event=vpn.tunnel_task_begin id=\(invocationID, privacy: .public)"
          )
-@@ -242,18 +246,8 @@
+@@ -242,18 +247,8 @@
          let captureConfig = runtimeConfiguration.capture
          currentCaptureMode = runtimeConfiguration.captureMode
  
@@ -1718,7 +3979,7 @@
  
          await HardeningConfig.shared.logCurrentConfig()
  
-@@ -390,6 +384,7 @@
+@@ -390,6 +385,7 @@
          with reason: NEProviderStopReason,
          completionHandler: @escaping () -> Void
      ) {

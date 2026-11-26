@@ -1,3 +1,267 @@
+--- a/Trace/TraceApp.swift
++++ b/Trace/TraceApp.swift
+@@ -39,22 +39,24 @@
+                     handleDeepLink(url)
+                 }
+                 .task {
++                    AppMCPServiceCoordinator.shared.setForeground(scenePhase != .background)
+                     handlePendingWidgetActionIfNeeded()
+                 }
+                 .onReceive(NotificationCenter.default.publisher(for: .onboardingCompleted)) { _ in
+                     VPNManager.shared.initializeIfNeeded()
+                     updateQuickActions()
+                 }
++                .onReceive(viewModel.$isCapturing.removeDuplicates()) { _ in
++                    if OnboardingState.hasCompleted { updateQuickActions() }
++                }
+         }
+         .onChangeCompat(of: scenePhase) { newPhase in
+             viewModel.setSceneActive(newPhase == .active)
+             if newPhase == .background {
+-                // Rule: the loopback port belongs to one process at a time. A suspended app
+-                // keeps its listening socket, so the port has to be released here; the scene
+-                // lifecycle never calls `applicationDidEnterBackground`.
+-                TraceMCPServer.shared.stop()
++                AppMCPServiceCoordinator.shared.setForeground(false)
+             }
+             if newPhase == .active {
++                AppMCPServiceCoordinator.shared.setForeground(true)
+                 // Rule: Avoid VPN setup before onboarding completion.
+                 if OnboardingState.hasCompleted {
+                     VPNManager.shared.initializeIfNeeded()
+@@ -86,7 +88,7 @@
+ 
+         var shortcutItems: [UIApplicationShortcutItem] = []
+ 
+-        if vpnManager.isConnected {
++        if vpnManager.isConnected && AppGroupStorage.shared.loadConfiguration().isRecordingEnabled {
+             shortcutItems.append(
+                 UIApplicationShortcutItem(
+                     type: TraceQuickActionType.stopCapture,
+@@ -196,7 +198,6 @@
+ 
+ final class AppDelegate: NSObject, UIApplicationDelegate {
+     var viewModel: CaptureViewModel?
+-    private var vpnStatusCancellable: AnyCancellable?
+ 
+     func application(
+         _ application: UIApplication,
+@@ -205,33 +206,8 @@
+         if let shortcutItem = launchOptions?[.shortcutItem] as? UIApplicationShortcutItem {
+             application.shortcutItem = shortcutItem
+         }
+-        // Loopback MCP endpoint for local agents; the tunnel extension hosts the same
+-        // endpoint while the VPN runs so the tools keep answering after the app suspends.
+-        TraceMCPBootstrap.startIfEnabled(host: "app")
+-        // The loopback port can only belong to one process. While the tunnel runs the
+-        // extension keeps serving, so the app parks its own listener the moment VPN
+-        // connects and takes the port back once the tunnel stops.
+-        vpnStatusCancellable = VPNManager.shared.isConnectedPublisher
+-            .receive(on: DispatchQueue.main)
+-            .sink { connected in
+-                if connected {
+-                    TraceMCPServer.shared.stop()
+-                } else {
+-                    TraceMCPBootstrap.startIfEnabled(host: "app")
+-                }
+-            }
++        // SwiftUI scene lifecycle owns app MCP; discovery never starts a tunnel here.
+         return true
+-    }
+-
+-    func applicationDidEnterBackground(_ application: UIApplication) {
+-        // Release the port so the tunnel extension can own it while we are suspended.
+-        TraceMCPServer.shared.stop()
+-    }
+-
+-    func applicationWillEnterForeground(_ application: UIApplication) {
+-        if !VPNManager.shared.isConnected {
+-            TraceMCPBootstrap.startIfEnabled(host: "app")
+-        }
+     }
+ 
+     func application(
+--- /dev/null
++++ b/TraceCore/MCP/TraceMCPListenerLifecycle.swift
+@@ -0,0 +1,28 @@
++import Foundation
++
++/// Serializes lifecycle decisions and invalidates work scheduled by a previous listener.
++/// A recursive lock permits a guarded retry to call the public, guarded start/stop methods.
++final class TraceMCPListenerLifecycle: @unchecked Sendable {
++    private let lock = NSRecursiveLock()
++    private var epoch: UInt64 = 0
++
++    func withLock<T>(_ operation: () throws -> T) rethrows -> T {
++        lock.lock()
++        defer { lock.unlock() }
++        return try operation()
++    }
++
++    var generation: UInt64 { withLock { epoch } }
++
++    @discardableResult
++    func advance() -> UInt64 { withLock { epoch &+= 1; return epoch } }
++
++    @discardableResult
++    func ifCurrent(_ generation: UInt64, _ operation: () -> Void) -> Bool {
++        withLock {
++            guard epoch == generation else { return false }
++            operation()
++            return true
++        }
++    }
++}
+--- a/TraceCore/MCP/TraceMCPServer.swift
++++ b/TraceCore/MCP/TraceMCPServer.swift
+@@ -56,6 +56,7 @@
+     }
+ 
+     private let lock = NSLock()
++    private let lifecycle = TraceMCPListenerLifecycle()
+     private var state = State()
+     private let queue = DispatchQueue(label: "com.justin.trace.mcp.server", qos: .userInitiated)
+     /// Serial queue used to retry binding after the other process releases the loopback port.
+@@ -155,6 +156,10 @@
+ 
+     /// Starts the loopback listener once; repeated calls with the same port are no-ops.
+     public func start(port: UInt16 = TraceMCPServer.defaultPort, host: String) {
++        lifecycle.withLock { startLocked(port: port, host: host) }
++    }
++
++    private func startLocked(port: UInt16, host: String) {
+         lock.lock()
+         if state.listener != nil, state.listenerState == "ready" {
+             let samePort = state.port == port
+@@ -167,6 +172,7 @@
+         }
+         // A listener that exists but never reached `.ready` - usually `.waiting` because the
+         // other process still owns the port - cannot accept connections. Drop it and rebind.
++        lifecycle.advance()
+         let stale = state.listener
+         state.listener = nil
+         state.listenerState = "idle"
+@@ -218,21 +224,24 @@
+         interval: TimeInterval = 5,
+         remaining: Int = -1
+     ) {
+-        start(port: port, host: host)
+-        retryQueue.asyncAfter(deadline: .now() + interval) { [weak self] in
+-            guard let self else { return }
+-            if self.isListening { return }
+-            if remaining == 0 {
+-                TraceMCPStatusStore.appendDiagnostic(host: host, "retry_exhausted")
+-                return
+-            }
+-            self.dropUnreadyListener()
+-            self.startRetrying(
+-                port: port,
+-                host: host,
+-                interval: interval,
+-                remaining: remaining < 0 ? -1 : remaining - 1
+-            )
++        lifecycle.withLock {
++            start(port: port, host: host)
++            let generation = lifecycle.generation
++            retryQueue.asyncAfter(deadline: .now() + interval) { [weak self] in
++                guard let self else { return }
++                self.lifecycle.ifCurrent(generation) {
++                    if self.isListening { return }
++                    if remaining == 0 {
++                        TraceMCPStatusStore.appendDiagnostic(host: host, "retry_exhausted")
++                        return
++                    }
++                    self.dropUnreadyListener()
++                    self.startRetrying(
++                        port: port, host: host, interval: interval,
++                        remaining: remaining < 0 ? -1 : remaining - 1
++                    )
++                }
++            }
+         }
+     }
+ 
+@@ -255,8 +264,10 @@
+         }
+ 
+         let listener = try NWListener(using: parameters, on: port)
++        let generation = lifecycle.generation
+         listener.stateUpdateHandler = { [weak self] newState in
+             guard let self else { return }
++            self.lifecycle.ifCurrent(generation) {
+             self.noteListenerState(newState)
+             switch newState {
+             case .ready:
+@@ -281,13 +292,16 @@
+             default:
+                 break
+             }
++            }
+         }
+         listener.newConnectionHandler = { [weak self] connection in
+             guard let self else {
+                 connection.cancel()
+                 return
+             }
+-            self.accept(connection)
++            if !self.lifecycle.ifCurrent(generation, { self.accept(connection) }) {
++                connection.cancel()
++            }
+         }
+         lock.lock()
+         state.listener = listener
+@@ -326,8 +340,10 @@
+     /// Republishes the snapshot every few seconds so `updatedAt` reflects a live process and
+     /// forces a rebind when the listener stops making progress.
+     private func startWatchdog() {
++        let generation = lifecycle.generation
+         retryQueue.asyncAfter(deadline: .now() + 5) { [weak self] in
+-            self?.watchdogTick()
++            guard let self else { return }
++            self.lifecycle.ifCurrent(generation) { self.watchdogTick() }
+         }
+     }
+ 
+@@ -355,10 +371,13 @@
+         let host = state.host
+         lock.unlock()
+         guard port != 0 else { return }
++        let generation = lifecycle.generation
+         retryQueue.asyncAfter(deadline: .now() + 3) { [weak self] in
+             guard let self else { return }
+-            guard !self.isListening else { return }
+-            self.rebind(port: port, host: host, reason: reason)
++            self.lifecycle.ifCurrent(generation) {
++                guard !self.isListening else { return }
++                self.rebind(port: port, host: host, reason: reason)
++            }
+         }
+     }
+ 
+@@ -366,8 +385,10 @@
+         mcpLog.info("mcp.rebind reason=\(reason, privacy: .public) port=\(Int(port), privacy: .public) host=\(host, privacy: .public)")
+         stopListener()
+         guard port != 0 else { return }
++        let generation = lifecycle.generation
+         retryQueue.asyncAfter(deadline: .now() + 1) { [weak self] in
+-            self?.start(port: port, host: host)
++            guard let self else { return }
++            self.lifecycle.ifCurrent(generation) { self.start(port: port, host: host) }
+         }
+     }
+ 
+@@ -420,7 +441,10 @@
+     }
+ 
+     public func stop() {
+-        stopListener()
++        lifecycle.withLock {
++            lifecycle.advance()
++            stopListener()
++        }
+     }
+ 
+     private func stopListener() {
 --- a/TraceCore/MCP/TraceMCPTools.swift
 +++ b/TraceCore/MCP/TraceMCPTools.swift
 @@ -280,9 +280,14 @@
