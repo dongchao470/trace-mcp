@@ -1,0 +1,357 @@
+diff --git a/Trace/ViewModels/SessionListViewModel.swift b/Trace/ViewModels/SessionListViewModel.swift
+index 48e6eb0..21a6a3c 100644
+--- a/Trace/ViewModels/SessionListViewModel.swift
++++ b/Trace/ViewModels/SessionListViewModel.swift
+@@ -9,6 +9,7 @@
+ import Combine
+ import Foundation
+ import TraceCore
++import TraceFeatures
+ import os
+ import TraceCore
+ 
+@@ -409,6 +410,34 @@ final class SessionListViewModel: ObservableObject {
+             return error.localizedDescription
+         }
+     }
++
++    // MARK: - Bulk actions
++
++    /// Deletes every session with its requests and its folder.
++    ///
++    /// Requests are removed per session so their body files are cleaned up as
++    /// well; `deleteAllSessionsAndFiles` afterwards catches rows and folders
++    /// that no longer had a request attached.
++    func clearAllSessions() async throws {
++        let storage = self.storage
++        let snapshots = rows.map(\.session)
++        try await Task.detached(priority: .userInitiated) {
++            for session in snapshots {
++                try CaptureSessionStore.deleteSessionAndFiles(storage: storage, session: session)
++            }
++            try storage.deleteAllSessionsAndFiles()
++        }.value
++        await reload(showSpinner: false)
++    }
++
++    /// Exports every stored request as one HAR file.
++    func exportAllRequestsHAR() async throws -> URL {
++        let storage = self.storage
++        let requests = try await Task.detached(priority: .userInitiated) {
++            try await storage.loadRequests()
++        }.value
++        return try HARExporter.exportToFile(requests: requests)
++    }
+ }
+ 
+ // MARK: - Detail view model
+@@ -500,4 +529,22 @@ final class SessionDetailViewModel: ObservableObject {
+             loadState = .failed(error.localizedDescription)
+         }
+     }
++
++    // MARK: - Actions
++
++    func exportHAR() throws -> URL {
++        try HARExporter.exportToFile(requests: requests)
++    }
++
++    var pcapFileURL: URL? {
++        CaptureSessionFiles.pcapURL(for: session)
++    }
++
++    func deleteSession() async throws {
++        let storage = self.storage
++        let session = self.session
++        try await Task.detached(priority: .userInitiated) {
++            try CaptureSessionStore.deleteSessionAndFiles(storage: storage, session: session)
++        }.value
++    }
+ }
+diff --git a/Trace/Views/Sessions/SessionDetailView.swift b/Trace/Views/Sessions/SessionDetailView.swift
+index 00120cc..6981ef5 100644
+--- a/Trace/Views/Sessions/SessionDetailView.swift
++++ b/Trace/Views/Sessions/SessionDetailView.swift
+@@ -16,6 +16,11 @@ struct SessionDetailView: View {
+     @StateObject private var viewModel: SessionDetailViewModel
+     @ObservedObject private var favorites = FavoritesManager.shared
+     @Environment(\.scenePhase) private var scenePhase
++    @Environment(\.dismiss) private var dismiss
++
++    @State private var showingDeleteConfirm = false
++    @State private var shareSheetItem: ShareSheetItem?
++    @State private var actionError: String?
+ 
+     /// Keeps an in-progress session's duration and requests up to date.
+     private let autoRefreshTimer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+@@ -47,6 +52,87 @@ struct SessionDetailView: View {
+             guard viewModel.status == .active else { return }
+             Task { await viewModel.reload(showSpinner: false) }
+         }
++        .toolbar {
++            ToolbarItem(placement: .topBarTrailing) {
++                Menu {
++                    Button {
++                        exportHAR()
++                    } label: {
++                        Label("Export HAR", systemImage: "square.and.arrow.up")
++                    }
++                    if viewModel.pcapFileURL != nil {
++                        Button {
++                            sharePCAP()
++                        } label: {
++                            Label("Share PCAP", systemImage: "doc")
++                        }
++                    }
++                    Divider()
++                    Button(role: .destructive) {
++                        showingDeleteConfirm = true
++                    } label: {
++                        Label("Delete Session", systemImage: "trash")
++                    }
++                } label: {
++                    Image(systemName: "ellipsis.circle")
++                }
++                .accessibilityLabel("More")
++            }
++        }
++        .confirmationDialog(
++            "Delete this capture session?",
++            isPresented: $showingDeleteConfirm,
++            titleVisibility: .visible
++        ) {
++            Button("Delete Session", role: .destructive) {
++                deleteSession()
++            }
++            Button("Cancel", role: .cancel) {}
++        } message: {
++            Text("This deletes the session, its requests and its pcap file. This cannot be undone.")
++        }
++        .alert(
++            "Action Failed",
++            isPresented: Binding(
++                get: { actionError != nil },
++                set: { isPresented in
++                    if !isPresented { actionError = nil }
++                }
++            )
++        ) {
++            Button("OK", role: .cancel) {
++                actionError = nil
++            }
++        } message: {
++            Text(actionError ?? "")
++        }
++        .shareSheet(item: $shareSheetItem)
++    }
++
++    // MARK: - Actions
++
++    private func exportHAR() {
++        do {
++            shareSheetItem = ShareSheetItem([try viewModel.exportHAR()])
++        } catch {
++            actionError = error.localizedDescription
++        }
++    }
++
++    private func sharePCAP() {
++        guard let url = viewModel.pcapFileURL else { return }
++        shareSheetItem = ShareSheetItem([url])
++    }
++
++    private func deleteSession() {
++        Task {
++            do {
++                try await viewModel.deleteSession()
++                dismiss()
++            } catch {
++                actionError = error.localizedDescription
++            }
++        }
+     }
+ 
+     // MARK: - Header
+diff --git a/Trace/Views/Sessions/SessionListView.swift b/Trace/Views/Sessions/SessionListView.swift
+index e1c44c1..24a66b0 100644
+--- a/Trace/Views/Sessions/SessionListView.swift
++++ b/Trace/Views/Sessions/SessionListView.swift
+@@ -9,7 +9,9 @@
+ import Combine
+ import SwiftUI
+ import TraceCore
++import TraceFeatures
+ import TraceUI
++import UniformTypeIdentifiers
+ 
+ struct SessionListView: View {
+     @StateObject private var viewModel = SessionListViewModel()
+@@ -17,6 +19,10 @@ struct SessionListView: View {
+ 
+     @State private var pendingDeletion: CaptureSessionRowModel?
+     @State private var infoAlert: SessionInfoAlert?
++    @State private var showingClearAllConfirm = false
++    @State private var showingHARImport = false
++    @State private var shareSheetItem: ShareSheetItem?
++    @State private var actionError: String?
+ 
+     /// Keeps the row of a running session (request count, duration) fresh.
+     private let autoRefreshTimer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+@@ -25,6 +31,44 @@ struct SessionListView: View {
+         sessionList
+             .navigationTitle("Capture Sessions")
+             .navigationBarTitleDisplayMode(.large)
++            .toolbar {
++                ToolbarItem(placement: .topBarTrailing) {
++                    Button {
++                        showingClearAllConfirm = true
++                    } label: {
++                        Image(systemName: "trash")
++                    }
++                    .disabled(viewModel.rows.isEmpty)
++                    .accessibilityLabel("Clear All Sessions")
++                }
++                ToolbarItem(placement: .topBarTrailing) {
++                    Menu {
++                        Button {
++                            exportAllHAR()
++                        } label: {
++                            Label("Export All HAR", systemImage: "square.and.arrow.up")
++                        }
++                        Button {
++                            showingHARImport = true
++                        } label: {
++                            Label("Import HAR", systemImage: "square.and.arrow.down")
++                        }
++                        NavigationLink {
++                            PCAPExportView()
++                        } label: {
++                            Label("Packet Capture Files", systemImage: "doc")
++                        }
++                        NavigationLink {
++                            StorageSettingsView()
++                        } label: {
++                            Label("Storage", systemImage: "externaldrive")
++                        }
++                    } label: {
++                        Image(systemName: "ellipsis.circle")
++                    }
++                    .accessibilityLabel("More")
++                }
++            }
+             .task {
+                 await viewModel.loadIfNeeded()
+             }
+@@ -74,6 +118,90 @@ struct SessionListView: View {
+             } message: { alert in
+                 Text(alert.message)
+             }
++            .confirmationDialog(
++                "Clear all capture sessions?",
++                isPresented: $showingClearAllConfirm,
++                titleVisibility: .visible
++            ) {
++                Button("Clear All", role: .destructive) {
++                    clearAll()
++                }
++                Button("Cancel", role: .cancel) {}
++            } message: {
++                Text("This deletes every session with its requests and pcap files. This cannot be undone.")
++            }
++            .alert(
++                "Action Failed",
++                isPresented: Binding(
++                    get: { actionError != nil },
++                    set: { isPresented in
++                        if !isPresented { actionError = nil }
++                    }
++                )
++            ) {
++                Button("OK", role: .cancel) {
++                    actionError = nil
++                }
++            } message: {
++                Text(actionError ?? "")
++            }
++            .shareSheet(item: $shareSheetItem)
++            .fileImporter(
++                isPresented: $showingHARImport,
++                allowedContentTypes: {
++                    if let harType = UTType(filenameExtension: "har") {
++                        return [.json, harType]
++                    }
++                    return [.json]
++                }(),
++                allowsMultipleSelection: false
++            ) { result in
++                importHAR(result)
++            }
++    }
++
++    // MARK: - Actions
++
++    private func exportAllHAR() {
++        Task {
++            do {
++                let url = try await viewModel.exportAllRequestsHAR()
++                shareSheetItem = ShareSheetItem([url])
++            } catch {
++                actionError = error.localizedDescription
++            }
++        }
++    }
++
++    private func clearAll() {
++        Task {
++            do {
++                try await viewModel.clearAllSessions()
++            } catch {
++                actionError = error.localizedDescription
++            }
++        }
++    }
++
++    private func importHAR(_ result: Result<[URL], Error>) {
++        Task {
++            do {
++                guard let url = try result.get().first else { return }
++                let scoped = url.startAccessingSecurityScopedResource()
++                defer {
++                    if scoped { url.stopAccessingSecurityScopedResource() }
++                }
++                let requests = try HARExporter.importFromFile(url)
++                try await Task.detached(priority: .userInitiated) {
++                    for request in requests {
++                        try AppGroupStorage.shared.saveRequest(request)
++                    }
++                }.value
++                await viewModel.reload(showSpinner: false)
++            } catch {
++                actionError = error.localizedDescription
++            }
++        }
+     }
+ 
+     // MARK: - List
+diff --git a/ci/l10n-zh-hans-06.strings b/ci/l10n-zh-hans-06.strings
+new file mode 100644
+index 0000000..12b273f
+--- /dev/null
++++ b/ci/l10n-zh-hans-06.strings
+@@ -0,0 +1,16 @@
++"Action Failed" = "操作失败";
++"Capture Sessions" = "抓包记录";
++"Clear All Sessions" = "清空全部记录";
++"Clear all capture sessions?" = "清空全部抓包记录？";
++"Delete Capture Session?" = "删除这条抓包记录？";
++"Delete Session" = "删除会话";
++"Delete this capture session?" = "删除这条抓包记录？";
++"Duration" = "持续时间";
++"Export All HAR" = "导出全部 HAR";
++"Finished" = "已结束";
++"Interrupted" = "异常中断";
++"Recording" = "抓包中";
++"Share PCAP" = "分享 pcap";
++"This deletes every session with its requests and pcap files. This cannot be undone." = "会删除所有会话、它们的请求和 pcap 文件，且不可恢复。";
++"This deletes the session, its requests and its pcap file. This cannot be undone." = "会删除该会话、它的请求和 pcap 文件，且不可恢复。";
++"%lld requests" = "%lld 条记录";
