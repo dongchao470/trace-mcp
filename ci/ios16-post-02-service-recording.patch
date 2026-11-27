@@ -1276,7 +1276,7 @@
 +            XCTAssertThrowsError(try document.formattedPages())
 +            XCTAssertThrowsError(try document.visibleRows())
 +        }
-+        await cancelled.value
++        try await cancelled.value
 +    }
 +
 +    func testHexIncludesBytesBeyondOldSixtyFourKiBLimit() {
@@ -1327,7 +1327,7 @@
 +    func testGuardedRetryCanAdvanceRecursivelyWithoutDeadlock() {
 +        let lifecycle = TraceMCPListenerLifecycle()
 +        let old = lifecycle.advance()
-+        lifecycle.ifCurrent(old) { lifecycle.withLock { lifecycle.advance() } }
++        lifecycle.ifCurrent(old) { lifecycle.withLock { _ = lifecycle.advance() } }
 +        XCTAssertNotEqual(lifecycle.generation, old)
 +        XCTAssertFalse(lifecycle.ifCurrent(old) { XCTFail("Old port revived") })
 +    }
