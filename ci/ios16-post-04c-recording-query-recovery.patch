@@ -1,0 +1,333 @@
+diff --git a/Trace/Services/NetworkCaptureService.swift b/Trace/Services/NetworkCaptureService.swift
+--- a/Trace/Services/NetworkCaptureService.swift
++++ b/Trace/Services/NetworkCaptureService.swift
+@@ -212,17 +212,24 @@
+     }
+ 
+     private func queryRecordingState() async throws -> Bool {
+-        // Only a known, short-lived transition is polled. Missing replies are not replayed.
++        // Retry only fast, received-but-unusable read replies. A transport timeout can already
++        // take 8 seconds, so repeating it would multiply the delay without improving certainty.
++        var lastError: Error = ServiceError.recordingStateUnconfirmed
+         for attempt in 0..<3 {
+             try Task.checkCancellation()
+             let data = try await vpnManager.sendMessage(["command": "getRecordingState"])
+-            do { return try decodeRecordingState(data) }
+-            catch ServiceError.transitionInProgress {
+-                guard attempt < 2 else { throw ServiceError.transitionInProgress }
++            do {
++                return try decodeRecordingState(data)
++            } catch is CancellationError {
++                throw CancellationError()
++            } catch {
++                lastError = error
++                guard attempt < 2 else { throw error }
++                FeatureLog.vpn.warning("event=vpn.recording_query outcome=retry attempt=\(attempt + 1) error=\(error.localizedDescription, privacy: .public)")
+                 try await waitForRecordingRetry()
+             }
+         }
+-        throw ServiceError.recordingStateUnconfirmed
++        throw lastError
+     }
+ 
+     private func decodeRecordingState(_ data: Data?) throws -> Bool {
+diff --git a/ci/TraceServiceRecordingRegressionTests.swift b/ci/TraceServiceRecordingRegressionTests.swift
+--- a/ci/TraceServiceRecordingRegressionTests.swift
++++ b/ci/TraceServiceRecordingRegressionTests.swift
+@@ -207,7 +207,7 @@
+ 
+ @MainActor
+ private final class MemoryVPN: VPNManaging {
+-    enum Failure: Error { case start, save, prepare, stop, acknowledgement }
++    enum Failure: Error { case start, save, prepare, stop, acknowledgement, query }
+     let subject = CurrentValueSubject<Bool, Never>(false)
+     var isConnected: Bool { get { subject.value } set { subject.send(newValue) } }
+     var isConnectedPublisher: AnyPublisher<Bool, Never> { subject.eraseToAnyPublisher() }
+@@ -222,6 +222,8 @@
+     var failStop = false
+     var missingReply = false
+     var missingQueryReply = false
++    var failQuery = false
++    var missingQueryRepliesRemaining = 0
+     var queryTransitioning = false
+     var queryTransitionsRemaining = 0
+     var missingQueryReplyAfterChange = false
+@@ -252,6 +254,11 @@
+         let command = message["command"] as? String
+         if command == "getRecordingState" {
+             queries += 1
++            if failQuery { throw Failure.query }
++            if missingQueryRepliesRemaining > 0 {
++                missingQueryRepliesRemaining -= 1
++                return nil
++            }
+             if missingQueryReply { return nil }
+             if queryTransitioning || queryTransitionsRemaining > 0 {
+                 if queryTransitionsRemaining > 0 { queryTransitionsRemaining -= 1 }
+@@ -632,7 +639,7 @@
+         XCTAssertNil(sessions.currentID)
+         XCTAssertEqual(sessions.ended, 1)
+         XCTAssertEqual(vpn.messages, 1)
+-        XCTAssertEqual(vpn.queries, 1)
++        XCTAssertEqual(vpn.queries, 3)
+         XCTAssertEqual(vpn.stops, 0)
+ 
+         vpn.missingReply = false
+@@ -647,14 +654,42 @@
+         XCTAssertEqual(sessions.aborted, 0)
+     }
+ 
+-    func testMissingReadOnlyReplyIsNotAutomaticallyRepeated() async {
++    func testReadOnlyTransportFailureIsNotRepeatedOrChanged() async {
++        let (service, vpn, _, _) = make()
++        vpn.isConnected = true
++        vpn.failQuery = true
++
++        do { try await service.refreshRecordingState(); XCTFail("Transport failure was accepted") }
++        catch {
++            XCTAssertEqual(service.recordingState, .unknown)
++            XCTAssertEqual(vpn.queries, 1)
++            XCTAssertEqual(vpn.messages, 0)
++        }
++    }
++
++    func testTemporaryMissingReadOnlyReplyRecoversWithoutRepeatingChange() async throws {
++        let (service, vpn, _, sessions) = make()
++        vpn.isConnected = true
++        vpn.actualRecording = true
++        vpn.missingQueryRepliesRemaining = 1
++
++        try await service.refreshRecordingState()
++
++        XCTAssertEqual(service.recordingState, .recording)
++        XCTAssertEqual(vpn.queries, 2)
++        XCTAssertEqual(vpn.messages, 0)
++        XCTAssertEqual(sessions.began, 0)
++        XCTAssertEqual(sessions.ended, 0)
++    }
++
++    func testPersistentMissingReadOnlyRepliesStayUnknownWithoutRepeatingChange() async {
+         let (service, vpn, _, _) = make()
+         vpn.isConnected = true
+         vpn.missingQueryReply = true
+         do { try await service.refreshRecordingState(); XCTFail("Missing reply was accepted") }
+         catch {
+             XCTAssertEqual(service.recordingState, .unknown)
+-            XCTAssertEqual(vpn.queries, 1)
++            XCTAssertEqual(vpn.queries, 3)
+             XCTAssertEqual(vpn.messages, 0)
+         }
+     }
+diff --git a/Trace/Views/NetworkView.swift b/Trace/Views/NetworkView.swift
+--- a/Trace/Views/NetworkView.swift
++++ b/Trace/Views/NetworkView.swift
+@@ -86,7 +86,6 @@
+             }
+             .shareSheet(item: $shareSheetItem)
+             .modifier(RequestNavigationDestinationModifier(requestToOpen: $requestToOpen))
+-            .toast(message: $toastMessage, bottomPadding: 80)
+             .modifier(RequestSelectionModifier(
+                 viewModel: viewModel,
+                 requestToOpen: $requestToOpen,
+@@ -160,10 +159,10 @@
+     }
+ 
+     private var contentStack: some View {
+-        ZStack(alignment: .bottom) {
+-            listArea
+-            bottomActionBar
+-        }
++        listArea
++            .safeAreaInset(edge: .bottom, spacing: 0) {
++                bottomActionBar
++            }
+     }
+ 
+     private var listArea: some View {
+@@ -198,9 +197,6 @@
+             }
+         }
+         .listStyle(.insetGrouped)
+-        .safeAreaInset(edge: .bottom) {
+-            Color.clear.frame(height: 100)
+-        }
+         .navigationTitle("Network")
+         .navigationBarTitleDisplayMode(.large)
+         .searchable(
+@@ -221,20 +217,7 @@
+                 onShowFavorites: { showingFavorites = true },
+                 onShowCurlImport: { showingCurlImport = true },
+                 onShowThrottling: { showingThrottling = true },
+-                onClearAll: { showingClearAllAlert = true },
+-                onToggleService: {
+-                    Task {
+-                        do {
+-                            try await viewModel.setNetworkServiceEnabled(!viewModel.isServiceRunning)
+-                        } catch {
+-                            if let vpnError = error as? VPNError, vpnError == .notConfigured {
+-                                showingVPNSetupAlert = true
+-                            } else {
+-                                toastMessage = error.localizedDescription
+-                            }
+-                        }
+-                    }
+-                }
++                onClearAll: { showingClearAllAlert = true }
+             )
+         }
+         .overlay {
+@@ -251,11 +234,31 @@
+     }
+ 
+     private var bottomActionBar: some View {
+-        BottomActionBar(
++        VStack(spacing: 8) {
++            if let message = toastMessage {
++                HStack(alignment: .top, spacing: 12) {
++                    Text(LocalizedStringKey(message))
++                        .font(.footnote)
++                        .fixedSize(horizontal: false, vertical: true)
++                        .frame(maxWidth: .infinity, alignment: .leading)
++                    Button {
++                        toastMessage = nil
++                    } label: {
++                        Image(systemName: "xmark")
++                            .padding(4)
++                    }
++                    .accessibilityLabel("Dismiss")
++                }
++                .padding(12)
++                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
++            }
++            BottomActionBar(
+             isCapturing: viewModel.isCapturing,
+             isServiceRunning: viewModel.isServiceRunning,
+             isStateUnknown: viewModel.isRecordingStateUnknown,
++            isTransitioning: viewModel.isCaptureTransitioning,
+             onToggleCapture: {
++                toastMessage = nil
+                 Task {
+                     do {
+                         if viewModel.isRecordingStateUnknown {
+@@ -275,8 +278,16 @@
+             onNewRequest: {
+                 showingRequestBuilder = true
+             }
+-        )
+-        .padding()
++            )
++        }
++        .padding(.horizontal)
++        .padding(.vertical, 8)
++        .task(id: toastMessage) {
++            guard let message = toastMessage else { return }
++            do { try await Task.sleep(nanoseconds: 5_000_000_000) }
++            catch { return }
++            if toastMessage == message { toastMessage = nil }
++        }
+         .alert("VPN Not Configured", isPresented: $showingVPNSetupAlert) {
+             Button("Add Configuration") {
+                 Task {
+diff --git a/Trace/Views/NetworkViewToolbar.swift b/Trace/Views/NetworkViewToolbar.swift
+--- a/Trace/Views/NetworkViewToolbar.swift
++++ b/Trace/Views/NetworkViewToolbar.swift
+@@ -17,7 +17,6 @@
+     let onShowCurlImport: () -> Void
+     let onShowThrottling: () -> Void
+     let onClearAll: () -> Void
+-    let onToggleService: () -> Void
+ 
+     var body: some ToolbarContent {
+         // Grouping menu (HTTP only)
+@@ -69,16 +68,6 @@
+         // More menu
+         ToolbarItem(placement: .topBarTrailing) {
+             Menu {
+-                Section("Network Service") {
+-                    Text(LocalizedStringKey(viewModel.isServiceRunning ? "Service Running" : "Service Stopped"))
+-                    Button(action: onToggleService) {
+-                        Label(LocalizedStringKey(viewModel.isServiceRunning ? "Stop Network Service" : "Start Network Service"), systemImage: "power")
+-                    }
+-                    .disabled(viewModel.isCaptureTransitioning)
+-                }
+-                Section {
+-                    Text("Stopping capture keeps the network service and MCP running.")
+-                }
+                 Button {
+                     onShowFavorites()
+                 } label: {
+diff --git a/TraceUI/Components/Components.swift b/TraceUI/Components/Components.swift
+--- a/TraceUI/Components/Components.swift
++++ b/TraceUI/Components/Components.swift
+@@ -342,13 +342,15 @@
+     public let isCapturing: Bool
+     public let isServiceRunning: Bool
+     public let isStateUnknown: Bool
++    public let isTransitioning: Bool
+     public let onToggleCapture: () -> Void
+     public let onNewRequest: () -> Void
+ 
+-    public init(isCapturing: Bool, isServiceRunning: Bool = false, isStateUnknown: Bool = false, onToggleCapture: @escaping () -> Void, onNewRequest: @escaping () -> Void) {
++    public init(isCapturing: Bool, isServiceRunning: Bool = false, isStateUnknown: Bool = false, isTransitioning: Bool = false, onToggleCapture: @escaping () -> Void, onNewRequest: @escaping () -> Void) {
+         self.isCapturing = isCapturing
+         self.isServiceRunning = isServiceRunning
+         self.isStateUnknown = isStateUnknown
++        self.isTransitioning = isTransitioning
+         self.onToggleCapture = onToggleCapture
+         self.onNewRequest = onNewRequest
+     }
+@@ -357,14 +359,22 @@
+         HStack(spacing: DesignSystem.Spacing.lg) {
+             Button(action: onToggleCapture) {
+                 HStack(spacing: DesignSystem.Spacing.sm) {
+-                    Circle()
+-                        .fill(isCapturing ? DesignSystem.Colors.success : DesignSystem.Colors.danger)
+-                        .frame(width: 12, height: 12)
+-                        .accessibilityHidden(true)
+-
+-                    Text(LocalizedStringKey(isStateUnknown ? "Check Capture State" : (isCapturing ? "Capturing" : (isServiceRunning ? "Capture Paused" : "Stopped"))))
++                    if isTransitioning {
++                        ProgressView()
++                            .controlSize(.small)
++                            .accessibilityHidden(true)
++                    } else {
++                        Circle()
++                            .fill(isCapturing ? DesignSystem.Colors.success : DesignSystem.Colors.danger)
++                            .frame(width: 12, height: 12)
++                            .accessibilityHidden(true)
++                    }
++
++                    Text(LocalizedStringKey(isStateUnknown ? "Check State" : (isCapturing ? "Capturing" : (isServiceRunning ? "Capture Paused" : "Stopped"))))
+                         .font(.subheadline)
+                         .fontWeight(.medium)
++                        .lineLimit(1)
++                        .minimumScaleFactor(0.85)
+ 
+                     Image(systemName: isStateUnknown ? "arrow.clockwise" : (isCapturing ? "stop.fill" : "play.fill"))
+                         .font(.caption)
+@@ -381,7 +391,8 @@
+                 .contentShape(Capsule())
+             }
+             .foregroundStyle(.primary)
+-            .accessibilityLabel(isStateUnknown ? "Check Capture State" : (isCapturing ? "Stop capturing" : "Start capturing"))
++            .disabled(isTransitioning)
++            .accessibilityLabel(isStateUnknown ? "Check State" : (isCapturing ? "Stop capturing" : "Start capturing"))
+             .accessibilityHint(isStateUnknown ? "Check Capture State" : "Double tap to \(isCapturing ? "stop" : "start") network capture")
+ 
+             Spacer()
+@@ -392,6 +403,8 @@
+                         .font(.headline)
+                     Text("New Request")
+                         .font(.headline)
++                        .lineLimit(1)
++                        .minimumScaleFactor(0.85)
+                 }
+                 .padding(.horizontal, DesignSystem.Spacing.xl)
+                 .padding(.vertical, DesignSystem.Spacing.md)
+diff --git a/ci/l10n-zh-hans-10.strings b/ci/l10n-zh-hans-10.strings
+new file mode 100644
+--- /dev/null
++++ b/ci/l10n-zh-hans-10.strings
+@@ -0,0 +1,2 @@
++/* Compact capture control and non-overlapping status presentation. */
++"Check State" = "核对状态";
