@@ -1,0 +1,1310 @@
+diff --git a/Trace/Services/NetworkCaptureService.swift b/Trace/Services/NetworkCaptureService.swift
+--- a/Trace/Services/NetworkCaptureService.swift
++++ b/Trace/Services/NetworkCaptureService.swift
+@@ -38,10 +38,15 @@
+ 
+     enum ServiceError: LocalizedError {
+         case recordingStateUnconfirmed, transitionInProgress, busy, sessionUnavailable
++        case recordingStateMismatch(expected: Bool)
+         var errorDescription: String? {
+             switch self {
+             case .recordingStateUnconfirmed:
+                 return NSLocalizedString("The network service did not confirm the recording state. Check the service before trying again.", comment: "Unconfirmed recording state")
++            case .recordingStateMismatch(let expected):
++                return expected
++                    ? NSLocalizedString("The network service is running, but recording did not start. The start command was not repeated.", comment: "Recording start was rejected")
++                    : NSLocalizedString("Recording is still running. The stop command was not repeated; check the service state.", comment: "Recording stop was rejected")
+             case .transitionInProgress:
+                 return NSLocalizedString("The network service is still applying a change. Check the recording state again shortly; do not repeat the original action.", comment: "Provider transition in progress")
+             case .busy:
+@@ -56,6 +61,7 @@
+     private weak var sessionCoordinator: CaptureSessionCoordinating?
+     private let loadConfiguration: () -> CaptureConfiguration
+     private let saveConfiguration: (CaptureConfiguration) throws -> Void
++    private let waitForRecordingRetry: () async throws -> Void
+     private var operationInProgress = false
+     @Published private(set) var recordingState: RecordingState
+ 
+@@ -65,12 +71,14 @@
+         vpnManager: VPNManaging = VPNManager.shared,
+         sessionCoordinator: CaptureSessionCoordinating? = nil,
+         loadConfiguration: @escaping () -> CaptureConfiguration = { AppGroupStorage.shared.loadConfiguration() },
+-        saveConfiguration: @escaping (CaptureConfiguration) throws -> Void = { try AppGroupStorage.shared.saveConfiguration($0) }
++        saveConfiguration: @escaping (CaptureConfiguration) throws -> Void = { try AppGroupStorage.shared.saveConfiguration($0) },
++        waitForRecordingRetry: @escaping () async throws -> Void = { try await Task.sleep(nanoseconds: 200_000_000) }
+     ) {
+         self.vpnManager = vpnManager
+         self.sessionCoordinator = sessionCoordinator
+         self.loadConfiguration = loadConfiguration
+         self.saveConfiguration = saveConfiguration
++        self.waitForRecordingRetry = waitForRecordingRetry
+         self.recordingState = vpnManager.isDefinitelyStopped ? .paused : .unknown
+     }
+ 
+@@ -90,7 +98,7 @@
+         defer { operationInProgress = false }
+         try await prepareForControl()
+         if vpnManager.isConnected {
+-            do { recordingState = try await queryRecordingState() ? .recording : .paused }
++            do { applyConfirmedRecordingState(try await queryRecordingState()) }
+             catch { recordingState = .unknown; throw error }
+         } else if vpnManager.isDefinitelyStopped {
+             recordingState = .paused
+@@ -107,7 +115,7 @@
+         try await prepareForControl()
+         if vpnManager.isConnected {
+             recordingState = .unknown
+-            recordingState = try await queryRecordingState() ? .recording : .paused
++            applyConfirmedRecordingState(try await queryRecordingState())
+             return
+         }
+         try setRecordingRequested(false)
+@@ -116,7 +124,7 @@
+             try await vpnManager.start()
+             try await confirmRecordingState(false)
+         } catch {
+-            recordingState = vpnManager.isDefinitelyStopped ? .paused : .unknown
++            if vpnManager.isDefinitelyStopped { recordingState = .paused }
+             throw error
+         }
+     }
+@@ -147,7 +155,7 @@
+         try await prepareForControl()
+         if vpnManager.isConnected {
+             recordingState = .unknown
+-            recordingState = try await queryRecordingState() ? .recording : .paused
++            applyConfirmedRecordingState(try await queryRecordingState())
+             if isCapturing { return }
+         }
+         let newlyCreatedID = try sessionCoordinator?.beginCaptureSession()
+@@ -162,9 +170,8 @@
+                 try? setRecordingRequested(false)
+                 if let newlyCreatedID { sessionCoordinator?.abortCaptureSession(newlyCreatedID) }
+                 recordingState = .paused
+-            } else {
+-                recordingState = .unknown
+             }
++            // Preserve an authoritative opposite-state reply. Unknown outcomes stay unknown.
+             throw error
+         }
+         FeatureLog.vpn.info("event=vpn.capture_start outcome=confirmed source=app")
+@@ -199,9 +206,23 @@
+         try saveConfiguration(config)
+     }
+ 
++    private func applyConfirmedRecordingState(_ recording: Bool) {
++        if !recording { sessionCoordinator?.endCaptureSession(reason: .userStopped) }
++        recordingState = recording ? .recording : .paused
++    }
++
+     private func queryRecordingState() async throws -> Bool {
+-        let data = try await vpnManager.sendMessage(["command": "getRecordingState"])
+-        return try decodeRecordingState(data)
++        // Only a known, short-lived transition is polled. Missing replies are not replayed.
++        for attempt in 0..<3 {
++            try Task.checkCancellation()
++            let data = try await vpnManager.sendMessage(["command": "getRecordingState"])
++            do { return try decodeRecordingState(data) }
++            catch ServiceError.transitionInProgress {
++                guard attempt < 2 else { throw ServiceError.transitionInProgress }
++                try await waitForRecordingRetry()
++            }
++        }
++        throw ServiceError.recordingStateUnconfirmed
+     }
+ 
+     private func decodeRecordingState(_ data: Data?) throws -> Bool {
+@@ -219,10 +240,36 @@
+     }
+ 
+     private func confirmRecordingState(_ expected: Bool) async throws {
+-        let data = try await vpnManager.sendMessage(["command": "setRecordingState"])
+-        let recording = try decodeRecordingState(data)
+-        guard recording == expected else { throw ServiceError.recordingStateUnconfirmed }
+-        recordingState = recording ? .recording : .paused
++        let requestID = UUID().uuidString
++        let initialError: Error
++        do {
++            // The desired state travels with the command, not just through shared storage.
++            let data = try await vpnManager.sendMessage([
++                "command": "setRecordingState", "recording": expected, "request_id": requestID
++            ])
++            let recording = try decodeRecordingState(data)
++            applyConfirmedRecordingState(recording)
++            guard recording == expected else { throw ServiceError.recordingStateMismatch(expected: expected) }
++            return
++        } catch let error as ServiceError {
++            if case .recordingStateMismatch = error { throw error }
++            initialError = error
++        } catch {
++            initialError = error
++        }
++
++        try Task.checkCancellation()
++        FeatureLog.vpn.warning("event=vpn.recording_ack outcome=unconfirmed request_id=\(requestID, privacy: .public) recovery=read_only")
++        do {
++            // The change might already have applied. Never send setRecordingState again.
++            let recording = try await queryRecordingState()
++            applyConfirmedRecordingState(recording)
++            guard recording == expected else { throw ServiceError.recordingStateMismatch(expected: expected) }
++            FeatureLog.vpn.info("event=vpn.recording_ack outcome=recovered request_id=\(requestID, privacy: .public)")
++        } catch {
++            if recordingState == .unknown { throw initialError }
++            throw error
++        }
+     }
+ 
+     func observeCaptureStatus() async -> AsyncStream<Bool> {
+diff --git a/Trace/ViewModels/CaptureViewModel.swift b/Trace/ViewModels/CaptureViewModel.swift
+--- a/Trace/ViewModels/CaptureViewModel.swift
++++ b/Trace/ViewModels/CaptureViewModel.swift
+@@ -233,6 +233,8 @@
+     @Published private(set) var recoveredSessionCount: Int = 0
+ 
+     @Published var currentSession: CaptureSession?
++    @Published private(set) var homeLifecycle = CaptureHomeLifecycle()
++    private var homeTrafficSnapshot: (sessionID: UUID, traffic: (requestCount: Int, totalBytes: Int64))?
+     @Published var selectedSession: CaptureSession?
+     @Published var selectedRequestId: UUID?
+     private var cachedGroupedRequests: GroupedRequests?
+@@ -247,6 +249,7 @@
+ 
+     // Search optimization
+     private var searchTask: Task<Void, Never>?
++    private var activeBodySearchTask: Task<Set<UUID>, Never>?
+     private let maxSearchBodySize = BodyViewerPolicy.networkBodySearchBytes
+     @Published private var bodySearchMatches: Set<UUID> = [] {
+         didSet {
+@@ -394,6 +397,8 @@
+                 self.isServiceRunning = isConnected
+                 self.isRecordingStateUnknown = recordingState == .unknown
+                 self.isCapturing = isConnected && recordingState == .recording
++                // Unknown is transient, not a stop. Only a confirmed pause closes presentation.
++                if recordingState == .paused { self.closeHomePresentation() }
+             }
+             .store(in: &cancellables)
+ 
+@@ -411,6 +416,7 @@
+ 
+     deinit {
+         searchTask?.cancel()
++        activeBodySearchTask?.cancel()
+         loadTask?.cancel()
+         activeLoadTask?.cancel()
+         transportLoadTask?.cancel()
+@@ -592,6 +598,7 @@
+     }
+ 
+     private func debouncedLoadRequests() {
++        guard let homeToken = homeLifecycle.token else { return }
+         // Cancel any pending load task
+         loadTask?.cancel()
+ 
+@@ -602,7 +609,8 @@
+                 try? await Task.sleep(nanoseconds: UInt64(500_000_000)) // 500ms
+                 guard !Task.isCancelled else { return }
+                 await MainActor.run {
+-                    self?.loadRequests(triggeredByNewRequest: true)
++                    guard let self, !Task.isCancelled, self.homeLifecycle.accepts(homeToken) else { return }
++                    self.loadRequests(triggeredByNewRequest: true)
+                 }
+             }
+             return
+@@ -613,6 +621,7 @@
+     }
+ 
+     private func debouncedLoadTransportRequests() {
++        guard let homeToken = homeLifecycle.token else { return }
+         transportLoadTask?.cancel()
+ 
+         if let lastLoad = lastTransportLoadTime, Date().timeIntervalSince(lastLoad) < minLoadInterval {
+@@ -620,7 +629,8 @@
+                 try? await Task.sleep(nanoseconds: UInt64(500_000_000))
+                 guard !Task.isCancelled else { return }
+                 await MainActor.run {
+-                    self?.loadTransportRequests(triggeredByNewRequest: true)
++                    guard let self, !Task.isCancelled, self.homeLifecycle.accepts(homeToken) else { return }
++                    self.loadTransportRequests(triggeredByNewRequest: true)
+                 }
+             }
+             return
+@@ -687,8 +697,9 @@
+     private func loadRequests(triggeredByNewRequest: Bool = false, forceFullReload: Bool = false) {
+         lastLoadTime = Date()
+         activeLoadTask?.cancel()
++        guard let homeToken = homeLifecycle.token, displayedSession != nil else { return }
+         activeLoadTask = Task { [weak self] in
+-            guard let self else { return }
++            guard let self, !Task.isCancelled, self.homeLifecycle.accepts(homeToken) else { return }
+ 
+             let shouldRunFullReload = self.shouldPerformFullRequestReload(
+                 triggeredByNewRequest: triggeredByNewRequest,
+@@ -713,13 +724,14 @@
+                     // New captures initially have no session ID. Read the time window first,
+                     // then attribute only unassigned requests belonging to this run.
+                     var loadedRequests = try await self.storage.loadRequestsAsync(newerThan: scope.startTime)
+-                    guard !Task.isCancelled, self.displayedSession?.id == scope.sessionID else { return }
++                    guard !Task.isCancelled, self.homeLifecycle.accepts(homeToken),
++                          self.displayedSession?.id == scope.sessionID else { return }
+                     loadedRequests = loadedRequests.filter { scope.contains(timestamp: $0.timestamp, sessionID: $0.sessionId) }
+                     loadedRequests = self.assignCurrentSession(to: loadedRequests, session: sessionForAttribution)
+                     loadedRequests = self.optimizeRequestsForList(loadedRequests)
+                     loadedRequests.sort { $0.timestamp > $1.timestamp }
+ 
+-                    guard !Task.isCancelled else { return }
++                    guard !Task.isCancelled, self.homeLifecycle.accepts(homeToken) else { return }
+                     self.requests = self.redirectChainResolver.enrich(loadedRequests)
+                     self.requestIDSet = Set(self.requests.map(\.id))
+                     self.lastRequestFullReloadTime = Date()
+@@ -758,12 +770,13 @@
+                     newerThan: newestKnownTimestamp,
+                     excludingIDs: self.requestIDSet
+                 )
+-                guard !Task.isCancelled, self.displayedSession?.id == scope.sessionID else { return }
++                guard !Task.isCancelled, self.homeLifecycle.accepts(homeToken),
++                      self.displayedSession?.id == scope.sessionID else { return }
+                 loadedRequests = loadedRequests.filter { scope.contains(timestamp: $0.timestamp, sessionID: $0.sessionId) }
+                 loadedRequests = self.assignCurrentSession(to: loadedRequests, session: sessionForAttribution)
+                 loadedRequests = self.optimizeRequestsForList(loadedRequests)
+ 
+-                guard !Task.isCancelled else { return }
++                guard !Task.isCancelled, self.homeLifecycle.accepts(homeToken) else { return }
+                 let newRequestCount = self.mergeRequests(loadedRequests)
+                 guard newRequestCount > 0 else { return }
+ 
+@@ -777,7 +790,7 @@
+                     "event=storage.requests_load outcome=success count=\(newRequestCount) mode=incremental"
+                 )
+             } catch {
+-                guard !Task.isCancelled else { return }
++                guard !Task.isCancelled, self.homeLifecycle.accepts(homeToken) else { return }
+                 CoreLog.storage.error(
+                     "event=storage.requests_load outcome=failure error=\(error.localizedDescription, privacy: .public)"
+                 )
+@@ -886,8 +899,9 @@
+     private func loadTransportRequests(triggeredByNewRequest: Bool = false, forceFullReload: Bool = false) {
+         lastTransportLoadTime = Date()
+         activeTransportLoadTask?.cancel()
++        guard let homeToken = homeLifecycle.token, displayedSession != nil else { return }
+         activeTransportLoadTask = Task { [weak self] in
+-            guard let self else { return }
++            guard let self, !Task.isCancelled, self.homeLifecycle.accepts(homeToken) else { return }
+ 
+             let shouldRunFullReload = self.shouldPerformFullTransportReload(
+                 triggeredByNewRequest: triggeredByNewRequest,
+@@ -908,7 +922,8 @@
+                 let excludedIDs: Set<UUID> = isFullReload ? [] : self.transportRequestIDSet
+                 let loaded = try await self.storage.loadTransportRequestsAsync(newerThan: since, excludingIDs: excludedIDs)
+ 
+-                guard !Task.isCancelled, self.displayedSession?.id == scope.sessionID else { return }
++                guard !Task.isCancelled, self.homeLifecycle.accepts(homeToken),
++                      self.displayedSession?.id == scope.sessionID else { return }
+                 let visible = loaded.filter { scope.contains(timestamp: $0.timestamp) }
+                 if isFullReload {
+                     self.transportRequests = self.enrichTransportRequests(visible)
+@@ -920,7 +935,7 @@
+                     self.transportIncrementalLoadsSinceFullReload += 1
+                 }
+             } catch {
+-                guard !Task.isCancelled else { return }
++                guard !Task.isCancelled, self.homeLifecycle.accepts(homeToken) else { return }
+                 CoreLog.storage.error(
+                     "event=storage.transport_requests_load outcome=failure error=\(error.localizedDescription, privacy: .public)"
+                 )
+@@ -961,8 +976,9 @@
+ 
+     private func loadTransportProtocolHints() {
+         activeUDPFlowHintLoadTask?.cancel()
++        guard let homeToken = homeLifecycle.token, displayedSession != nil else { return }
+         activeUDPFlowHintLoadTask = Task { [weak self] in
+-            guard let self else { return }
++            guard let self, !Task.isCancelled, self.homeLifecycle.accepts(homeToken) else { return }
+ 
+             do {
+                 guard let session = self.displayedSession else {
+@@ -971,14 +987,15 @@
+                 }
+                 let scope = CaptureHomeScope(sessionID: session.id, startTime: session.startTime, endTime: session.endTime)
+                 let flows = try await self.storage.loadAllUDPFlowMetadataAsync()
+-                guard !Task.isCancelled, self.displayedSession?.id == scope.sessionID else { return }
++                guard !Task.isCancelled, self.homeLifecycle.accepts(homeToken),
++                      self.displayedSession?.id == scope.sessionID else { return }
+ 
+                 self.transportProtocolHintsByFlowKey = Self.buildTransportProtocolHints(
+                     from: flows.filter { scope.contains(timestamp: $0.startTime) }
+                 )
+                 self.applyTransportProtocolHints()
+             } catch {
+-                guard !Task.isCancelled else { return }
++                guard !Task.isCancelled, self.homeLifecycle.accepts(homeToken) else { return }
+                 CoreLog.storage.error(
+                     "event=storage.udp_flow_hints_load outcome=failure error=\(error.localizedDescription, privacy: .public)"
+                 )
+@@ -1028,7 +1045,7 @@
+         return hints
+     }
+ 
+-    private let redirectChainResolver = RedirectChainResolver()
++    private var redirectChainResolver = RedirectChainResolver()
+ 
+     func reloadRequests() async {
+         await MainActor.run {
+@@ -1115,6 +1132,7 @@
+     }
+ 
+     var filteredRequests: [NetworkRequest] {
++        guard displayedSession != nil else { return [] }
+         let cacheKey = makeFilterCacheKey()
+ 
+         if let cached = filteredRequestsCache, filteredRequestsCacheKey == cacheKey {
+@@ -1154,7 +1172,7 @@
+ 
+     func makeRequestFilterSnapshot() -> RequestFilterSnapshot {
+         RequestFilterSnapshot(
+-            requests: requests,
++            requests: displayedSession == nil ? [] : requests,
+             filterMethod: filterMethod,
+             filterStatusCode: filterStatusCode,
+             filterDomains: filterDomains,
+@@ -1351,6 +1369,9 @@
+ 
+     private func debounceBodySearch() {
+         searchTask?.cancel()
++        activeBodySearchTask?.cancel()
++        activeBodySearchTask = nil
++        guard let homeToken = homeLifecycle.token else { return }
+ 
+         let currentText = searchText
+         let currentScope = searchScope
+@@ -1358,12 +1379,14 @@
+         searchTask = Task { [weak self] in
+             try? await Task.sleep(nanoseconds: 300_000_000) // 300ms debounce
+             guard !Task.isCancelled else { return }
+-            await self?.performBodySearch(text: currentText, scope: currentScope)
++            guard let self, self.homeLifecycle.accepts(homeToken) else { return }
++            await self.performBodySearch(text: currentText, scope: currentScope)
+         }
+     }
+ 
+     @MainActor
+     private func performBodySearch(text: String, scope: SearchScope) async {
++        guard !Task.isCancelled, let homeToken = homeLifecycle.token else { return }
+         guard !text.isEmpty, scope == .body || scope == .all else {
+             bodySearchMatches = []
+             return
+@@ -1372,7 +1395,7 @@
+         let requestsSnapshot = requests
+         let maxBytes = maxSearchBodySize
+ 
+-        let matches = await Task.detached(priority: .userInitiated) { () -> Set<UUID> in
++        let worker = Task.detached(priority: .userInitiated) { () -> Set<UUID> in
+             var results: Set<UUID> = []
+             for request in requestsSnapshot {
+                 if Task.isCancelled { return results }
+@@ -1381,8 +1404,13 @@
+                 }
+             }
+             return results
+-        }.value
+-
++        }
++        activeBodySearchTask = worker
++        let matches = await worker.value
++
++        guard !Task.isCancelled, !worker.isCancelled, homeLifecycle.accepts(homeToken),
++              searchText == text, searchScope == scope else { return }
++        activeBodySearchTask = nil
+         bodySearchMatches = matches
+     }
+ 
+@@ -1482,8 +1510,15 @@
+             updateWidget()
+         }
+         if enabled {
+-            try await captureService.startCapture()
++            do {
++                try await captureService.startCapture()
++            } catch {
++                // An unknown start result must not expose this attempt or delete its record.
++                closeHomePresentation()
++                throw error
++            }
+         } else {
++            closeHomePresentation()
+             try await captureService.stopCapture()
+         }
+     }
+@@ -1499,6 +1534,7 @@
+         if enabled {
+             try await captureService.startService()
+         } else {
++            closeHomePresentation()
+             try await captureService.stopService()
+         }
+     }
+@@ -1617,11 +1653,13 @@
+ 
+     private func scheduleDuplicateDetection() {
+         duplicateDetectionTask?.cancel()
++        guard let homeToken = homeLifecycle.token else { return }
+         duplicateDetectionTask = Task { [weak self] in
+             try? await Task.sleep(nanoseconds: 200_000_000)
+             guard !Task.isCancelled else { return }
+             await MainActor.run {
+-                self?.detectDuplicates()
++                guard let self, !Task.isCancelled, self.homeLifecycle.accepts(homeToken) else { return }
++                self.detectDuplicates()
+             }
+         }
+     }
+@@ -1711,21 +1749,63 @@
+ 
+     // MARK: - Session Management
+ 
+-    /// 首页列表只展示一条会话：正在抓的那条，或最近一次记录。
+-    ///
+-    /// 历史抓包仍然留在库里，从「抓包记录」里按会话查看，不再混进首页。
++    /// Only a session explicitly created in this process may populate the home screen.
+     private var displayedSession: CaptureSession? {
+-        if let current = currentSession, current.isActive {
+-            return current
+-        }
+-        return sessions.max { $0.startTime < $1.startTime }
++        guard let current = currentSession, current.isActive,
++              homeLifecycle.sessionID == current.id else { return nil }
++        return current
++    }
++
++    var homeScope: CaptureHomeScope? {
++        guard let session = displayedSession else { return nil }
++        return CaptureHomeScope(sessionID: session.id, startTime: session.startTime, endTime: session.endTime)
++    }
++
++    /// Preserve totals before clearing presentation; this never deletes or closes stored history.
++    private func closeHomePresentation() {
++        if homeLifecycle.token != nil, let session = currentSession {
++            homeTrafficSnapshot = (session.id, sessionTraffic(for: session))
++        }
++        homeLifecycle.close()
++        resetHomeForDisplayedSession()
+     }
+ 
+     /// Reset presentation state only. Never delete stored requests or capture files.
+     private func resetHomeForDisplayedSession() {
++        loadTask?.cancel()
++        loadTask = nil
++        transportLoadTask?.cancel()
++        transportLoadTask = nil
+         activeLoadTask?.cancel()
++        activeLoadTask = nil
+         activeTransportLoadTask?.cancel()
++        activeTransportLoadTask = nil
+         activeUDPFlowHintLoadTask?.cancel()
++        activeUDPFlowHintLoadTask = nil
++        searchTask?.cancel()
++        searchTask = nil
++        activeBodySearchTask?.cancel()
++        activeBodySearchTask = nil
++        duplicateDetectionTask?.cancel()
++        duplicateDetectionTask = nil
++        isRunningDuplicateDetection = false
++        hasPendingRequestRefresh = false
++        hasPendingTransportRefresh = false
++        hasPendingUDPFlowHintRefresh = false
++        lastLoadTime = nil
++        lastTransportLoadTime = nil
++        bodySearchMatches = []
++        searchText = ""
++        searchTask?.cancel()
++        searchTask = nil
++        selectedRequestId = nil
++        selectedSession = nil
++        duplicateRequestCache = [:]
++        redirectChainResolver = RedirectChainResolver()
++        notifiedRequestIds = []
++        filteredRequestsCache = nil
++        filteredRequestsCacheKey = nil
++        invalidateGroupingCache()
+         requests = []
+         requestIDSet = []
+         lastRequestFullReloadTime = nil
+@@ -1735,6 +1815,11 @@
+         lastTransportFullReloadTime = nil
+         transportIncrementalLoadsSinceFullReload = 0
+         transportProtocolHintsByFlowKey = [:]
++        // Setting requests may have scheduled duplicate detection; cancel that too.
++        duplicateDetectionTask?.cancel()
++        duplicateDetectionTask = nil
++        isRunningDuplicateDetection = false
++        guard displayedSession != nil else { return }
+         loadRequests(forceFullReload: true)
+         loadTransportRequests(forceFullReload: true)
+         loadTransportProtocolHints()
+@@ -1758,6 +1843,7 @@
+     /// - Important: A tunnel that is still connected owns its session, so nothing is marked in
+     ///   that case: the app only re-adopts the running session instead.
+     private func runStartupSessionRecovery() {
++        guard ownsCaptureLifecycle, !isCaptureTransitioning else { return }
+         recoveryTask?.cancel()
+         recoveryTask = Task { [weak self] in
+             guard let self else { return }
+@@ -1833,6 +1919,7 @@
+     @discardableResult
+     func startNewSession() -> CaptureSession? {
+         if let current = currentSession, current.isActive {
++            homeLifecycle.beginSession(sessionID: current.id, isNewSession: false)
+             return current
+         }
+ 
+@@ -1845,6 +1932,8 @@
+ 
+             currentSession = newSession
+             sessions.insert(newSession, at: 0)
++            homeTrafficSnapshot = nil
++            homeLifecycle.beginSession(sessionID: newSession.id, isNewSession: true)
+             // 开新会话时同时重置 HTTP 与连接列表，历史数据只在抓包记录中查看。
+             resetHomeForDisplayedSession()
+             CoreLog.storage.info(
+@@ -1852,6 +1941,7 @@
+             )
+             return newSession
+         } catch {
++            closeHomePresentation()
+             CoreLog.storage.error(
+                 "event=storage.session_start outcome=failure error=\(error.localizedDescription, privacy: .public)"
+             )
+@@ -1861,7 +1951,9 @@
+ 
+     /// Drops the session opened by `startNewSession()` when the tunnel never came up.
+     func abortCurrentSession() {
+-        guard let session = currentSession, session.isActive else { return }
++        closeHomePresentation()
++        guard VPNManager.shared.isDefinitelyStopped,
++              let session = currentSession, session.isActive else { return }
+ 
+         currentSession = nil
+         sessions.removeAll { $0.id == session.id }
+@@ -1878,6 +1970,7 @@
+     /// - Note: Idempotent. If the VPN extension already closed the record, its end reason is kept
+     ///   and only the statistics are refreshed.
+     func endCurrentSession(reason: SessionEndReason = .userStopped) {
++        closeHomePresentation()
+         guard let activeID = currentSession?.id else { return }
+         guard var session = (try? storage.session(id: activeID)) ?? currentSession else {
+             currentSession = nil
+@@ -1887,20 +1980,15 @@
+         // the write below fails (the extension closes the same record on tunnel stop).
+         currentSession = nil
+ 
+-        let traffic = sessionTraffic(for: session)
++        let traffic = homeTrafficSnapshot.flatMap { $0.sessionID == session.id ? $0.traffic : nil }
++            ?? sessionTraffic(for: session)
++        homeTrafficSnapshot = nil
+         session.requestCount = traffic.requestCount
+         session.totalDataTransferred = traffic.totalBytes
+         if session.endTime == nil {
+             session.endTime = Date()
+             session.endReason = reason
+         }
+-        defer {
+-            // Cancel pending pre-stop loads and apply the closed capture's upper bound.
+-            loadRequests(forceFullReload: true)
+-            loadTransportRequests(forceFullReload: true)
+-            loadTransportProtocolHints()
+-        }
+-
+         do {
+             try storage.updateSessionStats(
+                 id: session.id,
+@@ -1944,7 +2032,7 @@
+         // Connecting / reasserting is not termination; an in-flight start owns its session.
+         if isCapturing {
+             adoptActiveSessionIfNeeded()
+-        } else if VPNManager.shared.isDefinitelyStopped, !isCaptureTransitioning, currentSession != nil {
++        } else if VPNManager.shared.isDefinitelyStopped, !isCaptureTransitioning {
+             endCurrentSession(reason: .appTerminated)
+         }
+         updateWidget()
+@@ -1963,6 +2051,7 @@
+     }
+ 
+     var groupedRequests: GroupedRequests {
++        guard displayedSession != nil else { return GroupedRequests(mode: groupingMode) }
+         let cacheKey = GroupingCacheKey(
+             mode: groupingMode,
+             filterKey: makeFilterCacheKey(),
+@@ -2220,6 +2309,7 @@
+ 
+     /// Removes only this attempt's new record after the tunnel is confirmed stopped.
+     func abortCaptureSession(_ newlyCreatedID: UUID) {
++        if homeLifecycle.sessionID == newlyCreatedID { closeHomePresentation() }
+         guard VPNManager.shared.isDefinitelyStopped, currentSession?.id == newlyCreatedID else { return }
+         abortCurrentSession()
+     }
+diff --git a/Trace/Views/NetworkView.swift b/Trace/Views/NetworkView.swift
+--- a/Trace/Views/NetworkView.swift
++++ b/Trace/Views/NetworkView.swift
+@@ -32,6 +32,9 @@
+     @State private var hasLoaded = false
+     @State private var cachedFilteredEvents: [NetworkEvent] = []
+     @State private var eventRebuildTask: Task<Void, Never>?
++    @State private var activeEventBuildTask: Task<[NetworkEvent], Never>?
++    @State private var eventRebuildRevision: UInt64 = 0
++    @State private var cachedEventsToken: CaptureHomeLifecycle.Token?
+ 
+     @ObservedObject private var vpnManager = VPNManager.shared
+     private let isSimulator = {
+@@ -97,6 +100,17 @@
+             }
+             .onChangeCompat(of: scenePhase) { newPhase in
+                 syncRefreshLifecycle(for: newPhase)
++            }
++            .onChangeCompat(of: viewModel.homeLifecycle) {
++                scheduleEventRebuild()
++            }
++            .onDisappear {
++                eventRebuildTask?.cancel()
++                activeEventBuildTask?.cancel()
++                activeEventBuildTask = nil
++                eventRebuildRevision &+= 1
++                cachedFilteredEvents = []
++                cachedEventsToken = nil
+             }
+             .modifier(EventRebuildModifier(
+                 viewModel: viewModel,
+@@ -202,10 +216,7 @@
+         .toolbar {
+             NetworkViewToolbar(
+                 viewModel: viewModel,
+-                allEventsIsEmpty: viewModel.requests.isEmpty &&
+-                    viewModel.transportRequests.isEmpty &&
+-                    webSocketViewModel.connections.isEmpty &&
+-                    sseViewModel.connections.isEmpty,
++                allEventsIsEmpty: allScopedEventsAreEmpty,
+                 onToggleFilters: { showingFilters = true },
+                 onShowFavorites: { showingFavorites = true },
+                 onShowCurlImport: { showingCurlImport = true },
+@@ -307,6 +318,7 @@
+ 
+     private func syncRefreshLifecycle(for phase: ScenePhase) {
+         let isActive = phase == .active
++        viewModel.setSceneActive(isActive)
+         webSocketViewModel.setSceneActive(isActive)
+         sseViewModel.setSceneActive(isActive)
+     }
+@@ -314,7 +326,18 @@
+     // MARK: - Computed Properties
+ 
+     private var filteredEvents: [NetworkEvent] {
+-        cachedFilteredEvents
++        guard viewModel.homeScope != nil,
++              cachedEventsToken == viewModel.homeLifecycle.token else { return [] }
++        return cachedFilteredEvents
++    }
++
++    /// Toolbar state is based on the current run, before search and user filters.
++    private var allScopedEventsAreEmpty: Bool {
++        guard let scope = viewModel.homeScope else { return true }
++        return !viewModel.requests.contains(where: { scope.contains(timestamp: $0.timestamp, sessionID: $0.sessionId) })
++            && !viewModel.transportRequests.contains(where: { scope.contains(timestamp: $0.timestamp) })
++            && !webSocketViewModel.connections.contains(where: { scope.contains(timestamp: $0.startTime) })
++            && !sseViewModel.connections.contains(where: { scope.contains(timestamp: $0.startTime) })
+     }
+ 
+     var shouldShowEmptyState: Bool {
+@@ -435,6 +458,14 @@
+ 
+     private func scheduleEventRebuild() {
+         eventRebuildTask?.cancel()
++        activeEventBuildTask?.cancel()
++        activeEventBuildTask = nil
++        eventRebuildRevision &+= 1
++        if viewModel.homeScope == nil || cachedEventsToken != viewModel.homeLifecycle.token {
++            cachedFilteredEvents = []
++            cachedEventsToken = nil
++        }
++        guard viewModel.homeScope != nil else { return }
+         eventRebuildTask = Task {
+             try? await Task.sleep(nanoseconds: 100_000_000)
+             guard !Task.isCancelled else { return }
+@@ -444,8 +475,20 @@
+ 
+     @MainActor
+     private func rebuildEventCaches() async {
++        guard !Task.isCancelled else { return }
++        activeEventBuildTask?.cancel()
++        activeEventBuildTask = nil
++        eventRebuildRevision &+= 1
++        let revision = eventRebuildRevision
++        guard let homeToken = viewModel.homeLifecycle.token,
++              let scope = viewModel.homeScope else {
++            cachedFilteredEvents = []
++            cachedEventsToken = nil
++            return
++        }
+         let requestFilterSnapshot = viewModel.makeRequestFilterSnapshot()
+         let input = EventBuildInput(
++            scope: scope,
+             requestFilterSnapshot: requestFilterSnapshot,
+             transportRequests: viewModel.transportRequests,
+             webSockets: webSocketViewModel.connections,
+@@ -455,14 +498,21 @@
+             enabledTypes: viewModel.filterNetworkEventTypes
+         )
+ 
+-        let filtered = await Task.detached(priority: .userInitiated) {
++        let worker = Task.detached(priority: .userInitiated) {
+             Self.buildFilteredEvents(from: input)
+-        }.value
+-
++        }
++        activeEventBuildTask = worker
++        let filtered = await worker.value
++
++        guard !Task.isCancelled, !worker.isCancelled, revision == eventRebuildRevision,
++              viewModel.homeLifecycle.accepts(homeToken), viewModel.homeScope == scope else { return }
++        activeEventBuildTask = nil
++        cachedEventsToken = homeToken
+         cachedFilteredEvents = filtered
+     }
+ 
+     private struct EventBuildInput: Sendable {
++        let scope: CaptureHomeScope
+         let requestFilterSnapshot: CaptureViewModel.RequestFilterSnapshot
+         let transportRequests: [TransportRequest]
+         let webSockets: [WebSocketConnection]
+@@ -473,16 +523,20 @@
+     }
+ 
+     private nonisolated static func buildFilteredEvents(from input: EventBuildInput) -> [NetworkEvent] {
++        guard !Task.isCancelled else { return [] }
+         var eventArrays: [[NetworkEvent]] = []
+ 
+         if input.enabledTypes.contains(.http) {
+-            let filteredRequests = CaptureViewModel.filterRequests(using: input.requestFilterSnapshot)
++            let filteredRequests = CaptureViewModel.filterRequests(using: input.requestFilterSnapshot).filter {
++                input.scope.contains(timestamp: $0.timestamp, sessionID: $0.sessionId)
++            }
+             eventArrays.append(filteredRequests.map { .httpRequest($0) })
+         }
+ 
+         if input.enabledTypes.contains(.webSocket) {
+             let filteredWebSockets = input.webSockets.filter {
+-                matchesURLSearch($0.url, searchText: input.searchText, searchScope: input.searchScope)
++                input.scope.contains(timestamp: $0.startTime) &&
++                    matchesURLSearch($0.url, searchText: input.searchText, searchScope: input.searchScope)
+             }
+             if !filteredWebSockets.isEmpty {
+                 eventArrays.append(filteredWebSockets.map { .webSocket($0) })
+@@ -491,7 +545,8 @@
+ 
+         if input.enabledTypes.contains(.sse) {
+             let filteredSSE = input.sseConnections.filter {
+-                matchesURLSearch($0.url, searchText: input.searchText, searchScope: input.searchScope)
++                input.scope.contains(timestamp: $0.startTime) &&
++                    matchesURLSearch($0.url, searchText: input.searchText, searchScope: input.searchScope)
+             }
+             if !filteredSSE.isEmpty {
+                 eventArrays.append(filteredSSE.map { .sse($0) })
+@@ -499,7 +554,7 @@
+         }
+ 
+         let transportEvents = filteredTransportEvents(
+-            input.transportRequests,
++            input.transportRequests.filter { input.scope.contains(timestamp: $0.timestamp) },
+             searchText: input.searchText,
+             searchScope: input.searchScope,
+             enabledTypes: input.enabledTypes
+@@ -532,6 +587,7 @@
+         events.reserveCapacity(requests.count)
+ 
+         for request in requests {
++            guard !Task.isCancelled else { return [] }
+             let event = NetworkEvent.transportRequest(request)
+             guard enabledTypes.contains(event.type) else { continue }
+             guard matchesTransportSearch(request, searchText: searchText, searchScope: searchScope) else { continue }
+@@ -578,6 +634,7 @@
+         merged.reserveCapacity(totalCount)
+ 
+         while merged.count < totalCount {
++            guard !Task.isCancelled else { return [] }
+             var selectedArrayIndex: Int?
+             var selectedEvent: NetworkEvent?
+ 
+diff --git a/TraceCore/Models/CaptureHomeScope.swift b/TraceCore/Models/CaptureHomeScope.swift
+--- a/TraceCore/Models/CaptureHomeScope.swift
++++ b/TraceCore/Models/CaptureHomeScope.swift
+@@ -1,4 +1,38 @@
+ import Foundation
++
++/// Process-local permission to present a newly created capture. Never persisted.
++/// Restoring or reusing a stored session does not grant presentation permission.
++public struct CaptureHomeLifecycle: Equatable, Sendable {
++    public struct Token: Equatable, Sendable {
++        public let sessionID: UUID
++        public let generation: UInt64
++    }
++
++    public private(set) var sessionID: UUID?
++    public private(set) var generation: UInt64 = 0
++
++    public init() {}
++
++    public var token: Token? {
++        guard let sessionID else { return nil }
++        return Token(sessionID: sessionID, generation: generation)
++    }
++
++    public mutating func beginSession(sessionID: UUID, isNewSession: Bool) {
++        guard isNewSession else { return }
++        generation &+= 1
++        self.sessionID = sessionID
++    }
++
++    public mutating func close() {
++        generation &+= 1
++        sessionID = nil
++    }
++
++    public func accepts(_ token: Token) -> Bool {
++        self.token == token
++    }
++}
+ 
+ /// The single capture run visible on the home screen. History remains in storage.
+ public struct CaptureHomeScope: Equatable, Sendable {
+diff --git a/TraceLogicTests/TraceCaptureHomeScopeRegressionTests.swift b/TraceLogicTests/TraceCaptureHomeScopeRegressionTests.swift
+--- a/TraceLogicTests/TraceCaptureHomeScopeRegressionTests.swift
++++ b/TraceLogicTests/TraceCaptureHomeScopeRegressionTests.swift
+@@ -53,6 +53,87 @@
+         XCTAssertTrue(scope(ended: true).contains(timestamp: start.addingTimeInterval(60)))
+     }
+ 
++    func testProcessStartsWithoutHomePermission() {
++        let lifecycle = CaptureHomeLifecycle()
++        XCTAssertNil(lifecycle.sessionID)
++        XCTAssertNil(lifecycle.token)
++        XCTAssertEqual(lifecycle.generation, 0)
++    }
++
++    func testNewSessionOpensHomePermission() throws {
++        var lifecycle = CaptureHomeLifecycle()
++        lifecycle.beginSession(sessionID: currentID, isNewSession: true)
++        let token = try XCTUnwrap(lifecycle.token)
++        XCTAssertEqual(token.sessionID, currentID)
++        XCTAssertEqual(token.generation, lifecycle.generation)
++        XCTAssertTrue(lifecycle.accepts(token))
++    }
++
++    func testEndingSessionInvalidatesLateToken() throws {
++        var lifecycle = CaptureHomeLifecycle()
++        lifecycle.beginSession(sessionID: currentID, isNewSession: true)
++        let token = try XCTUnwrap(lifecycle.token)
++        lifecycle.close()
++        XCTAssertNil(lifecycle.sessionID)
++        XCTAssertNil(lifecycle.token)
++        XCTAssertFalse(lifecycle.accepts(token))
++        XCTAssertGreaterThan(lifecycle.generation, token.generation)
++    }
++
++    func testRestoringOrReusingSessionCannotOpenHome() {
++        var lifecycle = CaptureHomeLifecycle()
++        lifecycle.beginSession(sessionID: previousID, isNewSession: false)
++        XCTAssertNil(lifecycle.token)
++        lifecycle.beginSession(sessionID: currentID, isNewSession: false)
++        XCTAssertNil(lifecycle.sessionID)
++        XCTAssertEqual(lifecycle.generation, 0)
++    }
++
++    func testReuseCannotReopenHomeAfterStop() throws {
++        var lifecycle = CaptureHomeLifecycle()
++        lifecycle.beginSession(sessionID: currentID, isNewSession: true)
++        let token = try XCTUnwrap(lifecycle.token)
++        lifecycle.close()
++        lifecycle.beginSession(sessionID: currentID, isNewSession: false)
++        XCTAssertNil(lifecycle.token)
++        XCTAssertFalse(lifecycle.accepts(token))
++    }
++
++    func testNewSessionReplacesPreviousToken() throws {
++        var lifecycle = CaptureHomeLifecycle()
++        lifecycle.beginSession(sessionID: previousID, isNewSession: true)
++        let previous = try XCTUnwrap(lifecycle.token)
++        lifecycle.beginSession(sessionID: currentID, isNewSession: true)
++        let current = try XCTUnwrap(lifecycle.token)
++        XCTAssertFalse(lifecycle.accepts(previous))
++        XCTAssertTrue(lifecycle.accepts(current))
++        XCTAssertEqual(current.sessionID, currentID)
++    }
++
++    func testGenerationRejectsLateWorkEvenWhenSessionIDIsRepeated() throws {
++        var lifecycle = CaptureHomeLifecycle()
++        lifecycle.beginSession(sessionID: currentID, isNewSession: true)
++        let previous = try XCTUnwrap(lifecycle.token)
++        lifecycle.close()
++        lifecycle.beginSession(sessionID: currentID, isNewSession: true)
++        let current = try XCTUnwrap(lifecycle.token)
++        XCTAssertEqual(previous.sessionID, current.sessionID)
++        XCTAssertNotEqual(previous.generation, current.generation)
++        XCTAssertFalse(lifecycle.accepts(previous))
++        XCTAssertTrue(lifecycle.accepts(current))
++    }
++
++    func testClosingHomeDoesNotChangeHistoryContainsSemantics() {
++        let history = scope(ended: true)
++        var lifecycle = CaptureHomeLifecycle()
++        lifecycle.beginSession(sessionID: currentID, isNewSession: true)
++        lifecycle.close()
++        XCTAssertTrue(history.contains(timestamp: start.addingTimeInterval(20), sessionID: nil))
++        XCTAssertTrue(history.contains(timestamp: start.addingTimeInterval(61), sessionID: currentID))
++        XCTAssertFalse(history.contains(timestamp: start.addingTimeInterval(20), sessionID: previousID))
++        XCTAssertFalse(history.contains(timestamp: start.addingTimeInterval(61)))
++    }
++
+     func testNewCaptureCannotReplayPreviousCapture() {
+         let next = CaptureHomeScope(sessionID: UUID(), startTime: start.addingTimeInterval(100), endTime: nil)
+         XCTAssertFalse(next.contains(timestamp: start.addingTimeInterval(20), sessionID: nil))
+diff --git a/TraceVPN/Providers/PacketTunnelProvider+Messaging.swift b/TraceVPN/Providers/PacketTunnelProvider+Messaging.swift
+--- a/TraceVPN/Providers/PacketTunnelProvider+Messaging.swift
++++ b/TraceVPN/Providers/PacketTunnelProvider+Messaging.swift
+@@ -73,14 +73,38 @@
+         case .updateCaptureConfig:
+             await refreshCaptureConfiguration()
+         case .getRecordingState, .setRecordingState:
++            let requestID = message.payload["request_id"] as? String ?? "legacy"
++            var requestedRecording: Bool?
+             if case .setRecordingState = message.command {
+-                let runtimeConfiguration = await loadTunnelProviderConfiguration()
++                var capture = AppGroupStorage.shared.loadConfiguration()
++                // New callers send their exact intent; older callers retain shared-config semantics.
++                if let requested = message.payload["recording"] as? Bool { capture.isRecordingEnabled = requested }
++                requestedRecording = capture.isRecordingEnabled
++                let expected = capture.isRecordingEnabled
++                VPNLog.tunnel.info("event=vpn.recording_control phase=received request_id=\(requestID, privacy: .public) expected=\(expected)")
++                Task {
++                    await self.runtimeState.appendEventLog(type: "recording_control", msg: "phase=received request_id=\(requestID) expected=\(expected)")
++                }
++                let runtimeConfiguration = await loadTunnelProviderConfiguration(captureConfiguration: capture)
+                 await syncRecordingState(using: runtimeConfiguration)
+             }
+-            let response: [String: Any] = [
+-                "recording": CaptureRecordingState.shared.isRecording,
++            let recording = CaptureRecordingState.shared.isRecording
++            var response: [String: Any] = [
++                "recording": recording, "transitioning": false, "protocol_version": 2,
++                "request_id": requestID,
+                 "session_id": (captureSessionCoordinator.currentSession?.id.uuidString as Any?) ?? NSNull()
+             ]
++            if let expected = requestedRecording {
++                let outcome = recording == expected ? "applied" : "rejected"
++                let reason = recording == expected ? "none"
++                    : (captureSessionCoordinator.currentSession == nil ? "session_unavailable" : "recording_not_applied")
++                if recording != expected { response["error"] = reason }
++                VPNLog.tunnel.info("event=vpn.recording_control phase=completed request_id=\(requestID, privacy: .public) outcome=\(outcome, privacy: .public) recording=\(recording) reason=\(reason, privacy: .public)")
++                // Diagnostics must not delay the control reply or hold the recording queue.
++                Task {
++                    await self.runtimeState.appendEventLog(type: "recording_control", msg: "phase=completed request_id=\(requestID) outcome=\(outcome) recording=\(recording) reason=\(reason)")
++                }
++            }
+             completionHandler.call(try? JSONSerialization.data(withJSONObject: response))
+             return
+         case .updateHardeningConfig:
+diff --git a/ci/TraceServiceRecordingRegressionTests.swift b/ci/TraceServiceRecordingRegressionTests.swift
+--- a/ci/TraceServiceRecordingRegressionTests.swift
++++ b/ci/TraceServiceRecordingRegressionTests.swift
+@@ -207,7 +207,7 @@
+ 
+ @MainActor
+ private final class MemoryVPN: VPNManaging {
+-    enum Failure: Error { case start, save, prepare, stop }
++    enum Failure: Error { case start, save, prepare, stop, acknowledgement }
+     let subject = CurrentValueSubject<Bool, Never>(false)
+     var isConnected: Bool { get { subject.value } set { subject.send(newValue) } }
+     var isConnectedPublisher: AnyPublisher<Bool, Never> { subject.eraseToAnyPublisher() }
+@@ -223,6 +223,12 @@
+     var missingReply = false
+     var missingQueryReply = false
+     var queryTransitioning = false
++    var queryTransitionsRemaining = 0
++    var missingQueryReplyAfterChange = false
++    var malformedReply = false
++    var throwAfterApplyingChange = false
++    var requestedRecordingStates: [Bool] = []
++    var requestIDs: [String] = []
+     var oppositeReply = false
+     var actualRecording = false
+     var recording: () -> Bool = { false }
+@@ -247,14 +253,23 @@
+         if command == "getRecordingState" {
+             queries += 1
+             if missingQueryReply { return nil }
+-            if queryTransitioning {
++            if queryTransitioning || queryTransitionsRemaining > 0 {
++                if queryTransitionsRemaining > 0 { queryTransitionsRemaining -= 1 }
+                 return try JSONSerialization.data(withJSONObject: ["transitioning": true, "recording": actualRecording])
+             }
+         } else {
+             XCTAssertEqual(command, "setRecordingState")
+             messages += 1
+-            actualRecording = oppositeReply ? !recording() : recording()
++            let requested = message["recording"] as? Bool
++            XCTAssertNotNil(requested, "Control commands must carry their desired state")
++            let expected = requested ?? recording()
++            requestedRecordingStates.append(expected)
++            requestIDs.append(message["request_id"] as? String ?? "")
++            actualRecording = oppositeReply ? !expected : expected
++            if missingQueryReplyAfterChange { missingQueryReply = true }
++            if throwAfterApplyingChange { throw Failure.acknowledgement }
+             if missingReply { return nil }
++            if malformedReply { return Data("{}".utf8) }
+         }
+         return try JSONSerialization.data(withJSONObject: ["recording": actualRecording])
+     }
+@@ -262,7 +277,7 @@
+ 
+ @MainActor
+ final class NetworkServiceControlRegressionTests: XCTestCase {
+-    private func make() -> (NetworkCaptureService, MemoryVPN, ConfigurationBox, SessionSpy) {
++    private func make(wait: @escaping () async throws -> Void = {}) -> (NetworkCaptureService, MemoryVPN, ConfigurationBox, SessionSpy) {
+         let vpn = MemoryVPN()
+         let box = ConfigurationBox()
+         let sessions = SessionSpy()
+@@ -271,7 +286,7 @@
+             loadConfiguration: { box.value }, saveConfiguration: {
+                 if box.failSave { throw MemoryVPN.Failure.save }
+                 box.value = $0
+-            })
++            }, waitForRecordingRetry: wait)
+         return (service, vpn, box, sessions)
+     }
+ 
+@@ -337,6 +352,7 @@
+         let (service, vpn, _, sessions) = make()
+         try await service.startService()
+         vpn.missingReply = true
++        vpn.missingQueryReplyAfterChange = true
+         do { try await service.startCapture(); XCTFail("Unknown start was reported as success") }
+         catch {
+             XCTAssertEqual(sessions.began, 1)
+@@ -347,6 +363,7 @@
+             XCTAssertFalse(service.isCapturing)
+         }
+         let changes = vpn.messages
++        vpn.missingQueryReply = false
+         try await service.refreshRecordingState()
+         XCTAssertTrue(service.isCapturing)
+         XCTAssertEqual(vpn.messages, changes)
+@@ -359,6 +376,7 @@
+         let (service, vpn, _, sessions) = make()
+         try await service.startCapture()
+         vpn.missingReply = true
++        vpn.missingQueryReplyAfterChange = true
+         do { try await service.stopCapture(); XCTFail("Unknown stop was reported as success") }
+         catch {
+             XCTAssertEqual(sessions.ended, 0)
+@@ -366,8 +384,10 @@
+             XCTAssertEqual(service.recordingState, .unknown)
+         }
+         let changes = vpn.messages
++        vpn.missingQueryReply = false
+         try await service.refreshRecordingState()
+         XCTAssertEqual(service.recordingState, .paused)
++        XCTAssertEqual(sessions.ended, 1)
+         XCTAssertEqual(vpn.messages, changes)
+         XCTAssertTrue(vpn.isConnected)
+     }
+@@ -377,10 +397,11 @@
+         try await service.startService()
+         vpn.oppositeReply = true
+         do { try await service.startCapture(); XCTFail("Mismatched state was accepted") }
+-        catch {
++        catch NetworkCaptureService.ServiceError.recordingStateMismatch(let expected) {
++            XCTAssertTrue(expected)
+             XCTAssertEqual(vpn.messages, 2)
+-            XCTAssertEqual(service.recordingState, .unknown)
+-        }
++            XCTAssertEqual(service.recordingState, .paused)
++        } catch { XCTFail("Expected a known opposite state, got \(error)") }
+     }
+ 
+     func testFailedVPNStartAbortsOnlyTheUnusedSession() async {
+@@ -494,15 +515,170 @@
+             XCTAssertEqual(service.recordingState, .unknown)
+         } catch { XCTFail("Expected transition status, got \(error)") }
+         XCTAssertEqual(vpn.messages, 0)
+-        XCTAssertEqual(vpn.queries, 1)
++        XCTAssertEqual(vpn.queries, 3)
+         XCTAssertEqual(sessions.began, 0)
+         XCTAssertEqual(sessions.ended, 0)
+         vpn.queryTransitioning = false
+         try await service.refreshRecordingState()
+         XCTAssertEqual(service.recordingState, .recording)
+         XCTAssertEqual(vpn.messages, 0)
++        XCTAssertEqual(vpn.queries, 4)
++        XCTAssertEqual(vpn.starts, 0)
++    }
++
++    func testMissingStartReplyRecoversByQueryWithoutRepeatingChange() async throws {
++        let (service, vpn, _, sessions) = make()
++        try await service.startService()
++        vpn.missingReply = true
++        try await service.startCapture()
++        XCTAssertTrue(service.isCapturing)
++        XCTAssertEqual(vpn.messages, 2)
+         XCTAssertEqual(vpn.queries, 2)
++        XCTAssertEqual(vpn.starts, 1)
++        XCTAssertEqual(sessions.began, 1)
++        XCTAssertEqual(sessions.ended, 0)
++        XCTAssertEqual(sessions.aborted, 0)
++    }
++
++    func testMissingStopReplyRecoversAndFinalizesWithoutStoppingService() async throws {
++        let (service, vpn, _, sessions) = make()
++        try await service.startCapture()
++        vpn.missingReply = true
++        try await service.stopCapture()
++        XCTAssertEqual(service.recordingState, .paused)
++        XCTAssertTrue(vpn.isConnected)
++        XCTAssertEqual(vpn.messages, 2)
++        XCTAssertEqual(vpn.queries, 1)
++        XCTAssertEqual(vpn.stops, 0)
++        XCTAssertEqual(sessions.ended, 1)
++    }
++
++    func testMalformedStartReplyRecoversOnlyByQuery() async throws {
++        let (service, vpn, _, sessions) = make()
++        vpn.malformedReply = true
++        try await service.startCapture()
++        XCTAssertTrue(service.isCapturing)
++        XCTAssertEqual(vpn.messages, 1)
++        XCTAssertEqual(vpn.queries, 1)
++        XCTAssertEqual(sessions.began, 1)
++    }
++
++    func testThrownAcknowledgementAfterApplyingRecoversOnlyByQuery() async throws {
++        let (service, vpn, _, sessions) = make()
++        vpn.throwAfterApplyingChange = true
++        try await service.startCapture()
++        XCTAssertTrue(service.isCapturing)
++        XCTAssertEqual(vpn.messages, 1)
++        XCTAssertEqual(vpn.queries, 1)
++        XCTAssertEqual(sessions.aborted, 0)
++    }
++
++    func testTemporaryTransitionIsRetriedReadOnlyWithinBound() async throws {
++        let (service, vpn, _, sessions) = make()
++        vpn.isConnected = true
++        vpn.actualRecording = true
++        vpn.queryTransitionsRemaining = 2
++        try await service.refreshRecordingState()
++        XCTAssertTrue(service.isCapturing)
++        XCTAssertEqual(vpn.queries, 3)
++        XCTAssertEqual(vpn.messages, 0)
+         XCTAssertEqual(vpn.starts, 0)
++        XCTAssertEqual(sessions.began, 0)
++    }
++
++    func testPersistentTransitionAfterLostAcknowledgementRemainsUnknown() async {
++        let (service, vpn, _, sessions) = make()
++        vpn.missingReply = true
++        vpn.queryTransitioning = true
++        do { try await service.startCapture(); XCTFail("Unresolved transition was accepted") }
++        catch {
++            XCTAssertEqual(service.recordingState, .unknown)
++            XCTAssertEqual(vpn.messages, 1)
++            XCTAssertEqual(vpn.queries, 3)
++            XCTAssertEqual(sessions.began, 1)
++            XCTAssertEqual(sessions.ended, 0)
++            XCTAssertEqual(sessions.aborted, 0)
++        }
++    }
++
++    func testReadOnlyPauseConfirmationFinalizesSessionOnlyOnce() async throws {
++        let (service, vpn, _, sessions) = make()
++        try await service.startCapture()
++        let changes = vpn.messages
++        vpn.actualRecording = false
++        try await service.refreshRecordingState()
++        try await service.refreshRecordingState()
++        XCTAssertEqual(service.recordingState, .paused)
++        XCTAssertEqual(sessions.ended, 1)
++        XCTAssertEqual(vpn.messages, changes)
++        XCTAssertEqual(vpn.stops, 0)
++    }
++
++    func testMissingReadOnlyReplyIsNotAutomaticallyRepeated() async {
++        let (service, vpn, _, _) = make()
++        vpn.isConnected = true
++        vpn.missingQueryReply = true
++        do { try await service.refreshRecordingState(); XCTFail("Missing reply was accepted") }
++        catch {
++            XCTAssertEqual(service.recordingState, .unknown)
++            XCTAssertEqual(vpn.queries, 1)
++            XCTAssertEqual(vpn.messages, 0)
++        }
++    }
++
++    func testEachControlCommandCarriesExplicitStateAndUniqueRequestID() async throws {
++        let (service, vpn, _, _) = make()
++        try await service.startService()
++        try await service.startCapture()
++        try await service.stopCapture()
++        XCTAssertEqual(vpn.requestedRecordingStates, [false, true, false])
++        XCTAssertEqual(vpn.requestIDs.count, 3)
++        XCTAssertEqual(Set(vpn.requestIDs).count, 3)
++        XCTAssertTrue(vpn.requestIDs.allSatisfy { UUID(uuidString: $0) != nil })
++    }
++
++    func testRejectedStopKeepsKnownRecordingStateAndSession() async throws {
++        let (service, vpn, _, sessions) = make()
++        try await service.startCapture()
++        vpn.oppositeReply = true
++        do { try await service.stopCapture(); XCTFail("Rejected stop was accepted") }
++        catch NetworkCaptureService.ServiceError.recordingStateMismatch(let expected) {
++            XCTAssertFalse(expected)
++            XCTAssertEqual(service.recordingState, .recording)
++            XCTAssertTrue(service.isCapturing)
++            XCTAssertEqual(sessions.ended, 0)
++            XCTAssertEqual(vpn.messages, 2)
++            XCTAssertEqual(vpn.queries, 0)
++        } catch { XCTFail("Expected known rejected stop, got \(error)") }
++    }
++
++    func testOppositeStateAfterLostStartReplyIsKnownPausedNotUnknown() async throws {
++        let (service, vpn, _, sessions) = make()
++        try await service.startService()
++        vpn.missingReply = true
++        vpn.oppositeReply = true
++        do { try await service.startCapture(); XCTFail("Rejected start was accepted") }
++        catch NetworkCaptureService.ServiceError.recordingStateMismatch(let expected) {
++            XCTAssertTrue(expected)
++            XCTAssertEqual(service.recordingState, .paused)
++            XCTAssertEqual(sessions.ended, 1)
++            XCTAssertEqual(sessions.aborted, 0)
++            XCTAssertEqual(vpn.messages, 2)
++            XCTAssertEqual(vpn.queries, 2)
++        } catch { XCTFail("Expected known rejected start, got \(error)") }
++    }
++
++    func testCancelledReadOnlyWaitDoesNotRetryOrMutate() async {
++        let (service, vpn, _, sessions) = make(wait: { throw CancellationError() })
++        vpn.isConnected = true
++        vpn.queryTransitioning = true
++        do { try await service.refreshRecordingState(); XCTFail("Cancelled wait was ignored") }
++        catch is CancellationError {
++            XCTAssertEqual(service.recordingState, .unknown)
++            XCTAssertEqual(vpn.queries, 1)
++            XCTAssertEqual(vpn.messages, 0)
++            XCTAssertEqual(sessions.ended, 0)
++        } catch { XCTFail("Expected cancellation, got \(error)") }
+     }
+ 
+     func testConcurrentOppositeOperationFailsBusyRatherThanSilentlySucceeding() async throws {
+diff --git a/ci/l10n-zh-hans-09.strings b/ci/l10n-zh-hans-09.strings
+new file mode 100644
+--- /dev/null
++++ b/ci/l10n-zh-hans-09.strings
+@@ -0,0 +1,3 @@
++/* Recording acknowledgement recovery and known rejection states. */
++"The network service is running, but recording did not start. The start command was not repeated." = "网络服务正在运行，但录制未能开始。未重复发送开始命令。请检查服务状态后再操作。";
++"Recording is still running. The stop command was not repeated; check the service state." = "录制仍在进行。未重复发送停止命令，请先检查服务状态。";

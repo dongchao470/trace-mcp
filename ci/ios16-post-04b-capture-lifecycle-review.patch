@@ -1,0 +1,159 @@
+diff --git a/Trace/Services/NetworkCaptureService.swift b/Trace/Services/NetworkCaptureService.swift
+--- a/Trace/Services/NetworkCaptureService.swift
++++ b/Trace/Services/NetworkCaptureService.swift
+@@ -101,7 +101,7 @@
+             do { applyConfirmedRecordingState(try await queryRecordingState()) }
+             catch { recordingState = .unknown; throw error }
+         } else if vpnManager.isDefinitelyStopped {
+-            recordingState = .paused
++            applyConfirmedRecordingState(false)
+         } else {
+             recordingState = .unknown
+             throw ServiceError.recordingStateUnconfirmed
+diff --git a/Trace/ViewModels/CaptureViewModel.swift b/Trace/ViewModels/CaptureViewModel.swift
+--- a/Trace/ViewModels/CaptureViewModel.swift
++++ b/Trace/ViewModels/CaptureViewModel.swift
+@@ -234,7 +234,6 @@
+ 
+     @Published var currentSession: CaptureSession?
+     @Published private(set) var homeLifecycle = CaptureHomeLifecycle()
+-    private var homeTrafficSnapshot: (sessionID: UUID, traffic: (requestCount: Int, totalBytes: Int64))?
+     @Published var selectedSession: CaptureSession?
+     @Published var selectedRequestId: UUID?
+     private var cachedGroupedRequests: GroupedRequests?
+@@ -1761,11 +1760,8 @@
+         return CaptureHomeScope(sessionID: session.id, startTime: session.startTime, endTime: session.endTime)
+     }
+ 
+-    /// Preserve totals before clearing presentation; this never deletes or closes stored history.
++    /// Close presentation immediately; persisted history and final traffic totals are independent.
+     private func closeHomePresentation() {
+-        if homeLifecycle.token != nil, let session = currentSession {
+-            homeTrafficSnapshot = (session.id, sessionTraffic(for: session))
+-        }
+         homeLifecycle.close()
+         resetHomeForDisplayedSession()
+     }
+@@ -1932,7 +1928,6 @@
+ 
+             currentSession = newSession
+             sessions.insert(newSession, at: 0)
+-            homeTrafficSnapshot = nil
+             homeLifecycle.beginSession(sessionID: newSession.id, isNewSession: true)
+             // 开新会话时同时重置 HTTP 与连接列表，历史数据只在抓包记录中查看。
+             resetHomeForDisplayedSession()
+@@ -1980,9 +1975,7 @@
+         // the write below fails (the extension closes the same record on tunnel stop).
+         currentSession = nil
+ 
+-        let traffic = homeTrafficSnapshot.flatMap { $0.sessionID == session.id ? $0.traffic : nil }
+-            ?? sessionTraffic(for: session)
+-        homeTrafficSnapshot = nil
++        let traffic = sessionTraffic(for: session)
+         session.requestCount = traffic.requestCount
+         session.totalDataTransferred = traffic.totalBytes
+         if session.endTime == nil {
+@@ -2014,13 +2007,13 @@
+         }
+     }
+ 
+-    /// Request count and transferred bytes of one session.
++    /// Final totals come from persisted requests after stop, never a partial home-screen snapshot.
+     private func sessionTraffic(for session: CaptureSession) -> (requestCount: Int, totalBytes: Int64) {
+-        var sessionRequests = requests.filter { $0.sessionId == session.id }
+-        if sessionRequests.isEmpty,
+-           let stored = try? storage.loadRequests(newerThan: session.startTime) {
+-            sessionRequests = stored.filter { $0.sessionId == session.id }
+-        }
++        guard let stored = try? storage.loadRequests(newerThan: session.startTime) else {
++            // A read failure must not replace the extension's stored totals with zero.
++            return (session.requestCount, session.totalDataTransferred)
++        }
++        let sessionRequests = stored.filter { $0.sessionId == session.id }
+         return (
+             sessionRequests.count,
+             sessionRequests.reduce(Int64(0)) { $0 + Int64($1.responseSize ?? 0) }
+diff --git a/Trace/ViewModels/SSEViewModel.swift b/Trace/ViewModels/SSEViewModel.swift
+--- a/Trace/ViewModels/SSEViewModel.swift
++++ b/Trace/ViewModels/SSEViewModel.swift
+@@ -16,6 +16,7 @@
+ final class SSEViewModel: ObservableObject {
+     private let storage = AppGroupStorage.shared
+     private var loadTask: Task<Void, Never>?
++    private var loadRevision: UInt64 = 0
+     private var storageObserverToken: AppGroupStorageObserverToken?
+     private var isSceneActive = true
+     private var hasPendingRefresh = false
+@@ -71,6 +72,7 @@
+         isSceneActive = isActive
+ 
+         guard isActive else {
++            loadRevision &+= 1
+             hasPendingRefresh = true
+             loadTask?.cancel()
+             return
+@@ -91,16 +93,20 @@
+     }
+ 
+     func loadConnections() async {
++        loadRevision &+= 1
++        let revision = loadRevision
++        guard !Task.isCancelled, isSceneActive else { return }
+         NetworkLog.sse.info("event=sse_viewmodel.load_connections outcome=start")
+         do {
+             let loaded = try await Task.detached(priority: .utility) {
+                 try AppGroupStorage.shared.loadAllSSEConnections()
+                     .sorted { $0.startTime > $1.startTime }
+             }.value
+-            guard !Task.isCancelled, isSceneActive else { return }
++            guard !Task.isCancelled, isSceneActive, revision == loadRevision else { return }
+             connections = loaded
+             NetworkLog.sse.info("event=sse_viewmodel.load_connections outcome=success count=\(loaded.count, privacy: .public)")
+         } catch {
++            guard !Task.isCancelled, isSceneActive, revision == loadRevision else { return }
+             NetworkLog.sse.error(
+                 "event=sse_viewmodel.load_connections outcome=failure error=\(error.localizedDescription, privacy: .public)"
+             )
+diff --git a/ci/TraceServiceRecordingRegressionTests.swift b/ci/TraceServiceRecordingRegressionTests.swift
+--- a/ci/TraceServiceRecordingRegressionTests.swift
++++ b/ci/TraceServiceRecordingRegressionTests.swift
+@@ -614,6 +614,39 @@
+         XCTAssertEqual(vpn.stops, 0)
+     }
+ 
++    func testConfirmedStoppedRefreshAfterUnknownStartFinalizesAndAllowsNewSession() async throws {
++        let (service, vpn, _, sessions) = make()
++        vpn.missingReply = true
++        vpn.missingQueryReplyAfterChange = true
++        do { try await service.startCapture(); XCTFail("Unknown start was accepted") }
++        catch { XCTAssertEqual(service.recordingState, .unknown) }
++        let previousID = sessions.currentID
++        XCTAssertNotNil(previousID)
++        XCTAssertEqual(sessions.ended, 0)
++
++        vpn.isConnected = false
++        vpn.actualRecording = false
++        try await service.refreshRecordingState()
++        try await service.refreshRecordingState()
++        XCTAssertEqual(service.recordingState, .paused)
++        XCTAssertNil(sessions.currentID)
++        XCTAssertEqual(sessions.ended, 1)
++        XCTAssertEqual(vpn.messages, 1)
++        XCTAssertEqual(vpn.queries, 1)
++        XCTAssertEqual(vpn.stops, 0)
++
++        vpn.missingReply = false
++        vpn.missingQueryReplyAfterChange = false
++        vpn.missingQueryReply = false
++        try await service.startCapture()
++        XCTAssertTrue(service.isCapturing)
++        XCTAssertEqual(sessions.began, 2)
++        XCTAssertNotEqual(sessions.currentID, previousID)
++        XCTAssertEqual(vpn.starts, 2)
++        XCTAssertEqual(vpn.messages, 2)
++        XCTAssertEqual(sessions.aborted, 0)
++    }
++
+     func testMissingReadOnlyReplyIsNotAutomaticallyRepeated() async {
+         let (service, vpn, _, _) = make()
+         vpn.isConnected = true
